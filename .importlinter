@@ -1,0 +1,55 @@
+[importlinter]
+root_package = captioner
+include_external_packages = true
+
+[importlinter:contract:layers]
+name = Presentation and core layers
+type = layers
+layers =
+    captioner.gui
+    captioner.cli
+    captioner.core.application
+    captioner.core.domain
+
+[importlinter:contract:domain-forbidden]
+name = Domain has no presentation or adapter dependencies
+type = forbidden
+source_modules =
+    captioner.core.domain
+forbidden_modules =
+    captioner.gui
+    captioner.cli
+    captioner.adapters
+    PySide6
+    openai
+    faster_whisper
+    torch
+    transformers
+
+[importlinter:contract:application-forbidden]
+name = Application has no GUI dependency
+type = forbidden
+source_modules =
+    captioner.core.application
+forbidden_modules =
+    PySide6
+    captioner.gui
+
+[importlinter:contract:adapter-forbidden]
+name = Adapters have no GUI dependency
+type = forbidden
+source_modules =
+    captioner.adapters
+forbidden_modules =
+    captioner.gui
+
+[importlinter:contract:gui-sdk-forbidden]
+name = GUI has no model or provider SDK dependency
+type = forbidden
+source_modules =
+    captioner.gui
+forbidden_modules =
+    faster_whisper
+    torch
+    transformers
+    openai

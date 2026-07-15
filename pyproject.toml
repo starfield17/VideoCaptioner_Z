@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "captioner"
+version = "0.0.0"
+description = "Phase 0 skeleton for a batch subtitle generation tool"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "PySide6>=6.8,<7",
+    "platformdirs>=4.3,<5",
+]
+
+[project.scripts]
+captioner = "captioner.cli.cli_entry:main"
+captioner-gui = "captioner.gui.gui_entry:main"
+
+[dependency-groups]
+dev = [
+    "coverage>=7.6,<8",
+    "hypothesis>=6.120,<7",
+    "import-linter>=2.3,<3",
+    "nuitka>=2.6,<3",
+    "pyright>=1.1.400,<2",
+    "pytest>=8.3,<9",
+    "pytest-cov>=6,<7",
+    "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/captioner"]
+force-include = { "resources" = "resources" }
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/captioner",
+    "resources",
+    "README.md",
+    "AGENTS.md",
+    "docs",
+    "scripts",
+    "tests",
+    "main.py",
+    "pyproject.toml",
+    "uv.lock",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests", "scripts"]
+extend-exclude = [".venv", "dist", "build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "ARG", "TRY", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ARG001", "ARG002"]
+
+[tool.pyright]
+include = ["main.py", "src", "scripts", "tests"]
+exclude = [".venv", "dist", "build"]
+typeCheckingMode = "strict"
+pythonVersion = "3.13"
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-ra"
+
+[tool.coverage.run]
+branch = true
+source = ["src/captioner"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

@@ -1,0 +1,29 @@
+{
+  "_meta": {
+    "locale": "en",
+    "name": "English",
+    "fallback": null,
+    "schema_version": 1
+  },
+  "messages": {
+    "app.title": "Captioner",
+    "app.name": "Captioner",
+    "cli.description": "Batch subtitle generation tool",
+    "cli.doctor.title": "Captioner diagnostics",
+    "cli.doctor.version": "Version",
+    "cli.doctor.python": "Python",
+    "cli.doctor.platform": "Platform",
+    "cli.doctor.resource_root": "Resource root",
+    "cli.doctor.config_dir": "Config directory",
+    "cli.doctor.data_dir": "Data directory",
+    "cli.doctor.cache_dir": "Cache directory",
+    "cli.doctor.log_dir": "Log directory",
+    "cli.doctor.temp_dir": "Temp directory",
+    "cli.doctor.locale": "Locale",
+    "cli.doctor.catalog_valid": "Built-in catalogs valid",
+    "gui.window.title": "Captioner",
+    "gui.phase0.message": "Phase 0 project skeleton",
+    "i18n.catalog_invalid": "Built-in language catalogs are invalid",
+    "i18n.warning.english_missing": "Missing English message: {key}"
+  }
+}

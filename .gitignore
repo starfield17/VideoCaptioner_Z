@@ -1,0 +1,12 @@
+.venv/
+.coverage
+.coverage.*
+.hypothesis/
+.import_linter_cache/
+.pytest_cache/
+.pyright/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+build/
+dist/
