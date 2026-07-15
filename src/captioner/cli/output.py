@@ -22,10 +22,25 @@ DOCTOR_LABEL_KEYS = {
     "catalog_valid": "cli.doctor.catalog_valid",
 }
 
+RUN_LABEL_KEYS = {
+    "media_id": "cli.run.media_id",
+    "transcript_id": "cli.run.transcript_id",
+    "transcript_path": "cli.run.transcript_path",
+    "subtitle_path": "cli.run.subtitle_path",
+    "detected_language": "cli.run.language",
+    "word_count": "cli.run.words",
+    "cue_count": "cli.run.cues",
+}
+
 
 def doctor_labels(service: I18nService) -> dict[str, str]:
     """Resolve human-readable doctor labels at the CLI output boundary."""
     return {field: service.translate(key) for field, key in DOCTOR_LABEL_KEYS.items()}
+
+
+def run_labels(service: I18nService) -> dict[str, str]:
+    """Resolve human-readable run labels at the CLI output boundary."""
+    return {field: service.translate(key) for field, key in RUN_LABEL_KEYS.items()}
 
 
 def render(

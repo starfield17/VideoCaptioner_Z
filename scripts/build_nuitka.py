@@ -162,6 +162,10 @@ def build_command(
         f"--include-data-dir={resources}=resources",
         f"--include-data-files={readme}=README.md",
         "--nofollow-import-to=tests",
+        "--nofollow-import-to=faster_whisper",
+        "--nofollow-import-to=ctranslate2",
+        "--nofollow-import-to=torch",
+        "--nofollow-import-to=transformers",
         f"--output-dir={layout.work_root}",
         "--output-filename=captioner",
     ]

@@ -49,3 +49,19 @@ def test_checker_detects_gui_sdk_and_command_run_imports() -> None:
     )
     assert any("GUI imports torch" in violation.message for violation in gui_violations)
     assert any("another command run" in violation.message for violation in command_violations)
+
+
+def test_checker_detects_shell_float_timestamps_and_model_downloads() -> None:
+    source = """
+import subprocess
+subprocess.run([\"ffmpeg\"], shell=True)
+model.from_pretrained(\"tiny\")
+"""
+    violations = check_source(source, Path("tests/unit/test_bad.py"))
+    messages = {violation.message for violation in violations}
+    assert "shell=True is forbidden" in messages
+    assert "unit test downloads a model" in messages
+    domain_violations = check_source(
+        "class Word:\n    start_ms: float\n", Path("src/captioner/core/domain/bad.py")
+    )
+    assert any("timestamp field uses float" in item.message for item in domain_violations)

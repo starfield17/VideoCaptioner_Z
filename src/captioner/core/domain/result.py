@@ -2,10 +2,36 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import cast
 
 type JsonPrimitive = None | bool | int | float | str
 type JsonValue = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
+
+
+def validate_json_value(value: object) -> None:
+    """Reject values outside the finite, JSON-compatible value subset."""
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError
+        return
+    if isinstance(value, Mapping):
+        mapping = cast(Mapping[object, object], value)
+        for key, item in mapping.items():
+            if not isinstance(key, str):
+                raise TypeError
+            validate_json_value(item)
+        return
+    if isinstance(value, (list, tuple)):
+        sequence = cast(list[object] | tuple[object, ...], value)
+        for item in sequence:
+            validate_json_value(item)
+        return
+    raise TypeError
 
 
 class _Missing:

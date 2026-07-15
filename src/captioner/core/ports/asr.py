@@ -1,8 +1,43 @@
-"""ASR port without a Phase 0 request/response model."""
+"""Backend-neutral ASR port."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Protocol
 
+from captioner.core.domain.execution import ExecutionContext
+from captioner.core.domain.media import AudioArtifact
+from captioner.core.domain.transcript import Transcript
 from captioner.core.ports import CapabilityProbe
+
+
+@dataclass(frozen=True, slots=True)
+class ASRCapabilities:
+    word_timestamps: bool
+    segment_timestamps: bool
+    language_detection: bool
+    native_long_audio: bool
+    internal_batching: bool
+    supported_languages: frozenset[str] | None
+    supported_devices: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionRequest:
+    audio: AudioArtifact
+    language: str | None
+
+
+class ASREngine(Protocol):
+    @property
+    def engine_id(self) -> str: ...
+
+    @property
+    def capabilities(self) -> ASRCapabilities: ...
+
+    async def transcribe(
+        self, request: TranscriptionRequest, context: ExecutionContext
+    ) -> Transcript: ...
 
 
 class ASRPort(Protocol):

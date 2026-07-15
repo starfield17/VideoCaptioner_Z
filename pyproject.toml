@@ -13,6 +13,11 @@ dependencies = [
     "platformdirs>=4.3,<5",
 ]
 
+[project.optional-dependencies]
+asr-faster-whisper = [
+    "faster-whisper>=1.2,<2",
+]
+
 [project.scripts]
 captioner = "captioner.cli.cli_entry:main"
 captioner-gui = "captioner.gui.gui_entry:main"
@@ -58,6 +63,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "ARG", "TRY", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ARG001", "ARG002"]
+"scripts/validate_subtitle.py" = ["TRY003"] # parser errors carry the violated SRT rule
 
 [tool.pyright]
 include = ["main.py", "src", "scripts", "tests"]
@@ -70,6 +76,10 @@ reportMissingTypeStubs = false
 testpaths = ["tests"]
 pythonpath = ["src", "."]
 addopts = "-ra"
+markers = [
+    "integration: uses installed FFmpeg/FFprobe or other local external tools",
+    "slow: may download and load a real ASR model",
+]
 
 [tool.coverage.run]
 branch = true

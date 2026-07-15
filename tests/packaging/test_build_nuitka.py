@@ -51,6 +51,9 @@ def test_build_command_contains_plugin_package_and_resources(tmp_path: Path) -> 
     assert "--include-package=captioner" in command
     assert f"--include-data-dir={tmp_path / 'resources'}=resources" in command
     assert f"--include-data-files={tmp_path / 'README.md'}=README.md" in command
+    assert "--nofollow-import-to=faster_whisper" in command
+    assert "--nofollow-import-to=ctranslate2" in command
+    assert "--nofollow-import-to=torch" in command
     assert "--version" not in joined
 
 

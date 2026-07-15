@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import cast
 
-from captioner.core.domain.result import JsonValue
+from captioner.core.domain.result import JsonValue, validate_json_value
 
 
 class AppError(RuntimeError):
@@ -28,7 +26,7 @@ class AppError(RuntimeError):
         if not normalized_code:
             raise ValueError
         normalized_params = {} if params is None else dict(params)
-        _validate_json_value(normalized_params)
+        validate_json_value(normalized_params)
         try:
             json.dumps(
                 normalized_params,
@@ -56,25 +54,3 @@ class AppError(RuntimeError):
             "params": dict(self.params),
             "retryable": self.retryable,
         }
-
-
-def _validate_json_value(value: object) -> None:
-    """Reject values outside the strict JSON subset used by ``AppError``."""
-    if value is None or isinstance(value, (bool, int, str)):
-        return
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError
-        return
-    if isinstance(value, list):
-        for item in cast(list[object], value):
-            _validate_json_value(item)
-        return
-    if isinstance(value, dict):
-        mapping = cast(dict[object, object], value)
-        for key, item in mapping.items():
-            if not isinstance(key, str):
-                raise TypeError
-            _validate_json_value(item)
-        return
-    raise TypeError

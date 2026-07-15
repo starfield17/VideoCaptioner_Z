@@ -21,6 +21,8 @@ FORBIDDEN_SDKS = {
 }
 NETWORK_MODULES = {"requests", "httpx", "aiohttp", "openai"}
 GOLDEN_NAMES = {"update_golden", "write_golden", "overwrite_golden", "regenerate_golden"}
+MODEL_DOWNLOAD_NAMES = {"download", "snapshot_download", "from_pretrained"}
+ASR_OUTPUT_WRITE_NAMES = {"write_bytes", "write_text"}
 API_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9]{16,}\b")
 
 
@@ -42,8 +44,13 @@ def check_source(source: str, path: Path) -> list[Violation]:
     relative = path.as_posix().replace("\\", "/")
     is_core = "/core/" in f"/{relative}/"
     is_domain = "/core/domain/" in f"/{relative}/"
+    is_cli = "/cli/" in f"/{relative}/"
+    is_application = "/core/application/" in f"/{relative}/"
+    is_policies = "/core/policies/" in f"/{relative}/"
     is_gui = "/gui/" in f"/{relative}/"
+    is_asr_adapter = "/adapters/asr/" in f"/{relative}/"
     is_test = "/tests/" in f"/{relative}/"
+    is_unit_test = "/tests/unit/" in f"/{relative}/"
     command_path = "/cli/commands/" in f"/{relative}/"
 
     for node in ast.walk(tree):
@@ -59,6 +66,38 @@ def check_source(source: str, path: Path) -> list[Violation]:
                     Violation(str(path), node.lineno, "exception is silently swallowed")
                 )
         elif isinstance(node, ast.Call):
+            if any(
+                keyword.arg == "shell"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in node.keywords
+            ):
+                violations.append(Violation(str(path), node.lineno, "shell=True is forbidden"))
+            if (
+                is_unit_test
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in MODEL_DOWNLOAD_NAMES
+            ):
+                violations.append(Violation(str(path), node.lineno, "unit test downloads a model"))
+            if (
+                is_asr_adapter
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ASR_OUTPUT_WRITE_NAMES
+            ):
+                violations.append(
+                    Violation(str(path), node.lineno, "ASR adapter writes final artifacts")
+                )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess"
+                and node.func.attr in {"run", "Popen", "call", "check_call", "check_output"}
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and any(token in node.args[0].value.lower() for token in ("ffmpeg", "ffprobe"))
+            ):
+                violations.append(Violation(str(path), node.lineno, "direct FFmpeg command string"))
             if is_core and isinstance(node.func, ast.Name) and node.func.id == "print":
                 violations.append(Violation(str(path), node.lineno, "core code uses print()"))
             if isinstance(node.func, ast.Name) and node.func.id in GOLDEN_NAMES:
@@ -71,6 +110,10 @@ def check_source(source: str, path: Path) -> list[Violation]:
                 root_module = module.split(".", 1)[0]
                 if is_gui and root_module in FORBIDDEN_SDKS:
                     violations.append(Violation(str(path), node.lineno, f"GUI imports {module}"))
+                if (is_cli or is_application or is_policies) and root_module in FORBIDDEN_SDKS:
+                    violations.append(
+                        Violation(str(path), node.lineno, f"boundary imports {module}")
+                    )
                 if is_domain and (
                     module.startswith("captioner.gui")
                     or module.startswith("captioner.cli")
@@ -90,6 +133,19 @@ def check_source(source: str, path: Path) -> list[Violation]:
                 if is_test and root_module in NETWORK_MODULES:
                     violations.append(
                         Violation(str(path), node.lineno, f"test imports network module {module}")
+                    )
+
+        if is_domain and isinstance(node, ast.AnnAssign):
+            target = node.target
+            if isinstance(target, ast.Name):
+                field_name = target.id.lower()
+                annotation = ast.unparse(node.annotation)
+                timestamp_name = any(
+                    marker in field_name for marker in ("start", "end", "duration", "timestamp")
+                )
+                if timestamp_name and "float" in annotation:
+                    violations.append(
+                        Violation(str(path), node.lineno, "domain timestamp field uses float")
                     )
 
         if (
