@@ -35,6 +35,38 @@ forbidden_modules =
     PySide6
     captioner.gui
 
+[importlinter:contract:gui-no-cli]
+name = GUI does not import CLI
+type = forbidden
+source_modules =
+    captioner.gui
+forbidden_modules =
+    captioner.cli
+
+[importlinter:contract:cli-no-gui]
+name = CLI does not import GUI
+type = forbidden
+source_modules =
+    captioner.cli
+forbidden_modules =
+    captioner.gui
+
+[importlinter:contract:application-no-adapters]
+name = Application does not import adapters
+type = forbidden
+source_modules =
+    captioner.core.application
+forbidden_modules =
+    captioner.adapters
+
+[importlinter:contract:application-no-cli]
+name = Application does not import CLI
+type = forbidden
+source_modules =
+    captioner.core.application
+forbidden_modules =
+    captioner.cli
+
 [importlinter:contract:adapter-forbidden]
 name = Adapters have no GUI dependency
 type = forbidden

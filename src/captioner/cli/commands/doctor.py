@@ -20,13 +20,17 @@ class DoctorOptions:
     paths: AppPaths | None = None
 
 
-def run(options: DoctorOptions) -> dict[str, JsonValue]:
+def run(options: DoctorOptions, *, service: I18nService | None = None) -> dict[str, JsonValue]:
     """Collect read-only Phase 0 diagnostics."""
     paths = resolve_app_paths() if options.paths is None else options.paths
-    service = I18nService(
-        locale=options.locale,
-        resource_dir=paths.i18n_resource_dir,
-        strict=True,
+    message_service = (
+        I18nService(
+            locale=options.locale,
+            resource_dir=paths.i18n_resource_dir,
+            strict=True,
+        )
+        if service is None
+        else service
     )
     catalog_valid = True
     try:
@@ -44,6 +48,6 @@ def run(options: DoctorOptions) -> dict[str, JsonValue]:
         "cache_dir": str(paths.cache_dir),
         "log_dir": str(paths.log_dir),
         "temp_dir": str(paths.temp_dir),
-        "locale": service.locale,
+        "locale": message_service.locale,
         "catalog_valid": catalog_valid,
     }

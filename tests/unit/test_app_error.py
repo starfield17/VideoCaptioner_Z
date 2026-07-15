@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import cast
 
 import pytest
@@ -16,6 +17,19 @@ def test_empty_code_fails() -> None:
 def test_non_serializable_params_fail() -> None:
     params = cast(dict[str, JsonValue], {"bad": object()})
     with pytest.raises(TypeError):
+        AppError("test.invalid", params)
+
+
+def test_non_string_param_keys_fail() -> None:
+    params = cast(dict[str, JsonValue], {1: "bad"})
+    with pytest.raises(TypeError):
+        AppError("test.invalid", params)
+
+
+@pytest.mark.parametrize("number", [math.nan, math.inf, -math.inf])
+def test_non_finite_param_numbers_fail(number: float) -> None:
+    params = cast(dict[str, JsonValue], {"number": number})
+    with pytest.raises(ValueError):
         AppError("test.invalid", params)
 
 
@@ -43,3 +57,13 @@ def test_result_success_and_failure() -> None:
     assert success.value == "value"
     assert failure.ok is False
     assert isinstance(failure.error, RuntimeError)
+
+
+def test_result_requires_exactly_one_state() -> None:
+    with pytest.raises(ValueError):
+        Result[str]()
+    with pytest.raises(ValueError):
+        Result[str]("value", RuntimeError("failed"))
+    none_success = Result[None].success(None)
+    assert none_success.ok is True
+    assert none_success.value is None

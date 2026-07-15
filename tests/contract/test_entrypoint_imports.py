@@ -47,3 +47,18 @@ def test_gui_entry_module_is_lazy_about_qt_and_sdk() -> None:
         "('openai', 'torch', 'transformers', 'faster_whisper'))"
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_package_module_entrypoint_works_without_repository_root(tmp_path: Path) -> None:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    result = subprocess.run(
+        [sys.executable, "-m", "captioner", "--cli", "--help"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "usage: captioner" in result.stdout

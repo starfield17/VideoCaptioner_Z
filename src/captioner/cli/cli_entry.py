@@ -8,8 +8,10 @@ from collections.abc import Sequence
 
 from captioner import __version__
 from captioner.cli.commands import doctor
-from captioner.cli.output import render
+from captioner.cli.output import doctor_labels, render
 from captioner.core.domain.errors import AppError
+from captioner.i18n.service import I18nService
+from captioner.infrastructure.app_paths import resolve_app_paths
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,14 +36,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         namespace = parser.parse_args(None if argv is None else list(argv))
         if namespace.command not in (None, "doctor"):
             parser.error(f"unknown command: {namespace.command}")
+        paths = resolve_app_paths()
+        service = I18nService(
+            locale=namespace.lang,
+            resource_dir=paths.i18n_resource_dir,
+            strict=True,
+        )
         options = doctor.DoctorOptions(
             locale=namespace.lang,
             as_json=bool(getattr(namespace, "json", False)),
+            paths=paths,
         )
-        payload = doctor.run(options)
+        payload = doctor.run(options, service=service)
     except AppError as exc:
         print(render(exc.to_dict(), as_json=True), file=sys.stderr)
         return 2
     else:
-        print(render(payload, as_json=options.as_json))
+        labels = None if options.as_json else doctor_labels(service)
+        print(render(payload, as_json=options.as_json, labels=labels))
         return 0

@@ -57,6 +57,27 @@ def validate_version(value: str) -> str:
     return value
 
 
+def windows_numeric_version(value: str) -> str:
+    """Convert a release version into Windows' four-part numeric metadata."""
+    display_version = validate_version(value)
+    core = display_version.split("-", 1)[0].split("+", 1)[0]
+    components = tuple(int(part) for part in core.split("."))
+    if any(component > 65535 for component in components):
+        raise ValueError
+    return ".".join((*map(str, components), "0"))
+
+
+def windows_compiler_options(architecture: str | None = None) -> tuple[str, ...]:
+    """Select the Windows compiler, with an explicit ARM64 extension seam."""
+    normalized = (platform.machine() if architecture is None else architecture).lower()
+    if normalized in {"x86_64", "amd64", "x64"}:
+        return ("--msvc=latest",)
+    if normalized in {"arm64", "aarch64"}:
+        # ARM64 support stays isolated so its future Clang policy is easy to revise.
+        return ("--clang",)
+    raise ValueError
+
+
 def normalize_platform(value: str | None = None) -> str:
     """Map platform names to the three supported build branches."""
     value = platform.system() if value is None else value
@@ -123,9 +144,10 @@ def build_command(
     *,
     python_executable: Path | None = None,
     project_root: Path = PROJECT_ROOT,
+    architecture: str | None = None,
 ) -> list[str]:
     """Build the platform-specific Nuitka command without executing it."""
-    validate_version(version)
+    display_version = validate_version(version)
     python = str(sys.executable if python_executable is None else python_executable)
     resources = project_root / "resources"
     readme = project_root / "README.md"
@@ -142,8 +164,18 @@ def build_command(
         "--nofollow-import-to=tests",
         f"--output-dir={layout.work_root}",
         "--output-filename=captioner",
-        f"--product-version={version}",
     ]
+    if layout.platform_name == "windows":
+        numeric_version = windows_numeric_version(display_version)
+        command.extend(windows_compiler_options(architecture))
+        command.extend(
+            (
+                f"--product-version={numeric_version}",
+                f"--file-version={numeric_version}",
+            )
+        )
+    else:
+        command.append(f"--product-version={display_version}")
     if layout.platform_name == "macos":
         command.extend(("--macos-create-app-bundle", "--macos-app-name=Captioner"))
     command.append(str(project_root / "main.py"))

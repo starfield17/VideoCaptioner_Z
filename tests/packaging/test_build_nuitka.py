@@ -11,12 +11,15 @@ from scripts.build_nuitka import (
     layout_for_platform,
     safe_remove_owned,
     validate_version,
+    windows_compiler_options,
+    windows_numeric_version,
 )
 
 
 def test_version_validation() -> None:
     assert validate_version("0.0.0") == "0.0.0"
     assert validate_version("1.2.3-beta+build") == "1.2.3-beta+build"
+    assert windows_numeric_version("1.2.3-beta+build") == "1.2.3.0"
     with pytest.raises(ValueError):
         validate_version("0.0")
 
@@ -49,6 +52,25 @@ def test_build_command_contains_plugin_package_and_resources(tmp_path: Path) -> 
     assert f"--include-data-dir={tmp_path / 'resources'}=resources" in command
     assert f"--include-data-files={tmp_path / 'README.md'}=README.md" in command
     assert "--version" not in joined
+
+
+def test_windows_python_313_command_uses_msvc_and_numeric_metadata(tmp_path: Path) -> None:
+    layout = layout_for_platform("windows", dist_root=tmp_path / "dist")
+    command = build_command(
+        "1.2.3-beta",
+        layout,
+        python_executable=Path("python3.13"),
+        project_root=tmp_path,
+        architecture="x86_64",
+    )
+    assert "--msvc=latest" in command
+    assert not any("--mingw64" in argument for argument in command)
+    assert "--product-version=1.2.3.0" in command
+    assert "--file-version=1.2.3.0" in command
+
+
+def test_windows_arm64_compiler_seam_is_explicit() -> None:
+    assert windows_compiler_options("arm64") == ("--clang",)
 
 
 def test_clean_path_protection(tmp_path: Path) -> None:
