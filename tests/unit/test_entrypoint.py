@@ -46,3 +46,13 @@ def test_nonfirst_gui_flag_fails_through_cli_parser(
         entrypoint.main(["doctor", "--gui"])
     assert raised.value.code == 2
     assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_dispatch_converts_early_keyboard_interrupt_to_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupt(_arguments: Sequence[str]) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(entrypoint, "_run_cli", interrupt)
+    assert entrypoint.main(["--cli", "doctor"]) == 130

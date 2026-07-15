@@ -23,10 +23,13 @@ def _run_cli(arguments: Sequence[str]) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch using only the first argument."""
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if not arguments:
-        return _run_gui([])
-    if arguments[0] == "--gui":
-        return _run_gui(arguments[1:])
-    if arguments[0] == "--cli":
-        return _run_cli(arguments[1:])
-    return _run_cli(arguments)
+    try:
+        if not arguments:
+            return _run_gui([])
+        if arguments[0] == "--gui":
+            return _run_gui(arguments[1:])
+        if arguments[0] == "--cli":
+            return _run_cli(arguments[1:])
+        return _run_cli(arguments)
+    except KeyboardInterrupt:
+        return 130
