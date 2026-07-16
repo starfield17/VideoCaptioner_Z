@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import regex
@@ -28,6 +29,11 @@ def normalize_text(text: str) -> str:
             raise AppError("subtitle.control_character", {"reason": "control"})
     value = regex.sub(r"\s+", " ", value)
     return value.strip()
+
+
+def join_token_texts(parts: Iterable[str]) -> str:
+    """Join transcript token text using the canonical rendered-text rule."""
+    return normalize_text("".join(parts))
 
 
 def grapheme_clusters(text: str) -> tuple[str, ...]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from tests.support import POLICY_SIGNATURE
 
 from captioner.adapters.subtitles import webvtt
 from captioner.core.domain.errors import AppError
@@ -24,6 +25,7 @@ def _track() -> SubtitleTrack:
             ),
         ),
         0,
+        POLICY_SIGNATURE,
     )
 
 
@@ -45,6 +47,7 @@ def test_webvtt_escapes_plain_text_and_rejects_bad_timestamp() -> None:
         "en",
         (SubtitleCue("cue-000001", 0, 100, ("word-1",), "a & b", None, ("a & b",)),),
         0,
+        POLICY_SIGNATURE,
     )
     data = webvtt.serialize_bytes(track)
     assert b"a &amp; b" in data

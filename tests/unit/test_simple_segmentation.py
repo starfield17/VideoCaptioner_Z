@@ -15,8 +15,13 @@ def test_segmentation_splits_at_limits_and_preserves_token_whitespace() -> None:
         transcript,
         SimpleSegmentationConfig(max_duration_ms=3_000, max_text_units=20, hard_gap_ms=700),
     )
-    assert [cue.source_text for cue in track.cues] == ["Hello, world. 这是测试"]
-    assert track.cues[0].source_word_ids == tuple(word.id for word in transcript.words)
+    completed = SimpleSegmentationConfig(
+        max_duration_ms=3_000, max_text_units=20, hard_gap_ms=700
+    ).to_policy_config()
+    assert track == segment_transcript(transcript, completed)
+    assert [word_id for cue in track.cues for word_id in cue.source_word_ids] == [
+        word.id for word in transcript.words
+    ]
 
 
 def test_segmentation_terminates_for_one_oversized_word_and_is_deterministic() -> None:
@@ -88,7 +93,7 @@ def test_preferred_boundaries_outside_fitting_range_are_ignored() -> None:
     silence = _transcript_with_gaps(("one ", "two ", "three ", "four"), (100, 100, 900, 0))
     config = SimpleSegmentationConfig(max_duration_ms=10_000, max_text_units=10, hard_gap_ms=700)
     assert segment_transcript(punctuation, config).cues[0].source_text == "one two"
-    assert segment_transcript(silence, config).cues[0].source_text == "one two"
+    assert segment_transcript(silence, config).cues[0].source_text == "one"
 
 
 def test_no_preferred_boundary_falls_back_to_latest_fitting_word() -> None:
@@ -97,7 +102,7 @@ def test_no_preferred_boundary_falls_back_to_latest_fitting_word() -> None:
         transcript,
         SimpleSegmentationConfig(max_duration_ms=10_000, max_text_units=8),
     )
-    assert [cue.source_text for cue in track.cues] == ["one two", "three"]
+    assert [cue.source_text for cue in track.cues] == ["one", "two three"]
 
 
 def test_all_remaining_words_fit_as_one_cue() -> None:
@@ -106,4 +111,24 @@ def test_all_remaining_words_fit_as_one_cue() -> None:
         transcript,
         SimpleSegmentationConfig(max_duration_ms=10_000, max_text_units=50),
     )
-    assert len(track.cues) == 1
+    assert [cue.source_text for cue in track.cues] == ["one,", "two three"]
+
+
+def test_legacy_mapping_and_completed_policy_produce_identical_track() -> None:
+    transcript = make_transcript(("one ", "two ", "three"))
+    legacy_mapping = {
+        "max_duration_ms": 7_000,
+        "max_text_units": 84,
+        "hard_gap_ms": 700,
+    }
+    legacy = SimpleSegmentationConfig.from_mapping(legacy_mapping)
+    completed = legacy.to_policy_config()
+    assert segment_transcript(transcript, legacy) == segment_transcript(transcript, completed)
+
+
+def test_legacy_config_applies_line_breaking_and_has_policy_identity() -> None:
+    transcript = make_transcript(("one ", "two ", "three ", "four ", "five"))
+    config = SimpleSegmentationConfig(max_duration_ms=7_000, max_text_units=12, hard_gap_ms=700)
+    track = segment_transcript(transcript, config)
+    assert track.policy_signature == config.to_policy_config().signature
+    assert all(1 <= len(cue.lines) <= 2 for cue in track.cues)

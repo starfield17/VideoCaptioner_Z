@@ -4,6 +4,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 from tests.support import make_transcript
 
+from captioner.core.policies.segmentation import canonical_words
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig, segment_transcript
 
 
@@ -29,3 +30,6 @@ def test_segmentation_assigns_every_word_once_and_never_overlaps(lengths: list[i
         for cue in track.cues
     )
     assert segment_transcript(transcript, config) == segment_transcript(transcript, config)
+    assert [word_id for cue in track.cues for word_id in cue.source_word_ids] == [
+        word.id for word in canonical_words(transcript.words)
+    ]

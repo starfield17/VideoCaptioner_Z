@@ -17,7 +17,7 @@ from captioner.core.policies.protected_spans import (
 )
 from captioner.core.policies.reading_speed import reading_speed
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
-from captioner.core.policies.unicode_metrics import measure_text, normalize_text
+from captioner.core.policies.unicode_metrics import join_token_texts, measure_text, normalize_text
 
 _SENTENCE_END = frozenset(".!?…\u3002\uff01\uff1f")
 _CLAUSE_END = frozenset(",;:\u3001\uff0c\uff1b\uff1a")
@@ -253,7 +253,7 @@ def _candidate_window_is_exceeded(
 
 
 def _join_words(words: Sequence[WordToken]) -> str:
-    return normalize_text("".join(word.text for word in words))
+    return join_token_texts(word.text for word in words)
 
 
 def _canonical_text_and_boundaries(

@@ -12,6 +12,8 @@ from typing import cast
 from captioner.core.domain.errors import AppError
 from captioner.core.policies.unicode_metrics import normalize_text
 
+LEGACY_POLICY_SIGNATURE = "legacy-policy-unknown"
+
 
 def _text(value: object, field: str) -> None:
     if not isinstance(value, str) or not value.strip():
@@ -121,7 +123,7 @@ class SubtitleTrack:
                     )
                 assigned.add(word_id)
         object.__setattr__(self, "cues", cues)
-        _text(self.policy_signature, "policy_signature") if self.policy_signature else None
+        _text(self.policy_signature, "policy_signature")
 
 
 def derive_subtitle_track_id(

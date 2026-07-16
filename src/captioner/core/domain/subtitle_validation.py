@@ -11,7 +11,7 @@ from captioner.core.policies.line_breaking import join_rendered_lines
 from captioner.core.policies.protected_spans import protected_break_cost
 from captioner.core.policies.reading_speed import reading_speed
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
-from captioner.core.policies.unicode_metrics import measure_text, normalize_text
+from captioner.core.policies.unicode_metrics import join_token_texts, measure_text, normalize_text
 
 
 class ValidationSeverity(StrEnum):
@@ -49,9 +49,30 @@ def validate_subtitle_track(
         sorted(transcript.words, key=lambda word: (word.start_ms, word.end_ms, word.id))
     )
     canonical_indexes = {word.id: index for index, word in enumerate(canonical_words)}
-    full_source = normalize_text("".join(word.text for word in canonical_words))
+    canonical_ids = tuple(word.id for word in canonical_words)
+    full_source = join_token_texts(word.text for word in canonical_words)
     assigned: list[str] = []
     previous_end = -1
+    if not track.cues:
+        issues.append(ValidationIssue("subtitle.cue_empty", ValidationSeverity.ERROR))
+    if track.language != transcript.language:
+        issues.append(
+            ValidationIssue(
+                "subtitle.language_mismatch",
+                ValidationSeverity.ERROR,
+                actual=track.language,
+                limit=transcript.language,
+            )
+        )
+    if track.policy_signature != config.signature:
+        issues.append(
+            ValidationIssue(
+                "subtitle.policy_signature_invalid",
+                ValidationSeverity.ERROR,
+                actual=track.policy_signature,
+                limit=config.signature,
+            )
+        )
     for cue_number, cue in enumerate(track.cues, start=1):
         if cue.id != f"cue-{cue_number:06d}":
             issues.append(
@@ -159,7 +180,26 @@ def validate_subtitle_track(
                     )
                 )
         known_ids = tuple(word_id for word_id in cue.source_word_ids if word_id in words)
-        expected_text = normalize_text("".join(words[word_id].text for word_id in known_ids))
+        known_indexes = tuple(canonical_indexes[word_id] for word_id in known_ids)
+        if known_indexes and known_indexes != tuple(
+            range(known_indexes[0], known_indexes[0] + len(known_indexes))
+        ):
+            issues.append(
+                ValidationIssue(
+                    "subtitle.word_span_noncontiguous",
+                    ValidationSeverity.ERROR,
+                    cue.id,
+                    actual=known_ids[0],
+                )
+            )
+        if known_ids == cue.source_word_ids and known_indexes:
+            span_start = known_indexes[0]
+            span_end = known_indexes[-1] + 1
+            expected_text = join_token_texts(
+                word.text for word in canonical_words[span_start:span_end]
+            )
+        else:
+            expected_text = ""
         if known_ids == cue.source_word_ids and expected_text != normalized_source:
             issues.append(
                 ValidationIssue("subtitle.text_mismatch", ValidationSeverity.ERROR, cue.id)
@@ -183,8 +223,16 @@ def validate_subtitle_track(
                         "subtitle.protected_span_broken", ValidationSeverity.WARNING, cue.id
                     )
                 )
-    expected = [word.id for word in transcript.words]
-    for word_id in expected:
+    if tuple(assigned) != canonical_ids:
+        issues.append(
+            ValidationIssue(
+                "subtitle.word_order_invalid",
+                ValidationSeverity.ERROR,
+                actual="|".join(assigned),
+                limit="|".join(canonical_ids),
+            )
+        )
+    for word_id in canonical_ids:
         if word_id not in assigned:
             issues.append(
                 ValidationIssue("subtitle.word_missing", ValidationSeverity.ERROR, word_id=word_id)
@@ -198,20 +246,19 @@ def validate_subtitle_track(
                 limit=transcript.id,
             )
         )
-    if track.policy_signature:
-        expected_id = derive_subtitle_track_id(
-            transcript.id,
-            transcript.language,
-            track.cues,
-            config.to_mapping(),
-        )
-        if track.id != expected_id:
-            issues.append(
-                ValidationIssue(
-                    "subtitle.track_id_invalid",
-                    ValidationSeverity.ERROR,
-                    actual=track.id,
-                    limit=expected_id,
-                )
+    expected_id = derive_subtitle_track_id(
+        transcript.id,
+        transcript.language,
+        track.cues,
+        config.to_mapping(),
+    )
+    if track.id != expected_id:
+        issues.append(
+            ValidationIssue(
+                "subtitle.track_id_invalid",
+                ValidationSeverity.ERROR,
+                actual=track.id,
+                limit=expected_id,
             )
+        )
     return ValidationReport(tuple(issues))

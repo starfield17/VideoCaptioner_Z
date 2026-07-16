@@ -8,7 +8,7 @@ from tests.support import make_transcript
 
 from captioner.core.policies.segmentation import canonical_words
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
-from captioner.core.policies.simple_segmentation import segment_transcript
+from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig, segment_transcript
 
 
 @settings(deadline=None)
@@ -72,3 +72,33 @@ def test_overlap_and_equal_timestamps_are_normalized_to_legal_cues() -> None:
         left.end_ms <= right.start_ms
         for left, right in zip(track.cues, track.cues[1:], strict=False)
     )
+    legacy = SimpleSegmentationConfig()
+    assert segment_transcript(transcript, legacy) == segment_transcript(
+        transcript, legacy.to_policy_config()
+    )
+
+
+@settings(deadline=None)
+@given(
+    max_duration_ms=st.integers(min_value=800, max_value=7_000),
+    max_text_units=st.integers(min_value=12, max_value=84),
+    hard_gap_ms=st.integers(min_value=0, max_value=700),
+)
+def test_legacy_config_and_completed_policy_use_the_same_dp_track(
+    max_duration_ms: int, max_text_units: int, hard_gap_ms: int
+) -> None:
+    transcript = make_transcript(("one ", "two ", "three ", "four"))
+    legacy = SimpleSegmentationConfig(max_duration_ms, max_text_units, hard_gap_ms)
+    completed = legacy.to_policy_config()
+    assert segment_transcript(transcript, legacy) == segment_transcript(transcript, completed)
+
+
+@settings(deadline=None)
+@given(st.permutations(tuple(range(5))))
+def test_valid_tracks_flatten_to_canonical_word_order(order: tuple[int, ...]) -> None:
+    transcript = make_transcript(tuple(f"word-{index} " for index in range(5)))
+    shuffled = replace(transcript, words=tuple(transcript.words[index] for index in order))
+    track = segment_transcript(shuffled)
+    assert [word_id for cue in track.cues for word_id in cue.source_word_ids] == [
+        word.id for word in canonical_words(transcript.words)
+    ]

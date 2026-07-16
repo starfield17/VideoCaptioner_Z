@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import cast
 
@@ -11,10 +12,16 @@ from captioner.core.domain.errors import AppError
 from captioner.core.domain.media import AudioArtifact, MediaAsset
 from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
 from captioner.core.domain.result import JsonValue, thaw_json_value
-from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack
+from captioner.core.domain.subtitle import (
+    LEGACY_POLICY_SIGNATURE,
+    SubtitleCue,
+    SubtitleTrack,
+)
 from captioner.core.domain.transcript import Transcript, TranscriptSegment, WordToken
 
 SCHEMA_VERSION = 1
+TRACK_SCHEMA_VERSION = 2
+_POLICY_SIGNATURE = re.compile(r"^policy-[0-9a-f]{64}$")
 
 
 def encode_json(value: object) -> bytes:
@@ -176,9 +183,11 @@ def decode_transcript(data: bytes) -> Transcript:
 
 
 def encode_track(track: SubtitleTrack) -> bytes:
+    if _POLICY_SIGNATURE.fullmatch(track.policy_signature) is None:
+        raise AppError("artifact.codec_invalid", {"reason": "policy_signature"})
     return encode_json(
         {
-            "schema_version": 2,
+            "schema_version": TRACK_SCHEMA_VERSION,
             "subtitle_track": {
                 "id": track.id,
                 "source_transcript_id": track.source_transcript_id,
@@ -209,7 +218,7 @@ def decode_track(data: bytes) -> SubtitleTrack:
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version not in {1, 2}
+        or schema_version not in {1, TRACK_SCHEMA_VERSION}
         or not isinstance(root.get("subtitle_track"), dict)
     ):
         raise AppError("artifact.codec_invalid", {"reason": "subtitle_track"})
@@ -248,7 +257,9 @@ def decode_track(data: bytes) -> SubtitleTrack:
         _str_or_none(raw, "language"),
         cues,
         _int(raw, "revision"),
-        "" if schema_version == 1 else _str(raw, "policy_signature"),
+        LEGACY_POLICY_SIGNATURE
+        if schema_version == 1
+        else _policy_signature(raw, "policy_signature"),
     )
 
 
@@ -308,6 +319,13 @@ def _fields(value: Mapping[str, object], expected: set[str]) -> None:
 def _str(value: Mapping[str, object], key: str) -> str:
     item = value.get(key)
     if not isinstance(item, str):
+        raise AppError("artifact.codec_invalid", {"reason": key})
+    return item
+
+
+def _policy_signature(value: Mapping[str, object], key: str) -> str:
+    item = value.get(key)
+    if not isinstance(item, str) or _POLICY_SIGNATURE.fullmatch(item) is None:
         raise AppError("artifact.codec_invalid", {"reason": key})
     return item
 

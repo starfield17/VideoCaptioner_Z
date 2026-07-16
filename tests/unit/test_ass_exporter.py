@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from tests.support import POLICY_SIGNATURE
 
 from captioner.adapters.subtitles import ass
 from captioner.core.domain.errors import AppError
@@ -24,6 +25,7 @@ def test_ass_round_trip_has_at_most_ten_millisecond_timing_error() -> None:
             ),
         ),
         0,
+        POLICY_SIGNATURE,
     )
     data = ass.serialize_bytes(track)
     assert data.startswith(b"[Script Info]\n")
@@ -43,6 +45,7 @@ def test_ass_escapes_override_braces_and_backslashes() -> None:
         "en",
         (SubtitleCue("cue-000001", 0, 100, ("word-1",), text, None, (text,)),),
         0,
+        POLICY_SIGNATURE,
     )
     assert ass.parse(ass.serialize_bytes(track)).cues[0].lines == (text,)
 
@@ -54,6 +57,7 @@ def test_ass_parser_rejects_unescaped_override_tags() -> None:
         "en",
         (SubtitleCue("cue-000001", 0, 1, ("word-1",), "x", None, ("x",)),),
         0,
+        POLICY_SIGNATURE,
     )
     data = ass.serialize(track).replace("x\n", "{\\i1}x\n").encode("utf-8")
     with pytest.raises(AppError, match=r"export\.ass_invalid"):
