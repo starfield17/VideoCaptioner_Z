@@ -5,17 +5,25 @@ build-backend = "hatchling.build"
 [project]
 name = "captioner"
 version = "0.0.0"
-description = "Single-input subtitle generation with an extensible core"
+description = "Durable batch subtitle generation with resumable verified artifacts"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "filelock>=3.18,<4",
     "PySide6>=6.8,<7",
     "platformdirs>=4.3,<5",
 ]
 
 [project.optional-dependencies]
 asr-faster-whisper = [
-    "faster-whisper>=1.2,<2",
+    "faster-whisper==1.2.1",
+    "ctranslate2==4.8.1",
+]
+asr-faster-whisper-cuda12 = [
+    "faster-whisper==1.2.1",
+    "ctranslate2==4.8.1",
+    "nvidia-cublas-cu12>=12,<13; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "nvidia-cudnn-cu12>=9,<10; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.scripts]

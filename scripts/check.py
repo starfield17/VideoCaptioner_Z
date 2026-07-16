@@ -24,7 +24,14 @@ def _python_script(path: str, *arguments: str) -> list[str]:
 def build_steps(mode: str) -> list[tuple[str, list[str]]]:
     """Return subprocess argument lists for one quality-gate mode."""
     pytest_quick = ["tests/unit", "tests/contract", "-q"]
-    pytest_full = ["tests/unit", "tests/property", "tests/contract", "tests/packaging", "-q"]
+    pytest_full = [
+        "tests/unit",
+        "tests/property",
+        "tests/contract",
+        "tests/packaging",
+        "tests/recovery",
+        "-q",
+    ]
     if mode == "quick":
         return [
             ("ruff format", [*_tool("ruff"), "format", "--check", "."]),

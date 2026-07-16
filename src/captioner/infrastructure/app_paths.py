@@ -8,6 +8,9 @@ from pathlib import Path
 
 from platformdirs import user_cache_dir, user_config_dir, user_data_dir, user_log_dir
 
+from captioner.core.domain.errors import AppError
+from captioner.core.domain.job import validate_identifier
+
 APP_NAME = "Captioner"
 
 
@@ -25,6 +28,14 @@ class AppPaths:
     cache_dir: Path
     log_dir: Path
     temp_dir: Path
+
+    @property
+    def batches_dir(self) -> Path:
+        return self.data_dir / "batches"
+
+    @property
+    def artifacts_dir(self) -> Path:
+        return self.data_dir / "artifacts"
 
     @property
     def writable_directories(self) -> tuple[Path, ...]:
@@ -75,6 +86,19 @@ def ensure_runtime_layout(paths: AppPaths) -> None:
     """Create only writable directories; bundled resources remain untouched."""
     for directory in paths.writable_directories:
         directory.mkdir(parents=True, exist_ok=True)
+    paths.batches_dir.mkdir(parents=True, exist_ok=True)
+    (paths.artifacts_dir / ".incoming").mkdir(parents=True, exist_ok=True)
+    (paths.artifacts_dir / "sha256").mkdir(parents=True, exist_ok=True)
+
+
+def resolve_safe_child(root: Path, identifier: str, *, field: str) -> Path:
+    """Resolve one validated identifier directly below ``root``."""
+    validated = validate_identifier(identifier, field=field)
+    resolved_root = root.expanduser().resolve()
+    child = (resolved_root / validated).resolve()
+    if child.parent != resolved_root:
+        raise AppError("path.outside_runtime_root", {"field": field})
+    return child
 
 
 def _normalize_platform(value: str) -> str:

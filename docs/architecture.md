@@ -1,6 +1,6 @@
 # Architecture
 
-Phase 1 establishes the following dependency direction:
+Phase 2 preserves the following dependency direction:
 
 ```text
 GUI / CLI
@@ -27,11 +27,10 @@ one FFprobe/FFmpeg pair, one Faster Whisper engine, one local artifact store per
 run, and the injected serializers. The application uses a temporary workspace
 for normalized audio and never writes it beside the input or into resources.
 
-The vertical slice is:
+The durable pipeline is:
 
 ```text
-input → FFprobe → normalized WAV → ASR → Transcript
-      → simple segmentation → Transcript JSON + SRT → atomic commit
+inspect → normalize → transcribe → segment → export → publish
 ```
 
 The application serializes both final artifacts before staging them in their
@@ -56,8 +55,12 @@ The long-term runtime direction keeps three concerns separate:
 - Runtime: installed/runtime capability management.
 - Model: model loading and provider-specific execution.
 
-Phase 1 deliberately has no reusable Stage framework, GUI workflow, batch/job
-state, manifest/journal recovery, LLM, translation, forced alignment, muxing,
-runtime installer, model manager, or release workflow. Faster Whisper
-cancellation is cooperative at process/segment boundaries; hard worker
-isolation is deferred to the runtime phase.
+Stage runners only produce workspace files or bytes. The generic executor owns
+attempt events, CAS import and verification, the authoritative
+`stage.committed` event, then Manifest projection. Journal replay is pure and
+immutable. Recovery repairs a stale Manifest, records open attempts as
+interrupted, verifies artifacts, and invalidates only the affected suffix.
+
+Phase 2 has sequential Jobs and one ASR engine per active Batch. It has no GUI
+workflow, parallel scheduler, LLM, translation, forced alignment, distributed
+locking, artifact GC, runtime installer, or release workflow.

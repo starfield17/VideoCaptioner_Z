@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from captioner.core.domain.errors import AppError
@@ -22,6 +22,35 @@ class SimpleSegmentationConfig:
     max_text_units: int = 84
     hard_gap_ms: int = 700
 
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, object]) -> SimpleSegmentationConfig:
+        expected = {"max_duration_ms", "max_text_units", "hard_gap_ms"}
+        if set(values) != expected:
+            raise AppError("job.config_invalid", {"field": "segmentation"})
+        max_duration_ms = values["max_duration_ms"]
+        max_text_units = values["max_text_units"]
+        hard_gap_ms = values["hard_gap_ms"]
+        if (
+            not isinstance(max_duration_ms, int)
+            or isinstance(max_duration_ms, bool)
+            or not isinstance(max_text_units, int)
+            or isinstance(max_text_units, bool)
+            or not isinstance(hard_gap_ms, int)
+            or isinstance(hard_gap_ms, bool)
+        ):
+            raise AppError("job.config_invalid", {"field": "segmentation"})
+        try:
+            result = cls(
+                max_duration_ms,
+                max_text_units,
+                hard_gap_ms,
+            )
+        except (TypeError, ValueError) as exc:
+            raise AppError("job.config_invalid", {"field": "segmentation"}) from exc
+        if result.max_duration_ms < 1 or result.max_text_units < 1 or result.hard_gap_ms < 0:
+            raise AppError("job.config_invalid", {"field": "segmentation"})
+        return result
+
     def __post_init__(self) -> None:
         if self.max_duration_ms <= 0 or self.max_text_units <= 0 or self.hard_gap_ms < 0:
             raise ValueError
@@ -30,6 +59,7 @@ class SimpleSegmentationConfig:
 def segment_transcript(
     transcript: Transcript,
     config: SimpleSegmentationConfig | None = None,
+    progress: Callable[[], None] | None = None,
 ) -> SubtitleTrack:
     """Segment each source transcript segment greedily at word boundaries."""
     settings = SimpleSegmentationConfig() if config is None else config
@@ -37,7 +67,7 @@ def segment_transcript(
     cues: list[SubtitleCue] = []
     next_cue_number = 1
     assigned: set[str] = set()
-    for segment in transcript.segments:
+    for segment_index, segment in enumerate(transcript.segments):
         words = _resolve_words(segment, words_by_id)
         while words:
             end = _choose_end(words, 0, settings)
@@ -59,6 +89,10 @@ def segment_transcript(
                 )
             )
             next_cue_number += 1
+            if progress is not None and (
+                words[end:] or segment_index < len(transcript.segments) - 1
+            ):
+                progress()
             words = words[end:]
 
     expected = {word.id for word in transcript.words}

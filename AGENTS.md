@@ -32,6 +32,7 @@ This file is the repository-local contract for humans and coding agents.
 - Coding agents must not automatically batch-update golden files.
 - Every patch must report the tests run and known limitations.
 
-Phase 1 intentionally contains only a one-shot single-input ASR path. It has no
-GUI workflow, batch processing, LLM, translation, alignment, queue, job-state,
-manifest/journal recovery, runtime installation, or release behavior.
+Phase 2 has a fixed sequential six-Stage durable pipeline. Journal is
+authoritative, Manifest is rebuildable, and Stage commit cannot precede durable
+artifact verification. It still has no GUI workflow, parallel execution, LLM,
+translation, alignment, distributed workers, runtime installation, or release behavior.

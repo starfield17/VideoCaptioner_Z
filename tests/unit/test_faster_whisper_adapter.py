@@ -111,6 +111,21 @@ def test_model_factory_runs_once_and_model_is_reused(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_transcribe_mid_execute_occurs_on_first_segment_consumption(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        model = FakeModel((FakeSegment(" hello", 0.0, 1.0, (FakeWord("hello", 0.0, 1.0),)),))
+        checkpoints: list[str] = []
+        engine = FasterWhisperEngine(FasterWhisperConfig(), _factory(model))
+        transcript = await engine.transcribe(
+            _request(tmp_path),
+            ExecutionContext(checkpoint_hook=checkpoints.append),
+        )
+        assert transcript.words
+        assert checkpoints == ["mid_execute"]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "segment",
     [
