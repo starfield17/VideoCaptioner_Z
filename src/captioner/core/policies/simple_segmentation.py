@@ -12,6 +12,13 @@ from captioner.core.domain.subtitle import (
     derive_subtitle_track_id,
 )
 from captioner.core.domain.transcript import Transcript, TranscriptSegment, WordToken
+from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
+
+__all__ = [
+    "SegmentationPolicyConfig",
+    "SimpleSegmentationConfig",
+    "segment_transcript",
+]
 
 _PUNCTUATION = frozenset(".,!?;:\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001")
 
@@ -21,9 +28,18 @@ class SimpleSegmentationConfig:
     max_duration_ms: int = 7_000
     max_text_units: int = 84
     hard_gap_ms: int = 700
+    policy: SegmentationPolicyConfig | None = None
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, object]) -> SimpleSegmentationConfig:
+        if set(values) != {"max_duration_ms", "max_text_units", "hard_gap_ms"}:
+            policy = SegmentationPolicyConfig.from_mapping(values)
+            return cls(
+                policy.max_duration_ms,
+                policy.max_cue_width,
+                policy.hard_gap_ms,
+                policy,
+            )
         expected = {"max_duration_ms", "max_text_units", "hard_gap_ms"}
         if set(values) != expected:
             raise AppError("job.config_invalid", {"field": "segmentation"})
@@ -50,6 +66,17 @@ class SimpleSegmentationConfig:
         if result.max_duration_ms < 1 or result.max_text_units < 1 or result.hard_gap_ms < 0:
             raise AppError("job.config_invalid", {"field": "segmentation"})
         return result
+
+    def to_policy_config(self) -> SegmentationPolicyConfig:
+        if self.policy is not None:
+            return self.policy
+        return SegmentationPolicyConfig.from_mapping(
+            {
+                "max_duration_ms": self.max_duration_ms,
+                "max_text_units": self.max_text_units,
+                "hard_gap_ms": self.hard_gap_ms,
+            }
+        )
 
     def __post_init__(self) -> None:
         if self.max_duration_ms <= 0 or self.max_text_units <= 0 or self.hard_gap_ms < 0:

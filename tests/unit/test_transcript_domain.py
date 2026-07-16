@@ -29,12 +29,12 @@ def test_duplicate_word_ids_are_rejected() -> None:
         Transcript("transcript-1", "en", (word, word), (segment,), "fake", "model", {})
 
 
-def test_overlapping_words_and_missing_references_are_rejected() -> None:
+def test_overlapping_words_are_accepted_and_missing_references_are_rejected() -> None:
     first = WordToken("word-1", "one", 0, 100)
     second = WordToken("word-2", "two", 50, 150)
     segment = TranscriptSegment("segment-1", ("word-1", "word-2"), "one two", 0, 150, None)
-    with pytest.raises(AppError, match="overlap_or_order"):
-        Transcript("transcript-1", "en", (first, second), (segment,), "fake", "model", {})
+    transcript = Transcript("transcript-1", "en", (first, second), (segment,), "fake", "model", {})
+    assert transcript.words == (first, second)
 
     missing = TranscriptSegment("segment-1", ("word-missing",), "one", 0, 100, None)
     with pytest.raises(AppError, match="missing_reference"):

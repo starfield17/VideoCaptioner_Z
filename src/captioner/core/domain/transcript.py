@@ -126,11 +126,6 @@ class Transcript:
             raise AppError("transcript.invalid", {"field": "words", "reason": "duplicate_ids"})
         if len(set(segment_ids)) != len(segment_ids):
             raise AppError("transcript.invalid", {"field": "segments", "reason": "duplicate_ids"})
-        for previous, current in pairwise(words):
-            if current.start_ms < previous.start_ms or current.start_ms < previous.end_ms:
-                raise AppError(
-                    "transcript.invalid", {"field": "words", "reason": "overlap_or_order"}
-                )
         for previous, current in pairwise(segments):
             if current.start_ms < previous.start_ms or current.start_ms < previous.end_ms:
                 raise AppError(

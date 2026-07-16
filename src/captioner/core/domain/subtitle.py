@@ -7,12 +7,14 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
+from typing import cast
 
 from captioner.core.domain.errors import AppError
+from captioner.core.policies.unicode_metrics import normalize_text
 
 
-def _text(value: str, field: str) -> None:
-    if not value.strip():
+def _text(value: object, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
         raise AppError("subtitle.invalid", {"field": field, "reason": "empty"})
 
 
@@ -43,31 +45,37 @@ class SubtitleCue:
     end_ms: int
     source_word_ids: tuple[str, ...]
     source_text: str
-    translated_text: str | None
-    lines: tuple[str, ...]
+    translated_text: str | None = None
+    lines: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.id, "id")
         _time_range(self.start_ms, self.end_ms)
-        word_ids = tuple(self.source_word_ids)
+        raw_word_ids = tuple(cast(tuple[object, ...], self.source_word_ids))
         if (
-            not word_ids
-            or len(set(word_ids)) != len(word_ids)
-            or any(not word_id.strip() for word_id in word_ids)
+            not raw_word_ids
+            or len(set(raw_word_ids)) != len(raw_word_ids)
+            or any(not isinstance(word_id, str) or not word_id.strip() for word_id in raw_word_ids)
         ):
             raise AppError(
                 "subtitle.invalid",
                 {"field": "source_word_ids", "reason": "duplicate_or_empty"},
             )
-        object.__setattr__(self, "source_word_ids", word_ids)
+        object.__setattr__(self, "source_word_ids", cast(tuple[str, ...], raw_word_ids))
         _text(self.source_text, "source_text")
         if self.translated_text is not None:
             raise AppError(
                 "subtitle.invalid", {"field": "translated_text", "reason": "phase1_forbidden"}
             )
-        lines = tuple(self.lines)
-        if not lines or any(not line.strip() for line in lines):
+        raw_lines = tuple(cast(tuple[object, ...], self.lines))
+        if not raw_lines or len(raw_lines) > 2 or any(
+            not isinstance(line, str) or not line.strip() or "\n" in line or "\r" in line
+            for line in raw_lines
+        ):
             raise AppError("subtitle.invalid", {"field": "lines", "reason": "empty"})
+        lines = cast(tuple[str, ...], raw_lines)
+        if any(normalize_text(line) != line for line in lines):
+            raise AppError("subtitle.invalid", {"field": "lines", "reason": "not_canonical"})
         object.__setattr__(self, "lines", lines)
 
 
@@ -75,14 +83,16 @@ class SubtitleCue:
 class SubtitleTrack:
     id: str
     source_transcript_id: str
-    language: str
+    language: str | None
     cues: tuple[SubtitleCue, ...]
-    revision: int
+    revision: int = 0
+    policy_signature: str = ""
 
     def __post_init__(self) -> None:
         _text(self.id, "id")
         _text(self.source_transcript_id, "source_transcript_id")
-        _text(self.language, "language")
+        if self.language is not None:
+            _text(self.language, "language")
         cues = tuple(self.cues)
         _integer_revision(self.revision)
         if self.revision != 0:
@@ -105,13 +115,14 @@ class SubtitleTrack:
                     )
                 assigned.add(word_id)
         object.__setattr__(self, "cues", cues)
+        _text(self.policy_signature, "policy_signature") if self.policy_signature else None
 
 
 def derive_subtitle_track_id(
     transcript_id: str,
     language: str,
     cues: Sequence[SubtitleCue],
-    config: Mapping[str, int],
+    config: Mapping[str, object],
 ) -> str:
     """Derive a stable track ID from source transcript, config and cue content."""
     payload = {

@@ -116,7 +116,7 @@ def create_job_config(
         ffmpeg_bin,
         ffprobe_bin,
         {"codec": "pcm_s16le", "sample_rate": 16000, "channels": 1},
-        {"max_duration_ms": 7000, "max_text_units": 84, "hard_gap_ms": 700},
+        SimpleSegmentationConfig().to_policy_config().to_mapping(),
         str(output_dir.expanduser().resolve()),
         overwrite,
         {stage.value: "1" for stage in StageName},
@@ -192,7 +192,12 @@ def build_durable_service(
         StageName.SEGMENT: SegmentStage(
             durable,
             SimpleSegmentationConfig.from_mapping(
-                segmentation or {"max_duration_ms": 7000, "max_text_units": 84, "hard_gap_ms": 700}
+                segmentation
+                or {
+                    "max_duration_ms": 7_000,
+                    "max_text_units": 84,
+                    "hard_gap_ms": 700,
+                }
             ),
         ),
         StageName.EXPORT: ExportStage(durable),
