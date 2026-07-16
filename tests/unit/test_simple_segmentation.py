@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from tests.support import make_transcript
 
+from captioner.core.domain.transcript import Transcript, TranscriptSegment, WordToken
 from captioner.core.policies.simple_segmentation import (
     SimpleSegmentationConfig,
     segment_transcript,
@@ -25,3 +26,84 @@ def test_segmentation_terminates_for_one_oversized_word_and_is_deterministic() -
     second = segment_transcript(transcript, config)
     assert len(first.cues) == 1
     assert first == second
+
+
+def _transcript_with_gaps(texts: tuple[str, ...], gaps: tuple[int, ...]) -> Transcript:
+    words: list[WordToken] = []
+    cursor = 0
+    for number, text in enumerate(texts):
+        word = WordToken(f"word-{number + 1:06d}", text, cursor, cursor + 100)
+        words.append(word)
+        cursor = word.end_ms + gaps[number]
+    segment = TranscriptSegment(
+        "segment-000001",
+        tuple(word.id for word in words),
+        "".join(texts).strip(),
+        words[0].start_ms,
+        words[-1].end_ms,
+        None,
+    )
+    return Transcript(
+        "transcript-segmentation",
+        "en",
+        tuple(words),
+        (segment,),
+        "fake-asr",
+        "test-model",
+        {},
+    )
+
+
+def test_oversized_candidate_prefers_punctuation_boundary() -> None:
+    transcript = _transcript_with_gaps(("one, ", "two ", "three"), (100, 100, 0))
+    track = segment_transcript(
+        transcript,
+        SimpleSegmentationConfig(max_duration_ms=10_000, max_text_units=10),
+    )
+    assert [cue.source_text for cue in track.cues] == ["one,", "two three"]
+
+
+def test_oversized_candidate_prefers_latest_silence_boundary() -> None:
+    transcript = _transcript_with_gaps(
+        ("one ", "two ", "three ", "four ", "five"), (100, 100, 900, 100, 0)
+    )
+    track = segment_transcript(
+        transcript,
+        SimpleSegmentationConfig(max_duration_ms=10_000, max_text_units=19, hard_gap_ms=700),
+    )
+    assert [cue.source_text for cue in track.cues] == ["one two three", "four five"]
+
+
+def test_latest_preferred_boundary_wins() -> None:
+    transcript = _transcript_with_gaps(("one, ", "two? ", "three ", "four"), (100, 100, 100, 0))
+    track = segment_transcript(
+        transcript,
+        SimpleSegmentationConfig(max_duration_ms=10_000, max_text_units=16),
+    )
+    assert track.cues[0].source_text == "one, two?"
+
+
+def test_preferred_boundaries_outside_fitting_range_are_ignored() -> None:
+    punctuation = _transcript_with_gaps(("one ", "two ", "three, ", "four"), (100, 100, 100, 0))
+    silence = _transcript_with_gaps(("one ", "two ", "three ", "four"), (100, 100, 900, 0))
+    config = SimpleSegmentationConfig(max_duration_ms=10_000, max_text_units=10, hard_gap_ms=700)
+    assert segment_transcript(punctuation, config).cues[0].source_text == "one two"
+    assert segment_transcript(silence, config).cues[0].source_text == "one two"
+
+
+def test_no_preferred_boundary_falls_back_to_latest_fitting_word() -> None:
+    transcript = _transcript_with_gaps(("one ", "two ", "three"), (100, 100, 0))
+    track = segment_transcript(
+        transcript,
+        SimpleSegmentationConfig(max_duration_ms=10_000, max_text_units=8),
+    )
+    assert [cue.source_text for cue in track.cues] == ["one two", "three"]
+
+
+def test_all_remaining_words_fit_as_one_cue() -> None:
+    transcript = make_transcript(("one, ", "two ", "three"))
+    track = segment_transcript(
+        transcript,
+        SimpleSegmentationConfig(max_duration_ms=10_000, max_text_units=50),
+    )
+    assert len(track.cues) == 1

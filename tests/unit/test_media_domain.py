@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 from tests.support import HASH
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.media import AudioArtifact, MediaAsset
-from captioner.core.domain.result import JsonValue
+from captioner.core.domain.result import FrozenJsonValue, JsonValue, thaw_json_value
 
 
 def test_media_asset_and_audio_artifact_are_immutable_and_read_only(tmp_path: Path) -> None:
+    nested_items = ["en"]
+    metadata = cast(dict[str, JsonValue], {"nested": {"items": nested_items}})
     asset = MediaAsset(
         id="media-1",
         source_path=(tmp_path / "input.wav").resolve(),
@@ -18,11 +21,15 @@ def test_media_asset_and_audio_artifact_are_immutable_and_read_only(tmp_path: Pa
         duration_ms=1_000,
         audio_stream_index=0,
         container="wav",
-        metadata={"language": "en"},
+        metadata=metadata,
     )
     assert asset.source_path.is_absolute()
+    nested_items.append("zh")
+    assert thaw_json_value(cast(FrozenJsonValue, asset.metadata["nested"])) == {"items": ["en"]}
     with pytest.raises(TypeError):
         asset.metadata["new"] = "value"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        asset.metadata["nested"]["items"] = []  # type: ignore[index]
     audio = AudioArtifact(
         artifact_id="audio-1",
         path=(tmp_path / "normalized.wav").resolve(),

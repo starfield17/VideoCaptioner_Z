@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 
-from captioner.core.domain.result import JsonValue
+from captioner.core.domain.result import FrozenJsonValue, JsonValue, thaw_json_value
 from captioner.core.domain.transcript import Transcript
 
 
@@ -41,7 +42,7 @@ def transcript_to_dict(transcript: Transcript) -> dict[str, JsonValue]:
         "model_id": transcript.model_id,
         "words": words,
         "segments": segments,
-        "metadata": dict(transcript.metadata),
+        "metadata": thaw_json_value(cast(FrozenJsonValue, transcript.metadata)),
     }
     return {"schema_version": 1, "transcript": transcript_value}
 

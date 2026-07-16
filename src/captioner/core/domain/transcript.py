@@ -8,10 +8,15 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from types import MappingProxyType
+from typing import cast
 
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.result import JsonValue, validate_json_value
+from captioner.core.domain.result import (
+    FrozenJsonValue,
+    JsonValue,
+    freeze_json_value,
+    thaw_json_value,
+)
 
 
 def _text(value: str, field: str) -> None:
@@ -46,10 +51,10 @@ def _confidence(value: object, field: str) -> None:
 
 def _metadata(value: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
     try:
-        validate_json_value(value)
+        frozen = cast(Mapping[str, FrozenJsonValue], freeze_json_value(value))
     except (TypeError, ValueError) as exc:
         raise AppError("transcript.invalid", {"field": "metadata", "reason": str(exc)}) from exc
-    return MappingProxyType(dict(value))
+    return cast(Mapping[str, JsonValue], frozen)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +148,15 @@ class Transcript:
                     raise AppError(
                         "transcript.invalid", {"field": "word_ids", "reason": "multiple_assignment"}
                     )
+                word = by_id[word_id]
+                if word.start_ms < segment.start_ms or word.end_ms > segment.end_ms:
+                    raise AppError(
+                        "transcript.invalid",
+                        {"field": "word_ids", "reason": "word_outside_segment"},
+                    )
                 assigned.add(word_id)
+        if assigned != set(word_ids):
+            raise AppError("transcript.invalid", {"field": "word_ids", "reason": "unassigned_word"})
         object.__setattr__(self, "words", words)
         object.__setattr__(self, "segments", segments)
         object.__setattr__(self, "metadata", _metadata(self.metadata))
@@ -165,7 +178,7 @@ def derive_transcript_id(
         "model_id": model_id,
         "words": [_word_to_dict(word) for word in words],
         "segments": [_segment_to_dict(segment) for segment in segments],
-        "metadata": dict(metadata),
+        "metadata": thaw_json_value(freeze_json_value(metadata)),
     }
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return f"transcript-{hashlib.sha256(serialized.encode('utf-8')).hexdigest()}"

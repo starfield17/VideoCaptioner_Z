@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from contextlib import suppress
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
 from captioner.core.ports.process import ProcessResult
+
+_TERMINATION_GRACE_SECONDS = 2.0
 
 
 class AsyncioSubprocessRunner:
@@ -34,25 +37,51 @@ class AsyncioSubprocessRunner:
         try:
             while not communication.done():
                 if context.is_cancelled:
-                    await _terminate_and_reap(process)
-                    await communication
+                    await _cleanup_shielded(process, communication)
                     raise AppError("operation.cancelled")
                 await asyncio.sleep(0.02)
             stdout, stderr = await communication
+            context.raise_if_cancelled()
         except asyncio.CancelledError:
-            await _terminate_and_reap(process)
-            await communication
+            await _cleanup_shielded(process, communication)
             raise
         return ProcessResult(stdout=stdout, stderr=stderr, returncode=process.returncode or 0)
 
 
-async def _terminate_and_reap(process: asyncio.subprocess.Process) -> None:
+async def _cleanup_shielded(
+    process: asyncio.subprocess.Process,
+    communication: asyncio.Task[tuple[bytes, bytes]],
+) -> None:
+    """Terminate, reap and collect a child even if the caller is cancelled."""
+    cleanup = asyncio.create_task(terminate_and_reap(process, communication))
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    await cleanup
+
+
+async def terminate_and_reap(
+    process: asyncio.subprocess.Process,
+    communication: asyncio.Task[tuple[bytes, bytes]] | None = None,
+) -> None:
     """Terminate a child, escalate after a short grace period, and reap it."""
-    if process.returncode is not None:
-        return
-    process.terminate()
+    wait_task = asyncio.create_task(process.wait())
     try:
-        await asyncio.wait_for(process.wait(), timeout=2.0)
-    except TimeoutError:
-        process.kill()
-        await process.wait()
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(wait_task), timeout=_TERMINATION_GRACE_SECONDS
+                )
+            except TimeoutError:
+                with suppress(ProcessLookupError):
+                    process.kill()
+                await asyncio.shield(wait_task)
+        else:
+            await asyncio.shield(wait_task)
+    finally:
+        if communication is not None:
+            await asyncio.shield(communication)

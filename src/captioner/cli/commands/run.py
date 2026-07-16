@@ -20,7 +20,7 @@ from captioner.infrastructure.app_paths import AppPaths
 class RunOptions:
     input_path: Path
     output_dir: Path
-    model_id: str
+    model_ref: str
     device: str
     compute_type: str
     language: str | None
@@ -39,7 +39,7 @@ def execute(
     """Run one input synchronously at the CLI boundary."""
     selected_service = (
         build_run_service(
-            model_id=options.model_id,
+            model_ref=options.model_ref,
             device=options.device,
             compute_type=options.compute_type,
             language=options.language,

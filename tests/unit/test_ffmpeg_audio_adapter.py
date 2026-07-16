@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from tests.support import make_media
 
+import captioner.adapters.media.ffmpeg_audio as ffmpeg_audio_module
 from captioner.adapters.media.ffmpeg_audio import FFmpegAudioNormalizer
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
@@ -92,6 +93,50 @@ def test_ffmpeg_missing_binary_and_cancellation_are_structured(tmp_path: Path) -
         with pytest.raises(AppError, match=r"operation\.cancelled"):
             await FFmpegAudioNormalizer(FFmpegStub(ProcessResult(b"", b"", 0))).normalize(
                 make_media(source), tmp_path / "cancelled", context
+            )
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_during_normalized_audio_hash_removes_wav(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        source = tmp_path / "input.wav"
+        source.write_bytes(b"source")
+        context = ExecutionContext()
+
+        def cancel_hash(path: Path, selected: ExecutionContext) -> str:
+            del path
+            selected.cancel()
+            selected.raise_if_cancelled()
+            return "never"
+
+        monkeypatch.setattr(ffmpeg_audio_module, "_sha256", cancel_hash)
+        workspace = tmp_path / "workspace"
+        with pytest.raises(AppError, match=r"operation\.cancelled"):
+            await FFmpegAudioNormalizer(FFmpegStub(ProcessResult(b"", b"", 0))).normalize(
+                make_media(source), workspace, context
+            )
+        assert not (workspace / "normalized.wav").exists()
+
+    asyncio.run(scenario())
+
+
+def test_normalized_audio_read_failure_is_structured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        source = tmp_path / "input.wav"
+        source.write_bytes(b"source")
+
+        def fail_hash(_path: Path, _context: ExecutionContext) -> str:
+            raise OSError
+
+        monkeypatch.setattr(ffmpeg_audio_module, "_sha256", fail_hash)
+        with pytest.raises(AppError, match=r"media\.normalized_audio_read_failed"):
+            await FFmpegAudioNormalizer(FFmpegStub(ProcessResult(b"", b"", 0))).normalize(
+                make_media(source), tmp_path / "workspace", ExecutionContext()
             )
 
     asyncio.run(scenario())

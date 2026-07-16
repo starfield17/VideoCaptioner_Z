@@ -13,8 +13,10 @@ from captioner.adapters.asr.faster_whisper import (
     FasterWhisperConfig,
     FasterWhisperEngine,
     ModelFactory,
+    default_model_factory,
     seconds_to_ms,
 )
+from captioner.adapters.exporters.transcript_json import serialize
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
 from captioner.core.ports.asr import TranscriptionRequest
@@ -30,10 +32,10 @@ class FakeWord:
 
 @dataclass(frozen=True)
 class FakeSegment:
-    text: str
+    text: object
     start: float
     end: float
-    words: tuple[FakeWord, ...] | None
+    words: object
 
 
 @dataclass(frozen=True)
@@ -162,3 +164,135 @@ def test_missing_optional_runtime_is_reported(
 
     monkeypatch.setattr(faster_whisper_module.importlib, "import_module", missing_runtime)
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        FakeSegment(42, 0.0, 1.0, (FakeWord("word", 0, 1),)),
+        FakeSegment(" ", 0.0, 1.0, (FakeWord("word", 0, 1),)),
+        FakeSegment(" ", 0.0, 1.0, 42),
+    ],
+)
+def test_malformed_segment_text_or_words_is_rejected(tmp_path: Path, segment: FakeSegment) -> None:
+    async def scenario() -> None:
+        engine = FasterWhisperEngine(FasterWhisperConfig(), _factory(FakeModel((segment,))))
+        with pytest.raises(AppError, match=r"asr\.output_invalid"):
+            await engine.transcribe(_request(tmp_path), ExecutionContext())
+
+    asyncio.run(scenario())
+
+
+def test_empty_blank_segment_without_words_is_ignored(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        segment = FakeSegment(" ", 0.0, 1.0, None)
+        engine = FasterWhisperEngine(FasterWhisperConfig(), _factory(FakeModel((segment,))))
+        with pytest.raises(AppError, match=r"asr\.empty_transcript"):
+            await engine.transcribe(_request(tmp_path), ExecutionContext())
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("malformed_first", [False, True])
+def test_partial_valid_output_cannot_hide_malformed_segment(
+    tmp_path: Path, malformed_first: bool
+) -> None:
+    valid = FakeSegment("valid", 0.0, 1.0, (FakeWord("valid", 0.0, 1.0),))
+    malformed = FakeSegment(42, 1.0, 2.0, ())
+    segments = (malformed, valid) if malformed_first else (valid, malformed)
+
+    async def scenario() -> None:
+        engine = FasterWhisperEngine(FasterWhisperConfig(), _factory(FakeModel(segments)))
+        with pytest.raises(AppError, match=r"asr\.output_invalid"):
+            await engine.transcribe(_request(tmp_path), ExecutionContext())
+
+    asyncio.run(scenario())
+
+
+def test_named_model_has_stable_public_identity(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        model = FakeModel((FakeSegment("hello", 0.0, 1.0, (FakeWord("hello", 0.0, 1.0),)),))
+        config = FasterWhisperConfig(model_ref="tiny")
+        engine = FasterWhisperEngine(config, _factory(model))
+        transcript = await engine.transcribe(_request(tmp_path), ExecutionContext())
+        assert config.model_identity == "faster-whisper:tiny"
+        assert transcript.model_id == "faster-whisper:tiny"
+        assert "tiny" in serialize(transcript)
+
+    asyncio.run(scenario())
+
+
+def _write_model_identity_files(path: Path, value: bytes = b"model") -> None:
+    path.mkdir()
+    (path / "config.json").write_text('{"model": "tiny"}', encoding="utf-8")
+    (path / "model.bin").write_bytes(value)
+    (path / "tokenizer.json").write_text('{"tokenizer": 1}', encoding="utf-8")
+
+
+def test_local_model_identity_is_content_based_and_not_serialized(tmp_path: Path) -> None:
+    first_dir = tmp_path / "first model"
+    second_dir = tmp_path / "second model"
+    different_dir = tmp_path / "different model"
+    _write_model_identity_files(first_dir)
+    _write_model_identity_files(second_dir)
+    _write_model_identity_files(different_dir, b"different")
+    first = FasterWhisperConfig(model_ref=str(first_dir))
+    second = FasterWhisperConfig(model_ref=str(second_dir))
+    different = FasterWhisperConfig(model_ref=str(different_dir))
+    assert first.model_ref == str(first_dir.resolve())
+    assert first.model_identity == second.model_identity
+    assert first.model_identity != different.model_identity
+
+    async def scenario() -> None:
+        segments = (FakeSegment("hello", 0.0, 1.0, (FakeWord("hello", 0.0, 1.0),)),)
+        first_transcript = await FasterWhisperEngine(
+            first, _factory(FakeModel(segments))
+        ).transcribe(_request(tmp_path), ExecutionContext())
+        second_transcript = await FasterWhisperEngine(
+            second, _factory(FakeModel(segments))
+        ).transcribe(_request(tmp_path), ExecutionContext())
+        first_serialized = serialize(first_transcript)
+        assert first_serialized == serialize(second_transcript)
+        assert str(first_dir) not in first_serialized
+        assert str(second_dir) not in first_serialized
+        assert str(first_dir) not in first_transcript.id
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("model_ref", ["/missing/model", "./missing-model"])
+def test_invalid_local_model_reference_fails_structurally(tmp_path: Path, model_ref: str) -> None:
+    selected = model_ref if model_ref.startswith("/") else str(tmp_path / model_ref[2:])
+    with pytest.raises(AppError, match=r"asr\.model_config_invalid"):
+        FasterWhisperConfig(model_ref=selected)
+
+
+def test_local_model_without_identity_files_fails_structurally(tmp_path: Path) -> None:
+    model_dir = tmp_path / "empty-model"
+    model_dir.mkdir()
+    with pytest.raises(AppError, match=r"asr\.model_config_invalid"):
+        FasterWhisperConfig(model_ref=str(model_dir))
+
+
+def test_absolute_model_reference_is_passed_to_sdk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_dir = tmp_path / "model"
+    _write_model_identity_files(model_dir)
+    received: list[str] = []
+
+    class SDKModel:
+        def __init__(self, model_ref: str, **options: object) -> None:
+            del options
+            received.append(model_ref)
+
+    class SDKModule:
+        WhisperModel = SDKModel
+
+    def import_sdk(_name: str) -> object:
+        return SDKModule
+
+    monkeypatch.setattr(faster_whisper_module.importlib, "import_module", import_sdk)
+    config = FasterWhisperConfig(model_ref=str(model_dir))
+    default_model_factory(config)
+    assert received == [str(model_dir.resolve())]

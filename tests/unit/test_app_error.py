@@ -43,6 +43,20 @@ def test_to_dict_is_stable_and_preserves_retryable() -> None:
     assert str(error) == 'test.failed: {"a": "one", "b": 2}'
 
 
+def test_nested_params_are_recursively_frozen_and_thawed() -> None:
+    items = [1, 2]
+    params = cast(dict[str, JsonValue], {"nested": {"items": items}})
+    error = AppError("test.nested", params)
+    items.append(3)
+    assert error.to_dict()["params"] == {"nested": {"items": [1, 2]}}
+    nested = error.params["nested"]
+    with pytest.raises(TypeError):
+        nested["items"] = []  # type: ignore[index]
+    first = error.to_dict()
+    cast(dict[str, JsonValue], first["params"])["new"] = True
+    assert "new" not in cast(dict[str, JsonValue], error.to_dict()["params"])
+
+
 def test_cause_is_kept_by_exception_chaining() -> None:
     cause = ValueError("root")
     with pytest.raises(AppError) as raised:

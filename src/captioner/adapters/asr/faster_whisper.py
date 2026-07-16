@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
+import json
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import NoReturn, Protocol, cast
 
@@ -47,18 +50,69 @@ class WhisperModelProtocol(Protocol):
     ) -> tuple[Iterable[_SDKSegment], _SDKInfo]: ...
 
 
-@dataclass(frozen=True, slots=True)
-class FasterWhisperConfig:
-    model_id: str = "tiny"
-    device: str = "auto"
-    compute_type: str = "default"
-    language: str | None = None
-    vad_filter: bool = True
-    model_cache_dir: Path | None = None
+_IDENTITY_PATTERNS = (
+    "config.json",
+    "model*.bin",
+    "model*.safetensors",
+    "tokenizer.json",
+    "vocabulary.*",
+)
 
-    def __post_init__(self) -> None:
-        if not self.model_id.strip() or not self.device.strip() or not self.compute_type.strip():
+
+@dataclass(frozen=True, slots=True, init=False)
+class FasterWhisperConfig:
+    """Adapter configuration separating SDK loading from public identity.
+
+    ``model_ref`` is passed to Faster Whisper and may be an absolute local
+    directory.  ``model_identity`` is derived from stable model content and is
+    the only model value allowed into Transcript artifacts.  ``model_id`` is a
+    compatibility-only constructor/property alias for the former Phase 1 API.
+    """
+
+    model_ref: str
+    model_identity: str
+    device: str
+    compute_type: str
+    language: str | None
+    vad_filter: bool
+    model_cache_dir: Path | None
+
+    def __init__(
+        self,
+        model_ref: str = "tiny",
+        device: str = "auto",
+        compute_type: str = "default",
+        language: str | None = None,
+        vad_filter: bool = True,
+        model_cache_dir: Path | None = None,
+        *,
+        model_identity: str | None = None,
+        model_id: str | None = None,
+    ) -> None:
+        if model_id is not None:
+            if model_ref != "tiny" and model_ref != model_id:
+                raise ValueError
+            model_ref = model_id
+        normalized_ref = _normalize_model_ref(model_ref)
+        if not normalized_ref or not device.strip() or not compute_type.strip():
             raise ValueError
+        identity = (
+            derive_model_identity(normalized_ref)
+            if model_identity is None
+            else _validate_model_identity(model_identity)
+        )
+        object.__setattr__(self, "model_ref", normalized_ref)
+        object.__setattr__(self, "model_identity", identity)
+        object.__setattr__(self, "device", device.strip())
+        object.__setattr__(self, "compute_type", compute_type.strip())
+        object.__setattr__(self, "language", language)
+        object.__setattr__(self, "vad_filter", vad_filter)
+        object.__setattr__(self, "model_cache_dir", model_cache_dir)
+
+    @property
+    def model_id(self) -> str:
+        """Return the stable public identity for old adapter callers."""
+        return self.model_identity
 
 
 ModelFactory = Callable[[FasterWhisperConfig], WhisperModelProtocol]
@@ -90,7 +144,7 @@ class FasterWhisperEngine:
         available = importlib.util.find_spec("faster_whisper") is not None
         return CapabilityProbe(
             available=available,
-            details={"engine_id": self.engine_id, "model_id": self.config.model_id},
+            details={"engine_id": self.engine_id, "model_identity": self.config.model_identity},
         )
 
     async def transcribe(
@@ -123,14 +177,27 @@ class FasterWhisperEngine:
                 segment = raw_segment
                 text = cast(object, getattr(segment, "text", None))
                 if not isinstance(text, str):
-                    continue
+                    _raise_invalid_segment_output("segment_text")
+                raw_words = cast(object, getattr(segment, "words", None))
                 if not text.strip():
+                    # Faster Whisper can emit an empty no-speech segment.  It
+                    # is ignored only when it has no word payload at all; a
+                    # blank segment with words is malformed and must fail.
+                    if raw_words is None:
+                        continue
+                    if not isinstance(raw_words, Iterable):
+                        _raise_invalid_segment_output("blank_segment_with_words")
+                    try:
+                        blank_words = tuple(cast(Iterable[_SDKWord], raw_words))
+                    except TypeError as exc:
+                        _raise_invalid_segment_output_from("blank_segment_with_words", exc)
+                    if blank_words:
+                        _raise_invalid_segment_output("blank_segment_with_words")
                     continue
                 segment_start = seconds_to_ms(getattr(segment, "start", None))
                 segment_end = seconds_to_ms(getattr(segment, "end", None))
                 if segment_end <= segment_start:
                     _raise_invalid_segment_range()
-                raw_words = cast(object, getattr(segment, "words", None))
                 if raw_words is None:
                     _raise_word_timestamp_missing()
                 if not isinstance(raw_words, Iterable):
@@ -178,9 +245,12 @@ class FasterWhisperEngine:
                     )
                 )
         except AppError as exc:
-            if exc.code == "operation.cancelled":
-                raise
-            if exc.code in {"asr.word_timestamp_missing", "asr.word_timestamp_invalid"}:
+            if exc.code in {
+                "operation.cancelled",
+                "asr.output_invalid",
+                "asr.word_timestamp_missing",
+                "asr.word_timestamp_invalid",
+            }:
                 raise
             raise AppError("asr.output_invalid", {"reason": exc.code}) from exc
         except Exception as exc:
@@ -197,7 +267,7 @@ class FasterWhisperEngine:
             words=words,
             segments=transcript_segments,
             engine_id=self.engine_id,
-            model_id=self.config.model_id,
+            model_id=self.config.model_identity,
             metadata=metadata,
         )
         try:
@@ -207,7 +277,7 @@ class FasterWhisperEngine:
                 words=tuple(words),
                 segments=tuple(transcript_segments),
                 engine_id=self.engine_id,
-                model_id=self.config.model_id,
+                model_id=self.config.model_identity,
                 metadata=metadata,
             )
         except AppError as exc:
@@ -225,7 +295,9 @@ class FasterWhisperEngine:
         except (ImportError, ModuleNotFoundError) as exc:
             raise AppError("asr.runtime_missing") from exc
         except Exception as exc:
-            raise AppError("asr.model_load_failed", {"model_id": self.config.model_id}) from exc
+            raise AppError(
+                "asr.model_load_failed", {"model_id": self.config.model_identity}
+            ) from exc
         return self._model
 
 
@@ -259,6 +331,83 @@ def _detected_language(info: _SDKInfo, requested: str | None) -> str:
     return "und"
 
 
+def _normalize_model_ref(model_ref: object) -> str:
+    if not isinstance(model_ref, str):
+        raise TypeError
+    normalized = model_ref.strip()
+    if not normalized:
+        raise ValueError
+    candidate = Path(normalized).expanduser()
+    local_hint = candidate.is_absolute() or normalized.startswith((".", "~"))
+    if local_hint or candidate.exists():
+        if not candidate.is_dir():
+            raise AppError(
+                "asr.model_config_invalid",
+                {"reason": "local_model_directory"},
+            )
+        return str(candidate.resolve())
+    return normalized
+
+
+def _validate_model_identity(model_identity: object) -> str:
+    if not isinstance(model_identity, str) or not model_identity.strip():
+        raise ValueError
+    if Path(model_identity).is_absolute():
+        raise AppError("asr.model_config_invalid", {"reason": "absolute_model_identity"})
+    return model_identity.strip()
+
+
+def derive_model_identity(model_ref: str) -> str:
+    """Derive a stable public identity without including local paths.
+
+    Named models use their provider reference.  Local directories use only a
+    bounded, direct-child manifest of recognized model identity files; cache
+    files, directory names and modification times are deliberately excluded.
+    """
+    normalized_ref = _normalize_model_ref(model_ref)
+    candidate = Path(normalized_ref)
+    if not candidate.is_dir():
+        return f"faster-whisper:{normalized_ref}"
+    identity_files = _model_identity_files(candidate)
+    if not identity_files:
+        raise AppError("asr.model_config_invalid", {"reason": "identity_files"})
+    manifest: list[dict[str, JsonValue]] = []
+    for path in identity_files:
+        try:
+            digest = _hash_file(path)
+            size = path.stat().st_size
+        except OSError as exc:
+            raise AppError("asr.model_identity_failed", {"reason": "read"}) from exc
+        manifest.append({"name": path.name, "size": size, "sha256": digest})
+    serialized = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return f"faster-whisper-local:{digest}"
+
+
+def _model_identity_files(root: Path) -> tuple[Path, ...]:
+    selected: list[Path] = []
+    try:
+        children = sorted(root.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise AppError("asr.model_identity_failed", {"reason": "directory"}) from exc
+    for path in children:
+        if path.is_symlink():
+            raise AppError("asr.model_config_invalid", {"reason": "symlink"})
+        if path.is_file() and any(
+            fnmatchcase(path.name, pattern) for pattern in _IDENTITY_PATTERNS
+        ):
+            selected.append(path)
+    return tuple(selected)
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def default_model_factory(config: FasterWhisperConfig) -> WhisperModelProtocol:
     try:
         module = importlib.import_module("faster_whisper")
@@ -274,11 +423,11 @@ def default_model_factory(config: FasterWhisperConfig) -> WhisperModelProtocol:
     if config.model_cache_dir is not None:
         options["download_root"] = str(config.model_cache_dir)
     try:
-        model = constructor(config.model_id, **options)
+        model = constructor(config.model_ref, **options)
     except (ImportError, ModuleNotFoundError) as exc:
         raise AppError("asr.runtime_missing") from exc
     except Exception as exc:
-        raise AppError("asr.model_load_failed", {"model_id": config.model_id}) from exc
+        raise AppError("asr.model_load_failed", {"model_id": config.model_identity}) from exc
     return cast(WhisperModelProtocol, model)
 
 
@@ -292,6 +441,14 @@ def _raise_word_timestamp_missing_from(cause: TypeError) -> NoReturn:
 
 def _raise_invalid_word_text() -> NoReturn:
     raise AppError("asr.output_invalid", {"reason": "word_text"})
+
+
+def _raise_invalid_segment_output(reason: str) -> NoReturn:
+    raise AppError("asr.output_invalid", {"reason": reason})
+
+
+def _raise_invalid_segment_output_from(reason: str, cause: TypeError) -> NoReturn:
+    raise AppError("asr.output_invalid", {"reason": reason}) from cause
 
 
 def _raise_invalid_word_range() -> NoReturn:

@@ -50,7 +50,11 @@ class SubtitleCue:
         _text(self.id, "id")
         _time_range(self.start_ms, self.end_ms)
         word_ids = tuple(self.source_word_ids)
-        if not word_ids or len(set(word_ids)) != len(word_ids):
+        if (
+            not word_ids
+            or len(set(word_ids)) != len(word_ids)
+            or any(not word_id.strip() for word_id in word_ids)
+        ):
             raise AppError(
                 "subtitle.invalid",
                 {"field": "source_word_ids", "reason": "duplicate_or_empty"},

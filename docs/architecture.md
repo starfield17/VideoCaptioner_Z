@@ -34,6 +34,18 @@ input → FFprobe → normalized WAV → ASR → Transcript
       → simple segmentation → Transcript JSON + SRT → atomic commit
 ```
 
+The application serializes both final artifacts before staging them in their
+target directories. It checks its `ExecutionContext` before the first commit,
+between commits, and before returning success. A failure or cancellation
+restores every output committed by the current invocation, including previous
+bytes in overwrite mode; this is an in-process transaction, not durable crash
+recovery.
+
+The Faster Whisper adapter keeps `model_ref` (the SDK loading reference)
+separate from `model_identity` (the stable public value). Named models use a
+provider-prefixed identity. Local models use a bounded manifest of recognized
+identity files and never serialize their absolute directory path.
+
 Faster Whisper is dynamically imported only by its adapter and is an optional
 extra. The default Core App build can therefore provide `run --help` and a
 structured `asr.runtime_missing` error without bundling the ASR runtime.

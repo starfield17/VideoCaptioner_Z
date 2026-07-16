@@ -2,9 +2,9 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
+from typing import cast
 
-from captioner.core.domain.result import JsonValue
+from captioner.core.domain.result import FrozenJsonValue, JsonValue, freeze_json_value
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,7 +15,12 @@ class CapabilityProbe:
     details: Mapping[str, JsonValue]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
+        frozen = cast(Mapping[str, FrozenJsonValue], freeze_json_value(self.details))
+        object.__setattr__(
+            self,
+            "details",
+            cast(Mapping[str, JsonValue], frozen),
+        )
 
 
 __all__ = ["CapabilityProbe"]

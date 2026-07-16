@@ -41,6 +41,11 @@ def test_translated_text_and_nonzero_revision_are_phase1_invalid() -> None:
         SubtitleTrack("track-1", "transcript-1", "en", (), 1)
 
 
+def test_blank_source_word_ids_are_rejected() -> None:
+    with pytest.raises(AppError, match="duplicate_or_empty"):
+        SubtitleCue("cue-1", 0, 100, (" ",), "one", None, ("one",))
+
+
 def test_subtitle_rejects_float_milliseconds() -> None:
     with pytest.raises(AppError, match="integer_ms"):
         SubtitleCue("cue-1", 0.5, 1_000, ("word-1",), "one", None, ("one",))  # type: ignore[arg-type]
