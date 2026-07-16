@@ -47,7 +47,17 @@ def validate_subtitle_track(
     words = {word.id: word for word in transcript.words}
     assigned: list[str] = []
     previous_end = -1
-    for cue in track.cues:
+    for cue_number, cue in enumerate(track.cues, start=1):
+        if cue.id != f"cue-{cue_number:06d}":
+            issues.append(
+                ValidationIssue(
+                    "subtitle.cue_order_invalid",
+                    ValidationSeverity.ERROR,
+                    cue.id,
+                    actual=cue.id,
+                    limit=f"cue-{cue_number:06d}",
+                )
+            )
         if cue.start_ms < 0 or cue.end_ms <= cue.start_ms:
             issues.append(
                 ValidationIssue("subtitle.cue_time_invalid", ValidationSeverity.ERROR, cue.id)
@@ -117,7 +127,8 @@ def validate_subtitle_track(
                     limit=config.target_cps_milli,
                 )
             )
-        if join_rendered_lines(cue.lines) != normalize_text(cue.source_text):
+        normalized_source = normalize_text(cue.source_text)
+        if join_rendered_lines(cue.lines) != normalized_source:
             issues.append(
                 ValidationIssue("subtitle.text_mismatch", ValidationSeverity.ERROR, cue.id)
             )
@@ -142,7 +153,12 @@ def validate_subtitle_track(
                         "subtitle.word_duplicated", ValidationSeverity.ERROR, cue.id, word_id
                     )
                 )
-        normalized_source = normalize_text(cue.source_text)
+        known_ids = tuple(word_id for word_id in cue.source_word_ids if word_id in words)
+        expected_text = normalize_text("".join(words[word_id].text for word_id in known_ids))
+        if known_ids == cue.source_word_ids and expected_text != normalized_source:
+            issues.append(
+                ValidationIssue("subtitle.text_mismatch", ValidationSeverity.ERROR, cue.id)
+            )
         if len(cue.lines) > 1:
             line_boundary = len(normalize_text(cue.lines[0]))
             if protected_break_cost(normalized_source, line_boundary):

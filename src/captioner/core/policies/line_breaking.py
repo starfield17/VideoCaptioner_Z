@@ -25,7 +25,7 @@ def break_lines(text: str, config: SegmentationPolicyConfig) -> tuple[str, ...]:
     clusters = grapheme_clusters(value)
     candidates = _candidate_indices(clusters)
     if not candidates:
-        candidates = tuple(range(1, len(clusters)))
+        return (value,)
     scored: list[tuple[tuple[int, ...], tuple[str, str]]] = []
     for index in candidates:
         left = "".join(clusters[:index]).strip()
@@ -86,17 +86,10 @@ def _candidate_indices(clusters: Sequence[str]) -> tuple[int, ...]:
 
 
 def _fallback_lines(clusters: Sequence[str], max_width: int) -> tuple[str, ...]:
-    width = 0
-    split = 0
-    for index, cluster in enumerate(clusters, start=1):
-        next_width = measure_text(cluster).display_columns
-        if split == 0 and width + next_width > max_width:
-            split = index - 1
-            break
-        width += next_width
-    if split <= 0 or split >= len(clusters):
-        return ("".join(clusters),)
-    return ("".join(clusters[:split]).strip(), "".join(clusters[split:]).strip())
+    del max_width
+    # An indivisible token has no safe semantic break.  Keep the complete
+    # grapheme sequence and let validation report the bounded width warning.
+    return ("".join(clusters),)
 
 
 def _cjk(cluster: str) -> bool:

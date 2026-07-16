@@ -4,10 +4,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 from tests.support import make_transcript
 
-from captioner.core.policies.simple_segmentation import (
-    SimpleSegmentationConfig,
-    segment_transcript,
-)
+from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig, segment_transcript
 
 
 @given(st.lists(st.integers(min_value=1, max_value=12), min_size=1, max_size=20))
