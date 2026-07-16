@@ -39,3 +39,8 @@
 - Content-addressed artifact paths derive only from lowercase SHA-256; orphan bytes are allowed.
 - Abrupt interruption may leave incomplete workspace or output projection state, but replay and
   Artifact verification either repair it or fail explicitly.
+- External Batch and Job IDs are validated before durable path construction.
+- Status never repairs Journal or rewrites Manifest; repair requires the writer lease.
+- A Batch uses one common runtime configuration and distinct publication targets.
+- Failed and cancelled Jobs require an explicit `job.retry_requested` before retry.
+- Publication receipts are strict and reverify both final target files.

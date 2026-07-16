@@ -34,6 +34,21 @@ captioner retry batch-... --job job-000001 --stage transcribe --json
 captioner cancel batch-... --job job-000001 --json
 ```
 
+For Linux CUDA 12 systems, install the reproducible optional runtime and run
+the guarded manual diagnostic:
+
+```bash
+uv sync --frozen --extra asr-faster-whisper-cuda12
+export CAPTIONER_REAL_MEDIA_URL="https://example.invalid/direct-public-domain-media"
+uv run --no-sync python scripts/run_phase2_real_gpu_smoke.py \
+  --url "$CAPTIONER_REAL_MEDIA_URL" --duration 180
+```
+
+The script discovers CUDA 12 cuBLAS/cuDNN directories, prepends them to the
+child `LD_LIBRARY_PATH`, reports Faster Whisper/CTranslate2 versions, runs
+`ldd` diagnostics, and refuses to claim CUDA success with unresolved libraries.
+CUDA libraries are not included in the default installation or Nuitka app.
+
 The run writes `<source-stem>.transcript.json` and `<source-stem>.srt` only
 after successful transcription, validation, and a staged atomic artifact
 transaction. Cancellation or failure rolls back outputs committed by the
@@ -51,3 +66,11 @@ Durable state lives under the platformdirs data directory in `batches/` and
 are read from `resources/`. User-writable paths are owned
 by the operating system's standard application directories through
 `platformdirs`.
+
+Batch and Job IDs are validated before durable path construction. Status is a
+non-mutating read: it reports incomplete Journal tails and Manifest status but
+does not repair or rewrite either file. Resume and retry acquire the Batch
+writer lease before repair. All Jobs in one Batch share runtime
+ASR/media/segmentation settings; output target collisions are rejected before
+`batch.created`. Failed or cancelled Jobs require explicit `retry`, which
+appends `job.retry_requested`.

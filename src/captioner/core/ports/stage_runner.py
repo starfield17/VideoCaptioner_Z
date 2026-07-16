@@ -32,12 +32,16 @@ class StageExecutionRequest:
     input_path: Path
     config: JobConfig
     input_artifacts: tuple[ArtifactRef, ...]
+    recovery: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class StageExecutionContext:
     execution: ExecutionContext
     workspace: Path
+
+    def checkpoint(self, point: str) -> None:
+        self.execution.checkpoint(point)
 
 
 class StageRunner(Protocol):

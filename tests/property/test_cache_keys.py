@@ -22,13 +22,20 @@ def test_cache_key_ignores_mapping_insertion_order(config: dict[str, int]) -> No
     )
 
 
-@given(st.text(min_size=1), st.text(min_size=1))
-def test_irrelevant_external_id_is_not_part_of_cache_key(batch_id: str, job_id: str) -> None:
-    del batch_id, job_id
+@given(language=st.sampled_from(["en", "zh-CN", "de"]))
+def test_relevant_and_irrelevant_cache_inputs_behave_differently(language: str) -> None:
     artifact = ArtifactRef("a" * 64, 1, "input", "application/octet-stream", "input.bin")
-    config = cast(dict[str, FrozenJsonValue], freeze_json_value({"language": "en"}))
+    base = cast(dict[str, FrozenJsonValue], freeze_json_value({"language": language}))
     assert derive_stage_cache_key(
-        stage_name="transcribe", stage_version="1", input_artifacts=(artifact,), config=config
+        stage_name="transcribe", stage_version="1", input_artifacts=(artifact,), config=base
+    ) != derive_stage_cache_key(
+        stage_name="transcribe",
+        stage_version="1",
+        input_artifacts=(artifact,),
+        config=cast(dict[str, FrozenJsonValue], freeze_json_value({"language": "other"})),
+    )
+    assert derive_stage_cache_key(
+        stage_name="transcribe", stage_version="1", input_artifacts=(artifact,), config=base
     ) == derive_stage_cache_key(
-        stage_name="transcribe", stage_version="1", input_artifacts=(artifact,), config=config
+        stage_name="transcribe", stage_version="1", input_artifacts=(artifact,), config=base
     )

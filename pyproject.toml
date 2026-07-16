@@ -16,7 +16,14 @@ dependencies = [
 
 [project.optional-dependencies]
 asr-faster-whisper = [
-    "faster-whisper>=1.2,<2",
+    "faster-whisper==1.2.1",
+    "ctranslate2==4.8.1",
+]
+asr-faster-whisper-cuda12 = [
+    "faster-whisper==1.2.1",
+    "ctranslate2==4.8.1",
+    "nvidia-cublas-cu12>=12,<13; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "nvidia-cudnn-cu12>=9,<10; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.scripts]

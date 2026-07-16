@@ -244,7 +244,8 @@ class DurablePipelineService:
             raise
         projection = self._append(projection, "job.succeeded", {"job_id": job_id})
         self.manifest.write(projection)
-        self._clear_job_marker(job_id)
+        if not token.is_cancelled:
+            self._clear_job_marker(job_id)
         return projection
 
     def _interrupt_open_attempts(self, projection: BatchProjection) -> BatchProjection:

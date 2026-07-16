@@ -172,8 +172,10 @@ class FasterWhisperEngine:
         words: list[WordToken] = []
         transcript_segments: list[TranscriptSegment] = []
         try:
-            for raw_segment in raw_segments:
+            for segment_index, raw_segment in enumerate(raw_segments):
                 context.raise_if_cancelled()
+                if segment_index == 0:
+                    context.checkpoint("mid_execute")
                 segment = raw_segment
                 text = cast(object, getattr(segment, "text", None))
                 if not isinstance(text, str):
@@ -254,7 +256,7 @@ class FasterWhisperEngine:
                 raise
             raise AppError("asr.output_invalid", {"reason": exc.code}) from exc
         except Exception as exc:
-            raise AppError("asr.output_invalid", {"reason": "segments"}) from exc
+            raise AppError("asr.transcription_failed", {"reason": "segments"}) from exc
         if not words or not transcript_segments:
             raise AppError("asr.empty_transcript")
         detected_language = _detected_language(info, language)

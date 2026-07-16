@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from threading import Event
 
@@ -31,6 +32,7 @@ class ExecutionContext:
     """Context passed through one cancellable operation."""
 
     cancellation: CancellationToken = field(default_factory=CancellationToken)
+    checkpoint_hook: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
 
     @property
     def is_cancelled(self) -> bool:
@@ -41,3 +43,8 @@ class ExecutionContext:
 
     def raise_if_cancelled(self) -> None:
         self.cancellation.raise_if_cancelled()
+
+    def checkpoint(self, point: str) -> None:
+        self.raise_if_cancelled()
+        if self.checkpoint_hook is not None:
+            self.checkpoint_hook(point)

@@ -33,6 +33,8 @@ class FakeStage:
         del request
         context.execution.raise_if_cancelled()
         self.counts[self.name] = self.counts.get(self.name, 0) + 1
+        (context.workspace / "partial-output").write_bytes(self.name.value.encode())
+        context.checkpoint("mid_execute")
         return (
             ProducedArtifact(
                 self.name.value,

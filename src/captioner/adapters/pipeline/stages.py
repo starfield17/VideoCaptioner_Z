@@ -46,6 +46,7 @@ class InspectStage:
         self, request: StageExecutionRequest, context: StageExecutionContext
     ) -> tuple[ProducedArtifact, ...]:
         asset = await self.inspector.inspect(request.input_path, context.execution)
+        context.checkpoint("mid_execute")
         return (
             ProducedArtifact(
                 "media-json", "application/json", "media.json", data=encode_media(asset)
@@ -65,6 +66,7 @@ class NormalizeStage:
     ) -> tuple[ProducedArtifact, ...]:
         media = decode_media(self.artifacts.read_bytes(_ref(request, "media.json")))
         audio = await self.normalizer.normalize(media, context.workspace, context.execution)
+        context.checkpoint("mid_execute")
         return (
             ProducedArtifact(
                 "normalized-wav", "audio/wav", "normalized.wav", source_path=audio.path
@@ -96,6 +98,7 @@ class TranscribeStage:
         transcript = await self.engine.transcribe(
             TranscriptionRequest(audio, request.config.language), context.execution
         )
+        context.checkpoint("mid_execute")
         return (
             ProducedArtifact(
                 "transcript-json",
@@ -118,6 +121,7 @@ class SegmentStage:
     ) -> tuple[ProducedArtifact, ...]:
         context.execution.raise_if_cancelled()
         transcript = decode_transcript(self.artifacts.read_bytes(_ref(request, "transcript.json")))
+        context.checkpoint("mid_execute")
         track = segment_transcript(transcript, self.config)
         return (
             ProducedArtifact(
@@ -141,6 +145,7 @@ class ExportStage:
         context.execution.raise_if_cancelled()
         transcript_bytes = self.artifacts.read_bytes(_ref(request, "transcript.json"))
         track = decode_track(self.artifacts.read_bytes(_ref(request, "subtitle-track.json")))
+        context.checkpoint("mid_execute")
         return (
             ProducedArtifact(
                 "final-transcript-json",
@@ -181,9 +186,10 @@ class PublishStage:
                     (targets[0][0], self.artifacts.read_bytes(targets[0][1])),
                     (targets[1][0], self.artifacts.read_bytes(targets[1][1])),
                 ),
-                overwrite=request.config.overwrite,
+                overwrite=request.config.overwrite or request.recovery,
                 context=context.execution,
             )
+        context.checkpoint("mid_execute")
         for key, ref in targets:
             published = Path(request.config.output_dir) / key
             if published.stat().st_size != ref.size_bytes or _sha256(published) != ref.sha256:
@@ -247,19 +253,33 @@ def verify_publication(
         for ref in export_refs
         if ref.logical_name in {"final-transcript.json", "final-subtitle.srt"}
     )
+    if len(expected_refs) != 2:
+        raise AppError("output.publication_invalid", {"reason": "export_refs"})
     expected_generation = hashlib.sha256(
         "".join(ref.sha256 for ref in expected_refs).encode()
     ).hexdigest()
-    expected_paths = {
-        str((output_dir / f"{input_path.stem}.transcript.json").resolve()),
-        str((output_dir / f"{input_path.stem}.srt").resolve()),
+    expected_targets = {
+        str((output_dir / f"{input_path.stem}.transcript.json").resolve()): (
+            expected_refs[0],
+            f"{input_path.stem}.transcript.json",
+        ),
+        str((output_dir / f"{input_path.stem}.srt").resolve()): (
+            expected_refs[1],
+            f"{input_path.stem}.srt",
+        ),
     }
     if (
         receipt.output_generation != expected_generation
-        or {target.path for target in receipt.targets} != expected_paths
+        or len(receipt.targets) != len(expected_targets)
+        or {target.path for target in receipt.targets} != set(expected_targets)
     ):
         raise AppError("output.publication_invalid", {"reason": "receipt"})
     for target in receipt.targets:
+        expected = expected_targets.get(target.path)
+        if expected is None or target.logical_name != expected[1]:
+            raise AppError("output.publication_invalid", {"reason": "target_metadata"})
+        if target.sha256 != expected[0].sha256 or target.size_bytes != expected[0].size_bytes:
+            raise AppError("output.publication_invalid", {"reason": "target_metadata"})
         path = Path(target.path)
         if path.is_symlink() or not path.is_file():
             raise AppError("output.publication_invalid", {"reason": "target_missing"})

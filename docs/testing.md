@@ -39,12 +39,24 @@ uv run --extra asr-faster-whisper pytest \
   tests/integration/test_faster_whisper_smoke.py -q -m slow
 ```
 
+The reproducible CUDA 12 environment is separate from CPU ASR:
+
+```bash
+uv sync --frozen --extra asr-faster-whisper-cuda12
+uv run --no-sync python scripts/run_phase2_real_gpu_smoke.py \
+  --url "$CAPTIONER_REAL_MEDIA_URL" --duration 180
+```
+
+The manual script reports GPU, driver, CUDA loader paths, CTranslate2 device
+count, supported compute types, `ldd` output, and clean/recovered hashes.
+Normal CI never installs CUDA packages or downloads models.
+
 The manual Small/CUDA media run is intentionally outside CI:
 
 ```bash
 export CAPTIONER_REAL_MEDIA_URL=https://example.invalid/direct-public-domain-media
 export CAPTIONER_FASTER_WHISPER_CACHE="$PWD/build/model-cache"
-uv run --extra asr-faster-whisper python scripts/run_phase2_real_gpu_smoke.py
+uv run --extra asr-faster-whisper-cuda12 python scripts/run_phase2_real_gpu_smoke.py
 ```
 
 Record the source page, direct URL, license, downloaded SHA-256, duration, GPU,

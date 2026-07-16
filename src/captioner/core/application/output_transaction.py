@@ -25,8 +25,10 @@ def commit_output_pair(
         staged.extend(store.stage_bytes(key, data) for key, data in outputs)
         context.raise_if_cancelled()
         paths: list[Path] = []
-        for artifact in staged:
+        for index, artifact in enumerate(staged):
             paths.append(_commit_staged(artifact, overwrite=overwrite, committed=committed))
+            if index == 0:
+                context.checkpoint("mid_execute")
             context.raise_if_cancelled()
         cleanup_error = _discard_all(staged)
         if cleanup_error is not None:

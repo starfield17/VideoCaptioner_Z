@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from captioner.core.domain.artifact import ArtifactRef
@@ -97,9 +97,14 @@ class StageExecutor:
                 _stage_payload(job_id, runner.name, current.attempt),
             )
             current = projection.job(job_id).stage(runner.name)
+        recovery = current.attempt > 0
         attempt = current.attempt + 1
         workspace = self.work_root / job_id / runner.name.value / f"attempt-{attempt}"
         workspace.mkdir(parents=True, exist_ok=False)
+
+        def checkpoint(point: str) -> None:
+            self._hit(projection.batch_id, job_id, runner.name, attempt, point)
+
         committed = False
         post_commit_reason = "recovery"
         try:
@@ -118,10 +123,16 @@ class StageExecutor:
                     Path(job.input_path),
                     job.config,
                     input_artifacts,
+                    recovery,
                 ),
-                StageExecutionContext(context, workspace),
+                StageExecutionContext(
+                    replace(
+                        context,
+                        checkpoint_hook=checkpoint,
+                    ),
+                    workspace,
+                ),
             )
-            self._hit(projection.batch_id, job_id, runner.name, attempt, "mid_execute")
             context.raise_if_cancelled()
             refs = tuple(self._import(item) for item in produced)
             _require_outputs(refs, runner.name)

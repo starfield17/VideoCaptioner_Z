@@ -140,6 +140,11 @@ def cancel(batch_id: str, job_id: str | None, *, paths: AppPaths) -> Path:
             raise AppError("batch.job_not_found", {"job_id": job_id}) from exc
         if job.state in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED}:
             raise AppError("batch.cancel_invalid", {"reason": "terminal"})
+    elif all(
+        job.state in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED}
+        for job in projection.jobs
+    ):
+        raise AppError("batch.cancel_invalid", {"reason": "terminal"})
     batch_dir = resolve_safe_child(paths.batches_dir, batch_id, field="batch_id")
     return write_cancel_marker(batch_dir / "control", job_id=job_id)
 
@@ -196,7 +201,12 @@ def _lease_is_stale(path: Path) -> bool:
         value = json.loads(path.read_text(encoding="utf-8"))
         pid = value["pid"]
         hostname = value["hostname"]
-        if not isinstance(pid, int) or isinstance(pid, bool) or not isinstance(hostname, str):
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or not isinstance(hostname, str)
+            or not hostname
+        ):
             return True
         if hostname != socket.gethostname():
             return False

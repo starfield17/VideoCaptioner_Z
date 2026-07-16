@@ -5,6 +5,16 @@ replays all complete events, reconciles the Manifest, records stale open attempt
 as `stage.interrupted`, verifies every committed Artifact, invalidates the first
 bad Stage and its downstream suffix, removes stale workspaces, and continues.
 
+`status` is non-mutating. It reads complete Journal records, reports an
+incomplete final fragment, and inspects Manifest as `current`, `missing`,
+`stale`, `ahead`, `projection_mismatch`, or `invalid`. Only a writer holding
+the Batch lease may repair Journal tails or rewrite a Manifest.
+
+All Jobs in a Batch share one persisted runtime configuration. Output target
+collisions are rejected before `batch.created`. Failed or cancelled Jobs are
+not resumed automatically; `retry` appends `job.retry_requested` and reopens
+only the requested Stage suffix while retaining historical terminal events.
+
 A cooperative cancel marker becomes durable cancellation events when observed.
 A process disappearance is interrupted, not cancelled or failed. Retry appends
 invalidation events and never rewrites history. Local leases do not claim

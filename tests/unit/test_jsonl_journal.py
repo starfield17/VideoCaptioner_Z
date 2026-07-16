@@ -100,3 +100,42 @@ def test_snapshot_reports_incomplete_tail_without_truncating(tmp_path: Path) -> 
     assert snapshot.events == (_event(),)
     assert snapshot.tail_status == "incomplete"
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        {},
+        {"schema_version": 1},
+        {
+            "schema_version": "1",
+            "seq": 1,
+            "event_id": "event-1",
+            "timestamp_utc": "2026-01-01T00:00:00+00:00",
+            "batch_id": "batch-a",
+            "type": "batch.created",
+            "payload": {},
+        },
+    ],
+)
+def test_event_codec_rejects_malformed_roots(value: object) -> None:
+    with pytest.raises(AppError, match=r"journal\.corrupt"):
+        JournalEvent.from_dict(value)
+
+
+def test_append_rejects_sequence_and_batch_identity_errors(tmp_path: Path) -> None:
+    journal = JsonlJournal(tmp_path / "journal.jsonl")
+    with pytest.raises(AppError, match=r"journal\.append_failed"):
+        journal.append(_event(2))
+    journal.append(_event())
+    other = JournalEvent(
+        2,
+        "event-2",
+        "2026-01-01T00:00:00+00:00",
+        "batch-other",
+        "job.cancelled",
+        {"job_id": "job-000001"},
+    )
+    with pytest.raises(AppError, match=r"journal\.append_failed"):
+        journal.append(other)
