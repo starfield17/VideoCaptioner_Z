@@ -59,11 +59,19 @@ class StageExecutor:
     fault_injector: FaultInjector = field(default_factory=NoOpFaultInjector)
     committed_verifier: Callable[[JobProjection, StageProjection], None] | None = None
 
-    def verify_committed(self, job: JobProjection, stage: StageProjection) -> None:
-        for artifact in stage.artifacts:
-            self.artifact_store.verify(artifact)
+    def verify_artifact(self, ref: ArtifactRef) -> None:
+        """Verify one durable blob without evaluating Stage-specific state."""
+        self.artifact_store.verify(ref)
+
+    def verify_stage_external_state(self, job: JobProjection, stage: StageProjection) -> None:
+        """Verify external state associated with a committed Stage."""
         if self.committed_verifier is not None:
             self.committed_verifier(job, stage)
+
+    def verify_committed(self, job: JobProjection, stage: StageProjection) -> None:
+        for artifact in stage.artifacts:
+            self.verify_artifact(artifact)
+        self.verify_stage_external_state(job, stage)
 
     async def execute(
         self,
@@ -254,4 +262,7 @@ def _stage_payload(job_id: str, stage: StageName, attempt: int) -> dict[str, Fro
 
 def _require_outputs(refs: tuple[ArtifactRef, ...], stage: StageName) -> None:
     if not refs:
+        raise AppError("stage.output_invalid", {"stage_name": stage.value})
+    logical_names = [ref.logical_name for ref in refs]
+    if len(set(logical_names)) != len(logical_names):
         raise AppError("stage.output_invalid", {"stage_name": stage.value})

@@ -171,12 +171,16 @@ def build_durable_service(
     ffprobe_bin: str = "ffprobe",
     paths: AppPaths | None = None,
     segmentation: Mapping[str, object] | None = None,
+    initialize_runtime: bool = True,
 ) -> DurableServiceBundle:
     application_paths = resolve_app_paths() if paths is None else paths
-    ensure_runtime_layout(application_paths)
+    if initialize_runtime:
+        ensure_runtime_layout(application_paths)
     batch_dir = resolve_safe_child(application_paths.batches_dir, batch_id, field="batch_id")
     process = AsyncioSubprocessRunner()
-    durable = ContentAddressedArtifactStore(application_paths.artifacts_dir)
+    durable = ContentAddressedArtifactStore(
+        application_paths.artifacts_dir, initialize=initialize_runtime
+    )
     engine_config = FasterWhisperConfig(model_ref, device, compute_type, language)
     engine = FasterWhisperEngine(engine_config)
     runners = {

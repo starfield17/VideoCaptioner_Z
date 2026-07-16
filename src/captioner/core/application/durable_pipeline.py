@@ -7,19 +7,57 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from captioner.core.application.stage_executor import EventFactory, StageExecutor
-from captioner.core.domain.batch import BatchProjection
+from captioner.core.domain.artifact import ArtifactRef
+from captioner.core.domain.batch import BatchProjection, BatchState
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import CancellationToken, ExecutionContext
-from captioner.core.domain.job import JobConfig, JobState
+from captioner.core.domain.job import JobConfig, JobProjection, JobState
 from captioner.core.domain.journal import JournalEvent, apply_event, replay
 from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
 from captioner.core.domain.stage import STAGE_PLAN, StageName, StageState
 from captioner.core.ports.journal import JournalPort
-from captioner.core.ports.manifest import ManifestStorePort
+from captioner.core.ports.manifest import ManifestStatus, ManifestStorePort
 from captioner.core.ports.stage_runner import StageRunner
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrityIssue:
+    job_id: str
+    stage_name: str
+    code: str
+    logical_name: str | None = None
+    sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BatchStatus:
+    projection: BatchProjection
+    journal_tail_status: Literal["clean", "incomplete"]
+    manifest_status: ManifestStatus
+    integrity: Literal["valid", "invalid"]
+    integrity_errors: tuple[IntegrityIssue, ...]
+
+    @property
+    def batch_id(self) -> str:
+        return self.projection.batch_id
+
+    @property
+    def jobs(self) -> tuple[JobProjection, ...]:
+        return self.projection.jobs
+
+    @property
+    def state(self) -> BatchState:
+        return self.projection.state
+
+    @property
+    def last_event_seq(self) -> int:
+        return self.projection.last_event_seq
+
+    def job(self, job_id: str) -> JobProjection:
+        return self.projection.job(job_id)
 
 
 class MarkerCancellationToken(CancellationToken):
@@ -119,7 +157,7 @@ class DurablePipelineService:
         self._remove_stale_workspaces()
         return await self.run(projection)
 
-    def status(self) -> BatchProjection:
+    def read_status(self) -> BatchStatus:
         snapshot = self.journal.read_snapshot()
         events = snapshot.events
         if not events:
@@ -132,11 +170,70 @@ class DurablePipelineService:
                 for job in projection.jobs[1:]
             ):
                 raise AppError("batch.config_inconsistent", {"reason": "runtime"})
+        errors: list[IntegrityIssue] = []
+        manifest_status = self.manifest.inspect(projection)
+        if manifest_status != "current":
+            errors.append(
+                IntegrityIssue(
+                    projection.batch_id,
+                    "manifest",
+                    f"manifest.{manifest_status}",
+                )
+            )
         for job in projection.jobs:
             for stage in job.stages:
-                if stage.state is StageState.COMMITTED:
-                    self.executor.verify_committed(job, stage)
-        return projection
+                if stage.state is not StageState.COMMITTED:
+                    continue
+                bad_refs: list[ArtifactRef] = []
+                for artifact in stage.artifacts:
+                    try:
+                        self.executor.verify_artifact(artifact)
+                    except AppError as exc:
+                        if exc.code not in {"artifact.missing", "artifact.corrupt"}:
+                            raise
+                        errors.append(
+                            IntegrityIssue(
+                                job.job_id,
+                                stage.name.value,
+                                exc.code,
+                                artifact.logical_name,
+                                artifact.sha256,
+                            )
+                        )
+                        bad_refs.append(artifact)
+                if bad_refs:
+                    continue
+                if stage.name is StageName.PUBLISH:
+                    try:
+                        self.executor.verify_stage_external_state(job, stage)
+                    except AppError as exc:
+                        errors.append(
+                            IntegrityIssue(
+                                job.job_id,
+                                stage.name.value,
+                                "output.publication_invalid",
+                                _error_logical_name(exc),
+                            )
+                        )
+        return BatchStatus(
+            projection,
+            snapshot.tail_status,
+            manifest_status,
+            "invalid" if errors else "valid",
+            tuple(errors),
+        )
+
+    def status(self) -> BatchProjection:
+        """Return a verified projection for legacy application callers.
+
+        The CLI uses :meth:`read_status` so integrity failures remain visible in
+        the status document instead of being turned into a command exception.
+        """
+        result = self.read_status()
+        if result.integrity_errors:
+            issue = result.integrity_errors[0]
+            raise AppError(issue.code, _issue_params(issue))
+        return result.projection
 
     def update_config(
         self,
@@ -271,22 +368,41 @@ class DurablePipelineService:
             for stage in job.stages:
                 if stage.state is not StageState.COMMITTED:
                     continue
+                bad_refs: list[ArtifactRef] = []
                 for artifact in stage.artifacts:
                     try:
-                        self.executor.verify_committed(job, stage)
-                        break
-                    except AppError:
-                        self.executor.artifact_store.resolve(artifact).unlink(missing_ok=True)
-                        projection = self._append(
-                            projection,
-                            "stage.invalidated",
-                            {
-                                "job_id": job.job_id,
-                                "stage_name": stage.name.value,
-                                "attempt": stage.attempt,
-                            },
-                        )
-                        break
+                        self.executor.verify_artifact(artifact)
+                    except AppError as exc:
+                        if exc.code not in {"artifact.missing", "artifact.corrupt"}:
+                            raise
+                        bad_refs.append(artifact)
+                if bad_refs:
+                    for artifact in bad_refs:
+                        self.executor.artifact_store.remove_corrupt(artifact)
+                    projection = self._append(
+                        projection,
+                        "stage.invalidated",
+                        {
+                            "job_id": job.job_id,
+                            "stage_name": stage.name.value,
+                            "attempt": stage.attempt,
+                        },
+                    )
+                    continue
+                try:
+                    self.executor.verify_stage_external_state(job, stage)
+                except AppError as exc:
+                    if exc.code != "output.publication_invalid":
+                        raise
+                    projection = self._append(
+                        projection,
+                        "stage.invalidated",
+                        {
+                            "job_id": job.job_id,
+                            "stage_name": stage.name.value,
+                            "attempt": stage.attempt,
+                        },
+                    )
         self.manifest.write(projection)
         return projection
 
@@ -386,3 +502,17 @@ def _source_sha256(path: Path) -> str:
     except OSError as exc:
         raise AppError("media.input_read_failed", {"path": str(path)}) from exc
     return digest.hexdigest()
+
+
+def _error_logical_name(error: AppError) -> str | None:
+    value = error.params.get("logical_name")
+    return value if isinstance(value, str) else None
+
+
+def _issue_params(issue: IntegrityIssue) -> dict[str, str]:
+    params: dict[str, str] = {}
+    if issue.logical_name is not None:
+        params["logical_name"] = issue.logical_name
+    if issue.sha256 is not None:
+        params["sha256"] = issue.sha256
+    return params

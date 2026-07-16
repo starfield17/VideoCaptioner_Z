@@ -189,11 +189,11 @@ class PublishStage:
                 overwrite=request.config.overwrite or request.recovery,
                 context=context.execution,
             )
-        context.checkpoint("mid_execute")
         for key, ref in targets:
             published = Path(request.config.output_dir) / key
             if published.stat().st_size != ref.size_bytes or _sha256(published) != ref.sha256:
                 raise AppError("output.publication_invalid", {"logical_name": key})
+        context.checkpoint("mid_execute")
         receipt = PublicationReceipt(
             hashlib.sha256("".join(ref.sha256 for _, ref in targets).encode()).hexdigest(),
             tuple(
@@ -217,9 +217,9 @@ class PublishStage:
 
 
 def _ref(request: StageExecutionRequest, logical_name: str) -> ArtifactRef:
-    for ref in request.input_artifacts:
-        if ref.logical_name == logical_name:
-            return ref
+    matches = [ref for ref in request.input_artifacts if ref.logical_name == logical_name]
+    if len(matches) == 1:
+        return matches[0]
     raise AppError("stage.input_missing", {"logical_name": logical_name})
 
 
@@ -248,23 +248,20 @@ def verify_publication(
     export_refs: tuple[ArtifactRef, ...],
 ) -> None:
     receipt = decode_publication_receipt(receipt_bytes)
-    expected_refs = tuple(
-        ref
-        for ref in export_refs
-        if ref.logical_name in {"final-transcript.json", "final-subtitle.srt"}
-    )
-    if len(expected_refs) != 2:
+    expected_names = ("final-transcript.json", "final-subtitle.srt")
+    export_by_name = {ref.logical_name: ref for ref in export_refs}
+    if len(export_by_name) != len(export_refs) or set(export_by_name) != set(expected_names):
         raise AppError("output.publication_invalid", {"reason": "export_refs"})
     expected_generation = hashlib.sha256(
-        "".join(ref.sha256 for ref in expected_refs).encode()
+        "".join(export_by_name[name].sha256 for name in expected_names).encode()
     ).hexdigest()
     expected_targets = {
         str((output_dir / f"{input_path.stem}.transcript.json").resolve()): (
-            expected_refs[0],
+            export_by_name["final-transcript.json"],
             f"{input_path.stem}.transcript.json",
         ),
         str((output_dir / f"{input_path.stem}.srt").resolve()): (
-            expected_refs[1],
+            export_by_name["final-subtitle.srt"],
             f"{input_path.stem}.srt",
         ),
     }
@@ -276,8 +273,23 @@ def verify_publication(
         raise AppError("output.publication_invalid", {"reason": "receipt"})
     for target in receipt.targets:
         expected = expected_targets.get(target.path)
-        if expected is None or target.logical_name != expected[1]:
+        if (
+            expected is None
+            or target.logical_name != expected[1]
+            or target.sha256 != expected[0].sha256
+            or target.size_bytes != expected[0].size_bytes
+        ):
             raise AppError("output.publication_invalid", {"reason": "target_metadata"})
+        path = Path(target.path)
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise AppError("output.publication_invalid", {"logical_name": target.logical_name})
+            if path.stat().st_size != target.size_bytes or _sha256(path) != target.sha256:
+                raise AppError("output.publication_invalid", {"logical_name": target.logical_name})
+        except OSError as exc:
+            raise AppError(
+                "output.publication_invalid", {"logical_name": target.logical_name}
+            ) from exc
         if target.sha256 != expected[0].sha256 or target.size_bytes != expected[0].size_bytes:
             raise AppError("output.publication_invalid", {"reason": "target_metadata"})
         path = Path(target.path)

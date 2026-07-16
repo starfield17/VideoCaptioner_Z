@@ -18,12 +18,14 @@ _CHUNK_SIZE = 1024 * 1024
 @dataclass(frozen=True, slots=True)
 class ContentAddressedArtifactStore:
     root: Path
+    initialize: bool = True
 
     def __post_init__(self) -> None:
         root = self.root.expanduser().resolve()
         object.__setattr__(self, "root", root)
-        (root / ".incoming").mkdir(parents=True, exist_ok=True)
-        (root / "sha256").mkdir(parents=True, exist_ok=True)
+        if self.initialize:
+            (root / ".incoming").mkdir(parents=True, exist_ok=True)
+            (root / "sha256").mkdir(parents=True, exist_ok=True)
 
     def put_bytes(
         self, data: bytes, *, kind: str, media_type: str, logical_name: str
@@ -70,9 +72,9 @@ class ContentAddressedArtifactStore:
     def verify(self, ref: ArtifactRef) -> None:
         path = self.resolve(ref)
         try:
-            if not path.exists():
+            if path.is_symlink() or not path.exists():
                 raise AppError("artifact.missing", {"sha256": ref.sha256})
-            if not path.is_file() or path.is_symlink() or path.stat().st_size != ref.size_bytes:
+            if not path.is_file() or path.stat().st_size != ref.size_bytes:
                 raise AppError("artifact.corrupt", {"sha256": ref.sha256, "reason": "size"})
             digest, size = _hash_file(path)
         except OSError as exc:
@@ -80,8 +82,19 @@ class ContentAddressedArtifactStore:
         if size != ref.size_bytes or digest != ref.sha256:
             raise AppError("artifact.corrupt", {"sha256": ref.sha256, "reason": "hash"})
 
+    def remove_corrupt(self, ref: ArtifactRef) -> None:
+        path = self._blob_path(ref)
+        if not path.parent.is_dir():
+            return
+        try:
+            if path.exists() or path.is_symlink():
+                path.unlink()
+            _fsync_directory(path.parent)
+        except OSError as exc:
+            raise AppError("artifact.cleanup_failed", {"sha256": ref.sha256}) from exc
+
     def resolve(self, ref: ArtifactRef) -> Path:
-        return self.root / "sha256" / ref.sha256[:2] / ref.sha256
+        return self._blob_path(ref)
 
     def read_bytes(self, ref: ArtifactRef) -> bytes:
         self.verify(ref)
@@ -121,9 +134,18 @@ class ContentAddressedArtifactStore:
                 temporary.unlink(missing_ok=True)
 
     def _new_incoming(self) -> Path:
+        (self.root / ".incoming").mkdir(parents=True, exist_ok=True)
         descriptor, name = tempfile.mkstemp(prefix="artifact-", dir=self.root / ".incoming")
         os.close(descriptor)
         return Path(name)
+
+    def _blob_path(self, ref: ArtifactRef) -> Path:
+        path = self.root / "sha256" / ref.sha256[:2] / ref.sha256
+        try:
+            path.parent.resolve().relative_to(self.root)
+        except ValueError as exc:
+            raise AppError("artifact.path_invalid", {"sha256": ref.sha256}) from exc
+        return path
 
     def _commit_incoming(
         self,

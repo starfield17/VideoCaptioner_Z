@@ -17,7 +17,7 @@ from captioner.bootstrap import (
     create_batch_lease,
     create_job_config,
 )
-from captioner.core.application.durable_pipeline import write_cancel_marker
+from captioner.core.application.durable_pipeline import BatchStatus, write_cancel_marker
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobState, validate_identifier
@@ -87,10 +87,11 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
         lease.release()
 
 
-def status(batch_id: str, *, paths: AppPaths) -> BatchProjection:
+def status(batch_id: str, *, paths: AppPaths) -> BatchStatus:
     projection = _read_projection(batch_id, paths=paths, repair=False)
-    _common_config(projection)
-    return projection
+    config = _common_config(projection)
+    bundle = _bundle(batch_id, config, paths, initialize_runtime=False)
+    return bundle.service.read_status()
 
 
 def resume(
@@ -149,20 +150,28 @@ def cancel(batch_id: str, job_id: str | None, *, paths: AppPaths) -> Path:
     return write_cancel_marker(batch_dir / "control", job_id=job_id)
 
 
-def projection_payload(projection: BatchProjection, *, paths: AppPaths) -> dict[str, object]:
-    control = paths.batches_dir / projection.batch_id / "control"
-    stale_execution = _lease_is_stale(paths.batches_dir / projection.batch_id / "lease.json")
-    return {
+def projection_payload(
+    projection: BatchProjection | BatchStatus, *, paths: AppPaths
+) -> dict[str, object]:
+    if isinstance(projection, BatchStatus):
+        status_result: BatchStatus | None = projection
+        current = projection.projection
+    else:
+        status_result = None
+        current = projection
+    control = paths.batches_dir / current.batch_id / "control"
+    stale_execution = _lease_is_stale(paths.batches_dir / current.batch_id / "lease.json")
+    payload: dict[str, object] = {
         "schema_version": 1,
-        "batch_id": projection.batch_id,
+        "batch_id": current.batch_id,
         "state": "interrupted"
-        if stale_execution and projection.state.value == "running"
-        else projection.state.value,
-        "last_event_seq": projection.last_event_seq,
+        if stale_execution and current.state.value == "running"
+        else current.state.value,
+        "last_event_seq": current.last_event_seq,
         "manifest_status": JsonManifestStore(
-            resolve_safe_child(paths.batches_dir, projection.batch_id, field="batch_id")
+            resolve_safe_child(paths.batches_dir, current.batch_id, field="batch_id")
             / "manifest.json"
-        ).inspect(projection),
+        ).inspect(current),
         "cancel_requested": (control / "cancel-batch").exists()
         or any(control.glob("cancel-job-*")),
         "jobs": [
@@ -189,9 +198,24 @@ def projection_payload(projection: BatchProjection, *, paths: AppPaths) -> dict[
                 },
                 **_success_fields(job.input_path, job.config.output_dir),
             }
-            for job in projection.jobs
+            for job in current.jobs
         ],
     }
+    if status_result is not None:
+        payload["journal_tail_status"] = status_result.journal_tail_status
+        payload["manifest_status"] = status_result.manifest_status
+        payload["integrity"] = status_result.integrity
+        payload["integrity_errors"] = [
+            {
+                "job_id": issue.job_id,
+                "stage_name": issue.stage_name,
+                "code": issue.code,
+                "logical_name": issue.logical_name,
+                "sha256": issue.sha256,
+            }
+            for issue in status_result.integrity_errors
+        ]
+    return payload
 
 
 def _lease_is_stale(path: Path) -> bool:
@@ -239,13 +263,17 @@ def _success_fields(input_path: str, output_dir: str) -> dict[str, object]:
                 ]
             ),
         }
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise AppError(
-            "output.publication_invalid", {"logical_name": transcript_path.name}
-        ) from exc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+        return {}
 
 
-def _bundle(batch_id: str, config: JobConfig, paths: AppPaths) -> DurableServiceBundle:
+def _bundle(
+    batch_id: str,
+    config: JobConfig,
+    paths: AppPaths,
+    *,
+    initialize_runtime: bool = True,
+) -> DurableServiceBundle:
     return build_durable_service(
         batch_id,
         model_ref=config.model_ref,
@@ -256,6 +284,7 @@ def _bundle(batch_id: str, config: JobConfig, paths: AppPaths) -> DurableService
         ffprobe_bin=config.ffprobe_bin,
         paths=paths,
         segmentation=config.segmentation,
+        initialize_runtime=initialize_runtime,
     )
 
 
