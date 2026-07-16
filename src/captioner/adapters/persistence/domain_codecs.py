@@ -158,12 +158,13 @@ def decode_transcript(data: bytes) -> Transcript:
 def encode_track(track: SubtitleTrack) -> bytes:
     return encode_json(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "subtitle_track": {
                 "id": track.id,
                 "source_transcript_id": track.source_transcript_id,
                 "language": track.language,
                 "revision": track.revision,
+                "policy_signature": track.policy_signature,
                 "cues": [
                     {
                         "id": cue.id,
@@ -183,8 +184,15 @@ def encode_track(track: SubtitleTrack) -> bytes:
 
 def decode_track(data: bytes) -> SubtitleTrack:
     root = decode_json(data)
-    raw = _object(root, "subtitle_track", {"schema_version", "subtitle_track"})
-    _fields(raw, {"id", "source_transcript_id", "language", "revision", "cues"})
+    _fields(root, {"schema_version", "subtitle_track"})
+    schema_version = root.get("schema_version")
+    if schema_version not in {1, 2} or not isinstance(root.get("subtitle_track"), dict):
+        raise AppError("artifact.codec_invalid", {"reason": "subtitle_track"})
+    raw = cast(dict[str, object], root["subtitle_track"])
+    legacy_fields = {"id", "source_transcript_id", "language", "revision", "cues"}
+    current_fields = {*legacy_fields, "policy_signature"}
+    expected_fields = legacy_fields if schema_version == 1 else current_fields
+    _fields(raw, expected_fields)
     cues = tuple(
         SubtitleCue(
             _str(item, "id"),
@@ -200,9 +208,10 @@ def decode_track(data: bytes) -> SubtitleTrack:
     return SubtitleTrack(
         _str(raw, "id"),
         _str(raw, "source_transcript_id"),
-        _str(raw, "language"),
+        _str_or_none(raw, "language"),
         cues,
         _int(raw, "revision"),
+        "" if schema_version == 1 else _str(raw, "policy_signature"),
     )
 
 

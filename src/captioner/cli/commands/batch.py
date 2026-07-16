@@ -206,6 +206,7 @@ def projection_payload(
                 **(
                     {}
                     if status_result is not None
+                    and status_result.integrity != "valid"
                     else _success_fields(job.input_path, job.config.output_dir)
                 ),
             }
@@ -254,8 +255,14 @@ def _lease_is_stale(path: Path) -> bool:
 def _success_fields(input_path: str, output_dir: str) -> dict[str, object]:
     stem = Path(input_path).stem
     transcript_path = Path(output_dir) / f"{stem}.transcript.json"
+    subtitle_json_path = Path(output_dir) / f"{stem}.subtitle.json"
     subtitle_path = Path(output_dir) / f"{stem}.srt"
-    if not transcript_path.is_file() or not subtitle_path.is_file():
+    vtt_path = Path(output_dir) / f"{stem}.vtt"
+    ass_path = Path(output_dir) / f"{stem}.ass"
+    if not all(
+        path.is_file()
+        for path in (transcript_path, subtitle_json_path, subtitle_path, vtt_path, ass_path)
+    ):
         return {}
     try:
         root = json.loads(transcript_path.read_text(encoding="utf-8"))
@@ -263,7 +270,10 @@ def _success_fields(input_path: str, output_dir: str) -> dict[str, object]:
         return {
             "transcript_id": transcript["id"],
             "transcript_path": str(transcript_path),
+            "subtitle_json_path": str(subtitle_json_path),
             "subtitle_path": str(subtitle_path),
+            "vtt_path": str(vtt_path),
+            "ass_path": str(ass_path),
             "detected_language": transcript["language"],
             "word_count": len(transcript["words"]),
             "cue_count": len(
@@ -315,7 +325,13 @@ def _validate_output_collisions(inputs: tuple[Path, ...], output_dir: Path) -> N
     target_root = output_dir.expanduser().resolve()
     for source in inputs:
         stem = source.expanduser().resolve().stem
-        for suffix in (".transcript.json", ".srt"):
+        for suffix in (
+            ".transcript.json",
+            ".subtitle.json",
+            ".srt",
+            ".vtt",
+            ".ass",
+        ):
             target = target_root / f"{stem}{suffix}"
             key = os.path.normcase(str(target))
             previous = normalized.get(key)

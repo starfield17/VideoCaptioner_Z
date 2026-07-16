@@ -154,6 +154,13 @@ def test_all_stage_runners_execute_with_durable_inputs(tmp_path: Path) -> None:
             _request(tmp_path, (transcript_ref, track_ref)), _context(tmp_path)
         )
     )
+    assert {item.logical_name for item in exported} == {
+        "final-transcript.json",
+        "final-subtitle.json",
+        "final-subtitle.srt",
+        "final-subtitle.vtt",
+        "final-subtitle.ass",
+    }
     final_refs = tuple(_put(store, item.data or b"", item.logical_name) for item in exported)
     published = asyncio.run(
         PublishStage(store).execute(_request(tmp_path, final_refs), _context(tmp_path))

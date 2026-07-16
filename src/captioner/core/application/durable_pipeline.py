@@ -89,7 +89,13 @@ class DurablePipelineService:
             raise AppError("batch.config_inconsistent", {"reason": "runtime"})
         targets: set[str] = set()
         for _, input_path, config in jobs:
-            for suffix in (".transcript.json", ".srt"):
+            for suffix in (
+                ".transcript.json",
+                ".subtitle.json",
+                ".srt",
+                ".vtt",
+                ".ass",
+            ):
                 target = os.path.normcase(
                     str(Path(config.output_dir) / f"{input_path.stem}{suffix}")
                 )
@@ -590,7 +596,12 @@ def _cache_config(
     elif stage is StageName.SEGMENT:
         values = {"segmentation": config.segmentation}
     elif stage is StageName.EXPORT:
-        values = {"schema_version": 1}
+        values = {
+            "track_json": "track-json-v2",
+            "srt": "srt-v2",
+            "webvtt": "webvtt-v1",
+            "ass": "ass-v1",
+        }
     else:
         values = {"output_dir": config.output_dir, "overwrite": config.overwrite}
     return cast(Mapping[str, FrozenJsonValue], freeze_json_value(values))

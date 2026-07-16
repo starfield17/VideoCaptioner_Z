@@ -38,6 +38,7 @@ from captioner.core.application.stage_executor import EventFactory, StageExecuto
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.journal import replay
 from captioner.core.domain.stage import StageName
+from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig
 from captioner.infrastructure.app_paths import (
     AppPaths,
@@ -119,7 +120,14 @@ def create_job_config(
         SimpleSegmentationConfig().to_policy_config().to_mapping(),
         str(output_dir.expanduser().resolve()),
         overwrite,
-        {stage.value: "1" for stage in StageName},
+        {
+            stage.value: {
+                StageName.SEGMENT.value: "segment-v2",
+                StageName.EXPORT.value: "export-v2",
+                StageName.PUBLISH.value: "publish-v2",
+            }.get(stage.value, "1")
+            for stage in StageName
+        },
     )
 
 
@@ -183,24 +191,17 @@ def build_durable_service(
     )
     engine_config = FasterWhisperConfig(model_ref, device, compute_type, language)
     engine = FasterWhisperEngine(engine_config)
+    policy = SegmentationPolicyConfig.from_mapping(
+        segmentation or SegmentationPolicyConfig().to_mapping()
+    )
     runners = {
         StageName.INSPECT: InspectStage(FFprobeMediaInspector(process, executable=ffprobe_bin)),
         StageName.NORMALIZE: NormalizeStage(
             FFmpegAudioNormalizer(process, executable=ffmpeg_bin), durable
         ),
         StageName.TRANSCRIBE: TranscribeStage(engine, durable),
-        StageName.SEGMENT: SegmentStage(
-            durable,
-            SimpleSegmentationConfig.from_mapping(
-                segmentation
-                or {
-                    "max_duration_ms": 7_000,
-                    "max_text_units": 84,
-                    "hard_gap_ms": 700,
-                }
-            ),
-        ),
-        StageName.EXPORT: ExportStage(durable),
+        StageName.SEGMENT: SegmentStage(durable, policy),
+        StageName.EXPORT: ExportStage(durable, policy),
         StageName.PUBLISH: PublishStage(durable),
     }
     journal = JsonlJournal(batch_dir / "journal.jsonl")

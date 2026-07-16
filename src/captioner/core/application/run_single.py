@@ -13,8 +13,8 @@ from captioner.core.domain.execution import ExecutionContext
 from captioner.core.domain.media import MediaAsset
 from captioner.core.domain.subtitle import SubtitleTrack
 from captioner.core.domain.transcript import Transcript
+from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import (
-    SimpleSegmentationConfig,
     segment_transcript,
 )
 from captioner.core.ports.artifact_store import ArtifactStorePort
@@ -55,7 +55,7 @@ class RunSingleService:
     transcript_serializer: TranscriptSerializer
     subtitle_serializer: SubtitleSerializer
     temp_root: Path
-    segmentation_config: SimpleSegmentationConfig = field(default_factory=SimpleSegmentationConfig)
+    segmentation_config: SegmentationPolicyConfig = field(default_factory=SegmentationPolicyConfig)
 
     async def run(
         self, request: RunSingleRequest, context: ExecutionContext | None = None
