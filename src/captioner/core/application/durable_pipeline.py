@@ -127,9 +127,25 @@ class DurablePipelineService:
         return projection
 
     async def run(self, projection: BatchProjection) -> BatchProjection:
+        if self._has_cancel_requests(projection):
+            batch_requested = (self.control_dir / "cancel-batch").exists()
+            job_requested = any(
+                (self.control_dir / f"cancel-{job.job_id}").exists()
+                for job in projection.jobs
+            )
+            projection = self.acknowledge_cancel_requests(projection, active_job_id=None)
+            if batch_requested:
+                raise AppError("operation.cancelled", {"scope": "batch"})
+            if job_requested and len(projection.jobs) == 1:
+                raise AppError("operation.cancelled")
         for job in projection.jobs:
             if job.state in {JobState.CANCELLED, JobState.FAILED}:
                 continue
+            if (self.control_dir / "cancel-batch").exists():
+                projection = self.acknowledge_cancel_requests(
+                    projection, active_job_id=None
+                )
+                raise AppError("operation.cancelled", {"scope": "batch"})
             try:
                 projection = await self._run_job(projection, job.job_id)
             except AppError as exc:
@@ -142,7 +158,9 @@ class DurablePipelineService:
                     continue
                 raise
             if (self.control_dir / "cancel-batch").exists():
-                projection = self._cancel_pending_jobs(projection)
+                projection = self.acknowledge_cancel_requests(
+                    projection, active_job_id=None
+                )
                 break
         return projection
 
@@ -154,6 +172,7 @@ class DurablePipelineService:
         self.manifest.reconcile(projection)
         projection = self._interrupt_open_attempts(projection)
         projection = self._invalidate_corrupt_artifacts(projection)
+        projection = self.acknowledge_cancel_requests(projection, active_job_id=None)
         self._remove_stale_workspaces()
         return await self.run(projection)
 
@@ -239,10 +258,29 @@ class DurablePipelineService:
         self,
         projection: BatchProjection,
         *,
-        job_id: str,
         config: JobConfig,
         earliest_stage: StageName,
+        job_id: str | None = None,
     ) -> BatchProjection:
+        if job_id is None:
+            payload = cast(
+                Mapping[str, FrozenJsonValue],
+                freeze_json_value(
+                    {
+                        "config": config.to_dict(),
+                        "earliest_stage": earliest_stage.value,
+                    }
+                ),
+            )
+            event = self.event_factory.create(projection, "batch.config_updated", payload)
+            updated = apply_event(projection, event)
+            self._hit_config_point(projection, "before_batch_config_commit")
+            self.journal.append(event)
+            self._hit_config_point(updated, "after_batch_config_commit")
+            self._hit_config_point(updated, "before_batch_config_manifest")
+            self.manifest.write(updated)
+            self._hit_config_point(updated, "after_batch_config_manifest")
+            return updated
         projection = self._append(
             projection,
             "job.config_updated",
@@ -278,6 +316,15 @@ class DurablePipelineService:
         self.manifest.write(projection)
         return await self.run(projection)
 
+    def _hit_config_point(self, projection: BatchProjection, point: str) -> None:
+        self.executor.fault_injector.hit(
+            batch_id=projection.batch_id,
+            job_id="batch-config",
+            stage_name="batch-config",
+            attempt=1,
+            point=point,
+        )
+
     async def _run_job(self, projection: BatchProjection, job_id: str) -> BatchProjection:
         job = projection.job(job_id)
         token = MarkerCancellationToken(
@@ -305,23 +352,24 @@ class DurablePipelineService:
         except AppError as exc:
             current = replay(self.journal.repair_and_read())
             batch_requested = (self.control_dir / "cancel-batch").exists()
-            if (
-                exc.code == "operation.cancelled"
-                and current.job(job_id).state is not JobState.CANCELLED
-            ):
-                current = self._append(current, "job.cancelled", {"job_id": job_id})
-                self.manifest.write(current)
-                self._clear_job_marker(job_id)
-                if (self.control_dir / "cancel-batch").exists():
-                    self._cancel_pending_jobs(current)
+            cancellation = exc.code in {
+                "operation.cancelled",
+                "stage.cancellation_projection_failed",
+            }
+            if cancellation:
+                current = self.acknowledge_cancel_requests(
+                    current, active_job_id=job_id
+                )
             elif (
-                exc.code not in {"operation.cancelled", "stage.post_commit_failed"}
+                exc.code != "stage.post_commit_failed"
                 and current.job(job_id).state is not JobState.FAILED
             ):
                 current = self._append(current, "job.failed", {"job_id": job_id})
                 self.manifest.write(current)
-            if exc.code == "operation.cancelled" and batch_requested:
+            if cancellation and batch_requested:
                 raise AppError("operation.cancelled", {"scope": "batch"}) from exc
+            if cancellation and exc.code != "operation.cancelled":
+                raise AppError("operation.cancelled") from exc
             raise
         if projection.job(job_id).state is JobState.SUCCEEDED:
             return projection
@@ -330,19 +378,16 @@ class DurablePipelineService:
         except AppError as exc:
             if exc.code == "operation.cancelled":
                 batch_requested = (self.control_dir / "cancel-batch").exists()
-                projection = self._append(projection, "job.cancelled", {"job_id": job_id})
-                self.manifest.write(projection)
-                self._clear_job_marker(job_id)
-                if (self.control_dir / "cancel-batch").exists():
-                    projection = self._cancel_pending_jobs(projection)
+                projection = self.acknowledge_cancel_requests(
+                    projection, active_job_id=job_id
+                )
                 if batch_requested:
                     raise AppError("operation.cancelled", {"scope": "batch"}) from exc
                 raise
             raise
         projection = self._append(projection, "job.succeeded", {"job_id": job_id})
         self.manifest.write(projection)
-        if not token.is_cancelled:
-            self._clear_job_marker(job_id)
+        self._clear_job_marker(job_id)
         return projection
 
     def _interrupt_open_attempts(self, projection: BatchProjection) -> BatchProjection:
@@ -427,12 +472,65 @@ class DurablePipelineService:
     def _clear_job_marker(self, job_id: str) -> None:
         (self.control_dir / f"cancel-{job_id}").unlink(missing_ok=True)
 
-    def _cancel_pending_jobs(self, projection: BatchProjection) -> BatchProjection:
+    def _has_cancel_requests(self, projection: BatchProjection) -> bool:
+        return (self.control_dir / "cancel-batch").exists() or any(
+            (self.control_dir / f"cancel-{job.job_id}").exists() for job in projection.jobs
+        )
+
+    def acknowledge_cancel_requests(
+        self,
+        projection: BatchProjection,
+        *,
+        active_job_id: str | None,
+    ) -> BatchProjection:
+        batch_requested = (self.control_dir / "cancel-batch").exists()
+        targeted = {
+            job.job_id
+            for job in projection.jobs
+            if batch_requested
+            or job.job_id == active_job_id
+            or (self.control_dir / f"cancel-{job.job_id}").exists()
+        }
+        if not targeted:
+            return projection
+        events = self.journal.read_snapshot().events
         for job in projection.jobs:
-            if job.state in {JobState.PENDING, JobState.RUNNING, JobState.INTERRUPTED}:
-                projection = self._append(projection, "job.cancelled", {"job_id": job.job_id})
+            if job.job_id not in targeted:
+                continue
+            current = projection.job(job.job_id)
+            for stage in current.stages:
+                if stage.state is StageState.RUNNING:
+                    projection = self._append(
+                        projection,
+                        "stage.cancelled",
+                        {
+                            "job_id": job.job_id,
+                            "stage_name": stage.name.value,
+                            "attempt": stage.attempt,
+                            "error_code": "operation.cancelled",
+                        },
+                    )
+            current = projection.job(job.job_id)
+            if current.state in {
+                JobState.PENDING,
+                JobState.RUNNING,
+                JobState.INTERRUPTED,
+            } or (
+                current.state is JobState.CANCELLED
+                and not _has_job_cancel_event(events, job.job_id)
+            ):
+                projection = self._append(
+                    projection,
+                    "job.cancelled",
+                    {"job_id": job.job_id},
+                )
+            events = self.journal.read_snapshot().events
         self.manifest.write(projection)
-        (self.control_dir / "cancel-batch").unlink(missing_ok=True)
+        if batch_requested:
+            (self.control_dir / "cancel-batch").unlink(missing_ok=True)
+        for job_id in targeted:
+            if projection.job(job_id).state is JobState.CANCELLED:
+                self._clear_job_marker(job_id)
         return projection
 
 
@@ -516,3 +614,10 @@ def _issue_params(issue: IntegrityIssue) -> dict[str, str]:
     if issue.sha256 is not None:
         params["sha256"] = issue.sha256
     return params
+
+
+def _has_job_cancel_event(events: tuple[JournalEvent, ...], job_id: str) -> bool:
+    return any(
+        event.type == "job.cancelled" and event.payload.get("job_id") == job_id
+        for event in events
+    )

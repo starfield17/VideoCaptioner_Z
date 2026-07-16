@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobProjection, JobState, validate_identifier
 
 
@@ -48,4 +49,7 @@ class BatchProjection:
         return BatchState.PARTIAL
 
     def job(self, job_id: str) -> JobProjection:
-        return next(job for job in self.jobs if job.job_id == job_id)
+        for job in self.jobs:
+            if job.job_id == job_id:
+                return job
+        raise AppError("batch.job_not_found", {"job_id": job_id})

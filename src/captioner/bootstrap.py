@@ -239,7 +239,8 @@ def build_durable_service(
             raise AppError("fault_injection.disabled")
         try:
             stage_name, point = fault_spec.split(":", maxsplit=1)
-            StageName(stage_name)
+            if stage_name != "batch-config":
+                StageName(stage_name)
             _validate_fault_point(point)
         except ValueError as exc:
             from captioner.core.domain.errors import AppError
@@ -262,5 +263,9 @@ def _validate_fault_point(point: str) -> None:
         "before_journal_commit",
         "after_journal_commit",
         "before_manifest_projection",
+        "before_batch_config_commit",
+        "after_batch_config_commit",
+        "before_batch_config_manifest",
+        "after_batch_config_manifest",
     }:
         raise ValueError

@@ -169,6 +169,28 @@ class StageExecutor:
             post_commit_reason = "manifest_projection"
             self.manifest.write(projection)
         except AppError as exc:
+            if exc.code == "operation.cancelled":
+                projection = self._append(
+                    projection,
+                    "stage.cancelled",
+                    {
+                        **_stage_payload(job_id, runner.name, attempt),
+                        "error_code": exc.code,
+                    },
+                )
+                projection = self._append(
+                    projection,
+                    "job.cancelled",
+                    {"job_id": job_id},
+                )
+                try:
+                    self.manifest.write(projection)
+                except AppError as manifest_error:
+                    raise AppError(
+                        "stage.cancellation_projection_failed",
+                        {"job_id": job_id, "stage_name": runner.name.value},
+                    ) from manifest_error
+                raise
             if committed:
                 raise AppError(
                     "stage.post_commit_failed",
@@ -179,7 +201,7 @@ class StageExecutor:
                         "reason": post_commit_reason,
                     },
                 ) from exc
-            event_type = "stage.cancelled" if exc.code == "operation.cancelled" else "stage.failed"
+            event_type = "stage.failed"
             projection = self._append(
                 projection,
                 event_type,
@@ -188,14 +210,7 @@ class StageExecutor:
                     "error_code": exc.code,
                 },
             )
-            if event_type == "stage.cancelled":
-                projection = self._append(
-                    projection,
-                    "job.cancelled",
-                    {"job_id": job_id},
-                )
-            else:
-                projection = self._append(projection, "job.failed", {"job_id": job_id})
+            projection = self._append(projection, "job.failed", {"job_id": job_id})
             self.manifest.write(projection)
             raise
         else:

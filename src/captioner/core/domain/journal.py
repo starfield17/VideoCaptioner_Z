@@ -30,6 +30,7 @@ JOURNAL_SCHEMA_VERSION = 1
 EVENT_TYPES = frozenset(
     {
         "batch.created",
+        "batch.config_updated",
         "job.created",
         "job.config_updated",
         "job.retry_requested",
@@ -181,6 +182,8 @@ def _validate_envelope(projection: BatchProjection, event: JournalEvent) -> None
 
 
 def _apply_payload(projection: BatchProjection, event: JournalEvent) -> BatchProjection:
+    if event.type == "batch.config_updated":
+        return _update_batch_config(projection, event.payload)
     if event.type == "job.created":
         return _create_job(projection, event.payload)
     job_id = _required_str(event.payload, "job_id")
@@ -195,6 +198,27 @@ def _apply_payload(projection: BatchProjection, event: JournalEvent) -> BatchPro
         job = _apply_job_terminal(job, event.type)
     jobs = list(projection.jobs)
     jobs[job_index] = job
+    return replace(projection, jobs=tuple(jobs))
+
+
+def _update_batch_config(
+    projection: BatchProjection,
+    payload: Mapping[str, FrozenJsonValue],
+) -> BatchProjection:
+    if set(payload) != {"config", "earliest_stage"}:
+        raise AppError("journal.transition_invalid", {"reason": "batch_config_fields"})
+    config = _config_from_value(payload.get("config"))
+    try:
+        earliest_stage = StageName(_required_str(payload, "earliest_stage"))
+    except ValueError as exc:
+        raise AppError("journal.transition_invalid", {"reason": "stage_name"}) from exc
+    jobs: list[JobProjection] = []
+    for job in projection.jobs:
+        stages = _invalidate_suffix(list(job.stages), earliest_stage)
+        state = job.state
+        if state not in {JobState.FAILED, JobState.CANCELLED}:
+            state = JobState.PENDING
+        jobs.append(replace(job, config=config, state=state, stages=tuple(stages)))
     return replace(projection, jobs=tuple(jobs))
 
 
@@ -315,7 +339,12 @@ def _apply_job_terminal(job: JobProjection, event_type: str) -> JobProjection:
             raise AppError("journal.transition_invalid", {"reason": "stages_uncommitted"})
         return replace(job, state=JobState.SUCCEEDED)
     if event_type == "job.cancelled":
-        if job.state not in {JobState.PENDING, JobState.RUNNING, JobState.CANCELLED}:
+        if job.state not in {
+            JobState.PENDING,
+            JobState.RUNNING,
+            JobState.INTERRUPTED,
+            JobState.CANCELLED,
+        }:
             raise AppError("journal.transition_invalid", {"reason": "job_not_cancelled"})
         return replace(job, state=JobState.CANCELLED)
     if event_type == "job.failed":

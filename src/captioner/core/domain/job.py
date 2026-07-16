@@ -105,9 +105,9 @@ class JobConfig:
             self.vad_filter,
             self.ffmpeg_bin,
             self.ffprobe_bin,
-            self.normalization,
-            self.segmentation,
-            self.stage_versions,
+            _hashable_json(self.normalization),
+            _hashable_json(self.segmentation),
+            _hashable_json(self.stage_versions),
         )
 
 
@@ -126,3 +126,11 @@ class JobProjection:
 
     def stage(self, name: StageName) -> StageProjection:
         return self.stages[STAGE_PLAN.index(name)]
+
+
+def _hashable_json(value: FrozenJsonValue) -> object:
+    if isinstance(value, Mapping):
+        return tuple(sorted((key, _hashable_json(item)) for key, item in value.items()))
+    if isinstance(value, tuple):
+        return tuple(_hashable_json(item) for item in value)
+    return value

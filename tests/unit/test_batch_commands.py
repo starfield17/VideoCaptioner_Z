@@ -10,8 +10,10 @@ from typing import cast
 
 import pytest
 
+from captioner.adapters.persistence.jsonl_journal import JsonlJournal
 from captioner.bootstrap import build_durable_service, create_job_config, load_batch_config
 from captioner.cli.commands import batch
+from captioner.core.application.durable_pipeline import DurablePipelineService
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobProjection, JobState
@@ -153,6 +155,117 @@ def test_batch_helpers_cover_override_and_collision_policies(tmp_path: Path) -> 
             (tmp_path / "one" / "news.wav", tmp_path / "two" / "news.mp4"),
             tmp_path / "output",
         )
+
+
+def test_resume_output_creates_new_directory_and_rejects_file(tmp_path: Path) -> None:
+    prepare = cast(Callable[[Path], Path], batch_private._prepare_output_directory)
+    missing = tmp_path / "new" / "nested-output"
+
+    assert prepare(missing) == missing.resolve()
+    assert missing.is_dir()
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    assert prepare(existing) == existing.resolve()
+    regular_file = tmp_path / "output-file"
+    regular_file.write_bytes(b"not a directory")
+
+    with pytest.raises(AppError, match=r"output\.directory_failed"):
+        prepare(regular_file)
+
+
+def test_resume_output_creates_directory_before_config_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = resolve_app_paths(base_dir=tmp_path / "runtime")
+    input_path = tmp_path / "input.wav"
+    input_path.write_bytes(b"source")
+    initial_output = tmp_path / "initial-output"
+    initial = create_job_config(
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="en",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        output_dir=initial_output,
+        overwrite=False,
+    )
+    bundle = build_durable_service(
+        "batch-a",
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="en",
+        paths=paths,
+    )
+    bundle.service.create("batch-a", (("job-000001", input_path, initial),))
+    new_output = tmp_path / "created" / "output"
+    observed_event_counts: list[int] = []
+    real_prepare = batch_private._prepare_output_directory
+    journal_path = bundle.batch_dir / "journal.jsonl"
+
+    def observe_prepare(path: Path) -> Path:
+        observed_event_counts.append(len(JsonlJournal(journal_path).read_snapshot().events))
+        return real_prepare(path)
+
+    monkeypatch.setattr(batch_private, "_prepare_output_directory", observe_prepare)
+
+    async def stop_resume(self: DurablePipelineService) -> BatchProjection:
+        del self
+        raise AppError("test.resume_stop")
+
+    monkeypatch.setattr(DurablePipelineService, "resume", stop_resume)
+    with pytest.raises(AppError):
+        batch.resume(
+            "batch-a",
+            paths=paths,
+            overrides=batch.ResumeOverrides(output_dir=new_output),
+        )
+
+    assert new_output.is_dir()
+    assert observed_event_counts == [2]
+    assert sum(
+        event.type == "batch.config_updated"
+        for event in JsonlJournal(journal_path).read_snapshot().events
+    ) == 1
+
+
+def test_resume_output_failure_leaves_journal_unchanged(tmp_path: Path) -> None:
+    paths = resolve_app_paths(base_dir=tmp_path / "runtime")
+    input_path = tmp_path / "input.wav"
+    input_path.write_bytes(b"source")
+    initial = create_job_config(
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="en",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        output_dir=tmp_path / "initial-output",
+        overwrite=False,
+    )
+    bundle = build_durable_service(
+        "batch-a",
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="en",
+        paths=paths,
+    )
+    bundle.service.create("batch-a", (("job-000001", input_path, initial),))
+    journal_path = bundle.batch_dir / "journal.jsonl"
+    before = journal_path.read_bytes()
+    regular_file = tmp_path / "not-a-directory"
+    regular_file.write_bytes(b"file")
+
+    with pytest.raises(AppError, match=r"output\.directory_failed"):
+        batch.resume(
+            "batch-a",
+            paths=paths,
+            overrides=batch.ResumeOverrides(output_dir=regular_file),
+        )
+
+    assert journal_path.read_bytes() == before
 
 
 def test_projection_payload_reports_stale_execution_and_cancel_markers(tmp_path: Path) -> None:

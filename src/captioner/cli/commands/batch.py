@@ -22,7 +22,7 @@ from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobState, validate_identifier
 from captioner.core.domain.journal import replay
-from captioner.core.domain.stage import StageName
+from captioner.core.domain.stage import STAGE_PLAN, StageName
 from captioner.infrastructure.app_paths import AppPaths, resolve_safe_child
 from captioner.infrastructure.ids import new_id
 
@@ -103,16 +103,21 @@ def resume(
     try:
         projection = _read_projection(batch_id, paths=paths, repair=True)
         config = _common_config(projection)
+        if overrides is not None and overrides.output_dir is not None:
+            output_dir = _prepare_output_directory(overrides.output_dir)
+            overrides = replace(overrides, output_dir=output_dir)
         selected = config if overrides is None else _apply_overrides(config, overrides)
         bundle = _bundle(batch_id, selected, paths)
         if selected != config:
-            for job in projection.jobs:
-                projection = bundle.service.update_config(
-                    projection,
-                    job_id=job.job_id,
-                    config=selected,
-                    earliest_stage=_earliest_change(job.config, selected),
-                )
+            earliest = min(
+                (_earliest_change(job.config, selected) for job in projection.jobs),
+                key=STAGE_PLAN.index,
+            )
+            projection = bundle.service.update_config(
+                projection,
+                config=selected,
+                earliest_stage=earliest,
+            )
         return asyncio.run(bundle.service.resume())
     finally:
         lease.release()
@@ -135,10 +140,7 @@ def cancel(batch_id: str, job_id: str | None, *, paths: AppPaths) -> Path:
     projection = _read_projection(batch_id, paths=paths, repair=False)
     if job_id is not None:
         validate_identifier(job_id, field="job_id")
-        try:
-            job = projection.job(job_id)
-        except StopIteration as exc:
-            raise AppError("batch.job_not_found", {"job_id": job_id}) from exc
+        job = projection.job(job_id)
         if job.state in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED}:
             raise AppError("batch.cancel_invalid", {"reason": "terminal"})
     elif all(
@@ -196,7 +198,11 @@ def projection_payload(
                     }
                     for stage in job.stages
                 },
-                **_success_fields(job.input_path, job.config.output_dir),
+                **(
+                    {}
+                    if status_result is not None
+                    else _success_fields(job.input_path, job.config.output_dir)
+                ),
             }
             for job in current.jobs
         ],
@@ -263,8 +269,10 @@ def _success_fields(input_path: str, output_dir: str) -> dict[str, object]:
                 ]
             ),
         }
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
-        return {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise AppError(
+            "output.publication_invalid", {"logical_name": transcript_path.name}
+        ) from exc
 
 
 def _bundle(
@@ -314,6 +322,19 @@ def _validate_output_collisions(inputs: tuple[Path, ...], output_dir: Path) -> N
             normalized[key] = source
 
 
+def _prepare_output_directory(path: Path) -> Path:
+    requested = path.expanduser()
+    if requested.is_symlink():
+        raise AppError("output.directory_invalid", {"path": str(requested)})
+    try:
+        requested.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AppError("output.directory_failed", {"path": str(requested)}) from exc
+    if requested.is_symlink() or not requested.is_dir():
+        raise AppError("output.directory_invalid", {"path": str(requested)})
+    return requested.resolve()
+
+
 def _read_projection(batch_id: str, *, paths: AppPaths, repair: bool) -> BatchProjection:
     batch_dir = resolve_safe_child(paths.batches_dir, batch_id, field="batch_id")
     journal = JsonlJournal(batch_dir / "journal.jsonl")
@@ -325,7 +346,7 @@ def _read_projection(batch_id: str, *, paths: AppPaths, repair: bool) -> BatchPr
 
 def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig:
     if overrides.model_ref is not None:
-        return create_job_config(
+        candidate = create_job_config(
             model_ref=overrides.model_ref,
             device=overrides.device or config.device,
             compute_type=overrides.compute_type or config.compute_type,
@@ -336,6 +357,15 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
             if overrides.output_dir is None
             else overrides.output_dir,
             overwrite=config.overwrite,
+        )
+        return replace(
+            candidate,
+            vad_filter=config.vad_filter,
+            ffmpeg_bin=config.ffmpeg_bin,
+            ffprobe_bin=config.ffprobe_bin,
+            normalization=config.normalization,
+            segmentation=config.segmentation,
+            stage_versions=config.stage_versions,
         )
     return replace(
         config,
@@ -349,13 +379,19 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
 
 
 def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:
+    if old.ffprobe_bin != new.ffprobe_bin:
+        return StageName.INSPECT
+    if old.ffmpeg_bin != new.ffmpeg_bin or old.normalization != new.normalization:
+        return StageName.NORMALIZE
     if (
+        old.model_ref,
         old.model_identity,
         old.device,
         old.compute_type,
         old.language,
         old.vad_filter,
     ) != (
+        new.model_ref,
         new.model_identity,
         new.device,
         new.compute_type,
@@ -365,4 +401,13 @@ def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:
         return StageName.TRANSCRIBE
     if old.segmentation != new.segmentation:
         return StageName.SEGMENT
+    if old.stage_versions != new.stage_versions:
+        for stage in STAGE_PLAN:
+            if old.stage_versions.get(stage.value) != new.stage_versions.get(stage.value):
+                return stage
+        raise AppError("batch.config_inconsistent", {"reason": "stage_versions"})
+    if old.output_dir != new.output_dir or old.overwrite != new.overwrite:
+        return StageName.PUBLISH
+    if old != new:
+        raise AppError("batch.config_inconsistent", {"reason": "unknown_config_change"})
     return StageName.PUBLISH
