@@ -20,6 +20,13 @@ Stage suffix while preserving attempt numbers. The CLI never emits a sequence
 of per-Job configuration events; legacy `job.config_updated` records remain
 readable only for older development Journals.
 
+Phase 3 persists the complete segmentation policy in the canonical JobConfig.
+Legacy Phase 2 mappings containing only `max_duration_ms`, `max_text_units`,
+and `hard_gap_ms` are accepted and filled with deterministic defaults; old
+events are not rewritten. Stage versions `segment-v2`, `export-v2`, and
+`publish-v2` make an upgraded Batch invalidate the correct suffix. At every
+complete event boundary, all Jobs have one runtime configuration signature.
+
 Bytes after the final newline are truncated even if valid JSON. Any malformed,
 invalid UTF-8, schema-invalid, missing-sequence, or duplicate complete line is
 `journal.corrupt`. An uncertain append is reconciled by exact event ID, sequence,

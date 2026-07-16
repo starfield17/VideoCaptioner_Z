@@ -32,7 +32,7 @@ def _integer_ms(value: object, field: str) -> None:
 def _time_range(start_ms: int, end_ms: int, field: str) -> None:
     _integer_ms(start_ms, f"{field}.start_ms")
     _integer_ms(end_ms, f"{field}.end_ms")
-    if start_ms < 0 or end_ms <= start_ms:
+    if start_ms < 0 or end_ms < start_ms:
         raise AppError(
             "transcript.invalid",
             {"field": field, "reason": "timestamp", "start_ms": start_ms, "end_ms": end_ms},

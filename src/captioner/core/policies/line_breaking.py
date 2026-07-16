@@ -20,6 +20,8 @@ def break_lines(text: str, config: SegmentationPolicyConfig) -> tuple[str, ...]:
     value = normalize_text(text)
     if not value:
         return ()
+    if config.max_lines == 1:
+        return (value,)
     if measure_text(value).display_columns <= config.max_line_width:
         return (value,)
     clusters = grapheme_clusters(value)
@@ -41,8 +43,7 @@ def break_lines(text: str, config: SegmentationPolicyConfig) -> tuple[str, ...]:
         protected = protected_break_cost(value, boundary)
         punctuation = punctuation_attachment_cost(value, boundary)
         orphan = int(
-            min(measure_text(left).reading_characters, measure_text(right).reading_characters)
-            <= 1
+            min(measure_text(left).reading_characters, measure_text(right).reading_characters) <= 1
         )
         cost = (
             overflow * config.overflow_penalty,
@@ -80,7 +81,12 @@ def _candidate_indices(clusters: Sequence[str]) -> tuple[int, ...]:
     for index in range(1, len(clusters)):
         left = clusters[index - 1]
         right = clusters[index]
-        if left.isspace() or right.isspace() or (_cjk(left) and _cjk(right)):
+        if (
+            left.isspace()
+            or right.isspace()
+            or (_cjk(left) and _cjk(right))
+            or (_cjk(left) != _cjk(right) and not left.isspace() and not right.isspace())
+        ):
             indices.append(index)
     return tuple(indices)
 

@@ -1,4 +1,4 @@
-"""Durable Phase 2 Batch CLI command boundaries."""
+"""Durable Phase 2/3 Batch CLI command boundaries."""
 
 from __future__ import annotations
 
@@ -205,8 +205,7 @@ def projection_payload(
                 },
                 **(
                     {}
-                    if status_result is not None
-                    and status_result.integrity != "valid"
+                    if status_result is not None and status_result.integrity != "valid"
                     else _success_fields(job.input_path, job.config.output_dir)
                 ),
             }

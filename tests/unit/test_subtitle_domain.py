@@ -49,3 +49,8 @@ def test_blank_source_word_ids_are_rejected() -> None:
 def test_subtitle_rejects_float_milliseconds() -> None:
     with pytest.raises(AppError, match="integer_ms"):
         SubtitleCue("cue-1", 0.5, 1_000, ("word-1",), "one", None, ("one",))  # type: ignore[arg-type]
+
+
+def test_subtitle_source_text_must_be_canonical_nfc() -> None:
+    with pytest.raises(AppError, match="not_canonical"):
+        SubtitleCue("cue-1", 0, 100, ("word-1",), "e\u0301", None, ("é",))

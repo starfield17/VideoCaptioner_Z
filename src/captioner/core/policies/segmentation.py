@@ -10,7 +10,11 @@ from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack, derive_su
 from captioner.core.domain.subtitle_validation import validate_subtitle_track
 from captioner.core.domain.transcript import Transcript, WordToken
 from captioner.core.policies.line_breaking import break_lines
-from captioner.core.policies.protected_spans import protected_break_cost
+from captioner.core.policies.protected_spans import (
+    ProtectedSpan,
+    find_protected_spans,
+    protected_break_cost,
+)
 from captioner.core.policies.reading_speed import reading_speed
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.unicode_metrics import measure_text, normalize_text
@@ -129,7 +133,8 @@ def _solve_partition(
     progress: Callable[[], None] | None,
 ) -> tuple[tuple[tuple[WordToken, ...], ...], bool]:
     count = len(words)
-    full_text = _join_words(words)
+    full_text, boundary_offsets = _canonical_text_and_boundaries(words)
+    protected_spans = find_protected_spans(full_text)
     best: list[_Path | None] = [None] * (count + 1)
     best[0] = _Path(_zero_cost(), ())
     progress_emitted = False
@@ -138,7 +143,15 @@ def _solve_partition(
         if prior is None:
             continue
         for end in range(start + 1, min(count, start + _MAX_CANDIDATE_WORDS) + 1):
-            candidate = _evaluate_candidate(words, start, end, full_text, config)
+            candidate = _evaluate_candidate(
+                words,
+                start,
+                end,
+                full_text,
+                boundary_offsets,
+                protected_spans,
+                config,
+            )
             if progress is not None and not progress_emitted and end == start + 1 and count > 1:
                 progress()
                 progress_emitted = True
@@ -164,6 +177,8 @@ def _evaluate_candidate(
     start: int,
     end: int,
     full_text: str,
+    boundary_offsets: tuple[int, ...],
+    protected_spans: tuple[ProtectedSpan, ...],
     config: SegmentationPolicyConfig,
 ) -> _Candidate:
     selected = words[start:end]
@@ -187,9 +202,10 @@ def _evaluate_candidate(
         metrics.reading_characters * 1_000_000 - config.max_cps_milli * duration_ms,
     )
     width_over = max(0, metrics.display_columns - config.max_cue_width) + line_width_over
-    boundary = len(_join_words(words[:end]))
+    duration_under = max(0, config.min_duration_ms - duration_ms)
+    boundary = boundary_offsets[end]
     protected = (
-        protected_break_cost(full_text, boundary) if end < len(words) else 0
+        protected_break_cost(full_text, boundary, protected_spans) if end < len(words) else 0
     )
     boundary_quality = 0
     silence_quality = 0
@@ -214,9 +230,9 @@ def _evaluate_candidate(
         cps_over,
         duration_over,
         width_over,
-        -boundary_quality * config.punctuation_bonus
-        - silence_quality * config.silence_bonus,
+        -boundary_quality * config.punctuation_bonus - silence_quality * config.silence_bonus,
         abs(duration_ms - config.target_duration_ms),
+        duration_under,
         line_balance,
         1,
     )
@@ -240,8 +256,35 @@ def _join_words(words: Sequence[WordToken]) -> str:
     return normalize_text("".join(word.text for word in words))
 
 
+def _canonical_text_and_boundaries(
+    words: Sequence[WordToken],
+) -> tuple[str, tuple[int, ...]]:
+    """Build canonical source text and word-end offsets in one pass.
+
+    Word text is already a valid token, so normalizing each token and adding
+    one separator when either adjacent source token contains whitespace is
+    equivalent to normalizing their concatenation for the supported transcript
+    representation. Keeping offsets here avoids a whole-prefix join for every
+    dynamic-programming candidate.
+    """
+    pieces: list[str] = []
+    offsets = [0]
+    previous_raw: str | None = None
+    for word in words:
+        piece = normalize_text(word.text)
+        separator = previous_raw is not None and (
+            previous_raw[-1].isspace() or word.text[0].isspace()
+        )
+        if separator:
+            pieces.append(" ")
+        pieces.append(piece)
+        offsets.append(offsets[-1] + len(piece) + int(separator))
+        previous_raw = word.text
+    return "".join(pieces), tuple(offsets)
+
+
 def _zero_cost() -> _Cost:
-    return (0,) * 10
+    return (0,) * 11
 
 
 def _add_cost(left: _Cost, right: _Cost) -> _Cost:

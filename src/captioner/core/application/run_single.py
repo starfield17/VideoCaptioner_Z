@@ -1,4 +1,4 @@
-"""One-shot application service for the Phase 1 vertical slice."""
+"""One-shot application service with deterministic Phase 3 subtitle export."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from captioner.core.application.output_transaction import commit_output_pair
+from captioner.core.application.output_transaction import commit_output_pair, commit_output_set
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
 from captioner.core.domain.media import MediaAsset
@@ -39,6 +39,9 @@ class RunSingleResult:
     detected_language: str
     word_count: int
     cue_count: int
+    subtitle_json_path: Path | None = None
+    vtt_path: Path | None = None
+    ass_path: Path | None = None
 
 
 ArtifactStoreFactory = Callable[[Path], ArtifactStorePort]
@@ -56,6 +59,9 @@ class RunSingleService:
     subtitle_serializer: SubtitleSerializer
     temp_root: Path
     segmentation_config: SegmentationPolicyConfig = field(default_factory=SegmentationPolicyConfig)
+    subtitle_json_serializer: SubtitleSerializer | None = None
+    webvtt_serializer: SubtitleSerializer | None = None
+    ass_serializer: SubtitleSerializer | None = None
 
     async def run(
         self, request: RunSingleRequest, context: ExecutionContext | None = None
@@ -82,6 +88,38 @@ class RunSingleService:
             transcript_bytes = self.transcript_serializer(transcript)
             srt_bytes = self.subtitle_serializer(track)
             execution.raise_if_cancelled()
+            extra_serializers = (
+                self.subtitle_json_serializer,
+                self.webvtt_serializer,
+                self.ass_serializer,
+            )
+            if any(serializer is not None for serializer in extra_serializers) and not all(
+                serializer is not None for serializer in extra_serializers
+            ):
+                raise AppError("output.serializer_invalid")
+            if all(serializer is not None for serializer in extra_serializers):
+                json_serializer = self.subtitle_json_serializer
+                webvtt_serializer = self.webvtt_serializer
+                ass_serializer = self.ass_serializer
+                assert json_serializer is not None
+                assert webvtt_serializer is not None
+                assert ass_serializer is not None
+                extra_outputs: tuple[tuple[str, bytes], ...] | None = (
+                    (
+                        f"{asset.source_path.stem}.subtitle.json",
+                        json_serializer(track),
+                    ),
+                    (
+                        f"{asset.source_path.stem}.vtt",
+                        webvtt_serializer(track),
+                    ),
+                    (
+                        f"{asset.source_path.stem}.ass",
+                        ass_serializer(track),
+                    ),
+                )
+            else:
+                extra_outputs = None
             return _commit_outputs(
                 store=self.artifact_store_factory(output_dir),
                 asset=asset,
@@ -91,6 +129,7 @@ class RunSingleService:
                 srt_bytes=srt_bytes,
                 overwrite=request.overwrite,
                 context=execution,
+                extra_outputs=extra_outputs,
             )
 
 
@@ -120,16 +159,31 @@ def _commit_outputs(
     srt_bytes: bytes,
     overwrite: bool,
     context: ExecutionContext,
+    extra_outputs: tuple[tuple[str, bytes], ...] | None,
 ) -> RunSingleResult:
     transcript_key = f"{asset.source_path.stem}.transcript.json"
     subtitle_key = f"{asset.source_path.stem}.srt"
-    keys = (transcript_key, subtitle_key)
-    transcript_path, subtitle_path = commit_output_pair(
-        store,
-        ((keys[0], transcript_bytes), (keys[1], srt_bytes)),
-        overwrite=overwrite,
-        context=context,
-    )
+    if extra_outputs is None:
+        transcript_path, subtitle_path = commit_output_pair(
+            store,
+            ((transcript_key, transcript_bytes), (subtitle_key, srt_bytes)),
+            overwrite=overwrite,
+            context=context,
+        )
+        subtitle_json_path = vtt_path = ass_path = None
+    else:
+        paths = commit_output_set(
+            store,
+            (
+                (transcript_key, transcript_bytes),
+                *extra_outputs[:1],
+                (subtitle_key, srt_bytes),
+                *extra_outputs[1:],
+            ),
+            overwrite=overwrite,
+            context=context,
+        )
+        transcript_path, subtitle_json_path, subtitle_path, vtt_path, ass_path = paths
     return RunSingleResult(
         media_id=asset.id,
         transcript_id=transcript.id,
@@ -138,4 +192,7 @@ def _commit_outputs(
         detected_language=transcript.language,
         word_count=len(transcript.words),
         cue_count=len(track.cues),
+        subtitle_json_path=subtitle_json_path,
+        vtt_path=vtt_path,
+        ass_path=ass_path,
     )

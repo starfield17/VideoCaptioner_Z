@@ -24,6 +24,13 @@ def test_cjk_breaks_on_grapheme_boundaries_and_preserves_text() -> None:
     assert all(measure_text(line).display_columns <= 24 for line in lines)
 
 
+def test_mixed_cjk_and_latin_can_break_at_script_transition() -> None:
+    text = "这是一个很长的English句子用于测试"
+    lines = break_lines(text, _config(16))
+    assert len(lines) == 2
+    assert join_rendered_lines(lines) == text
+
+
 def test_emoji_zwj_sequence_is_never_split() -> None:
     family = "👨‍👩‍👧‍👦"
     lines = break_lines(f"{family} family words", _config(10))
@@ -36,6 +43,11 @@ def test_long_atomic_token_uses_grapheme_safe_fallback() -> None:
     assert len(lines) == 1
     assert join_rendered_lines(lines) == "abcdefghijklmnop"
     assert measure_text(lines[0]).display_columns > 8
+
+
+def test_configured_single_line_policy_does_not_split() -> None:
+    config = SegmentationPolicyConfig(max_lines=1, max_line_width=8, max_cue_width=8)
+    assert break_lines("one two three", config) == ("one two three",)
 
 
 def test_currency_and_unit_remain_together_when_feasible() -> None:

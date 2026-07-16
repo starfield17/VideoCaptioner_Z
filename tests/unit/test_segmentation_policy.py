@@ -17,6 +17,14 @@ def test_legacy_configuration_is_completed_deterministically() -> None:
     assert policy.signature == SegmentationPolicyConfig.from_mapping(policy.to_mapping()).signature
 
 
+def test_short_legacy_duration_is_completed_without_invalid_defaults() -> None:
+    policy = SegmentationPolicyConfig.from_mapping(
+        {"max_duration_ms": 1, "max_text_units": 2, "hard_gap_ms": 0}
+    )
+    assert policy.min_duration_ms == 1
+    assert policy.target_duration_ms == 1
+
+
 def test_policy_rejects_partial_unknown_configuration() -> None:
     with pytest.raises(AppError, match=r"job\.config_invalid"):
         SegmentationPolicyConfig.from_mapping({"max_duration_ms": 7_000})

@@ -1,4 +1,4 @@
-"""Strict deterministic JSON codecs for Phase 2 Stage artifacts."""
+"""Strict deterministic JSON codecs for Phase 2/3 Stage artifacts."""
 
 from __future__ import annotations
 
@@ -23,17 +23,37 @@ def encode_json(value: object) -> bytes:
             value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
         )
         + "\n"
-    ).encode()
+    ).encode("utf-8")
 
 
 def decode_json(data: bytes) -> dict[str, object]:
     try:
-        value = cast(object, json.loads(data.decode("utf-8")))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = cast(
+            object,
+            json.loads(
+                data.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_json_constant,
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise AppError("artifact.codec_invalid", {"reason": "json"}) from exc
     if not isinstance(value, dict):
         raise AppError("artifact.codec_invalid", {"reason": "root"})
     return cast(dict[str, object], value)
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_json_key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non_finite_json_value:{value}")
 
 
 def encode_media(asset: MediaAsset) -> bytes:
@@ -186,13 +206,30 @@ def decode_track(data: bytes) -> SubtitleTrack:
     root = decode_json(data)
     _fields(root, {"schema_version", "subtitle_track"})
     schema_version = root.get("schema_version")
-    if schema_version not in {1, 2} or not isinstance(root.get("subtitle_track"), dict):
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in {1, 2}
+        or not isinstance(root.get("subtitle_track"), dict)
+    ):
         raise AppError("artifact.codec_invalid", {"reason": "subtitle_track"})
     raw = cast(dict[str, object], root["subtitle_track"])
     legacy_fields = {"id", "source_transcript_id", "language", "revision", "cues"}
     current_fields = {*legacy_fields, "policy_signature"}
     expected_fields = legacy_fields if schema_version == 1 else current_fields
     _fields(raw, expected_fields)
+    cue_fields = {
+        "id",
+        "start_ms",
+        "end_ms",
+        "source_word_ids",
+        "source_text",
+        "translated_text",
+        "lines",
+    }
+    raw_cues = _objects(raw, "cues")
+    for cue in raw_cues:
+        _fields(cue, cue_fields)
     cues = tuple(
         SubtitleCue(
             _str(item, "id"),
@@ -203,7 +240,7 @@ def decode_track(data: bytes) -> SubtitleTrack:
             _str_or_none(item, "translated_text"),
             tuple(_strings(item, "lines")),
         )
-        for item in _objects(raw, "cues")
+        for item in raw_cues
     )
     return SubtitleTrack(
         _str(raw, "id"),

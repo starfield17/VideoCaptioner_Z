@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from captioner.adapters.subtitles import ass
+from captioner.core.domain.errors import AppError
 from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack
 
 
@@ -42,3 +45,16 @@ def test_ass_escapes_override_braces_and_backslashes() -> None:
         0,
     )
     assert ass.parse(ass.serialize_bytes(track)).cues[0].lines == (text,)
+
+
+def test_ass_parser_rejects_unescaped_override_tags() -> None:
+    track = SubtitleTrack(
+        "track-1",
+        "transcript-1",
+        "en",
+        (SubtitleCue("cue-000001", 0, 1, ("word-1",), "x", None, ("x",)),),
+        0,
+    )
+    data = ass.serialize(track).replace("x\n", "{\\i1}x\n").encode("utf-8")
+    with pytest.raises(AppError, match=r"export\.ass_invalid"):
+        ass.parse(data)

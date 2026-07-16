@@ -4,9 +4,16 @@ from captioner.core.policies.protected_spans import find_protected_spans, protec
 
 
 def test_numbers_currency_dates_and_units_are_protected() -> None:
-    text = "1,000 1.25 $100 10 kg 2026-07-16 10:30 AM"
+    text = "1,000 1.25 $100 +65 1234 5678 10 kg 2026-07-16 July 16, 2026 10:30 AM Dr."
     spans = find_protected_spans(text)
-    assert {span.kind for span in spans} >= {"number", "currency", "date-time", "unit"}
+    assert {span.kind for span in spans} >= {
+        "number",
+        "currency",
+        "phone",
+        "date-time",
+        "unit",
+        "abbreviation",
+    }
     assert protected_break_cost(text, text.index("000")) == 1
 
 

@@ -10,6 +10,7 @@ from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack, derive_su
 from captioner.core.domain.transcript import Transcript, TranscriptSegment, WordToken
 from captioner.core.policies.segmentation import segment_transcript_dp
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
+from captioner.core.policies.unicode_metrics import normalize_text
 
 __all__ = ["SegmentationPolicyConfig", "SimpleSegmentationConfig", "segment_transcript"]
 
@@ -91,7 +92,7 @@ def _legacy_segment_transcript(
         while words:
             end = _choose_end(words, config)
             selected = words[:end]
-            source_text = "".join(word.text for word in selected).strip()
+            source_text = normalize_text("".join(word.text for word in selected))
             word_ids = tuple(word.id for word in selected)
             if not source_text or assigned.intersection(word_ids):
                 raise AppError("subtitle.segmentation_failed", {"segment_id": segment.id})
@@ -162,10 +163,7 @@ def _choose_end(words: list[WordToken], config: SimpleSegmentationConfig) -> int
         punctuation = current.text.rstrip().endswith(
             tuple(".,!?;:\uff0c\u3002\uff01\uff1f\uff1b\uff1a")
         )
-        silence = (
-            end < len(words)
-            and words[end].start_ms - current.end_ms >= config.hard_gap_ms
-        )
+        silence = end < len(words) and words[end].start_ms - current.end_ms >= config.hard_gap_ms
         if punctuation or silence:
             preferred.append(end)
     return preferred[-1] if preferred else fit_end

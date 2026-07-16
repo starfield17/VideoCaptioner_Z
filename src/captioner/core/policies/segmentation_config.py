@@ -75,7 +75,7 @@ class SegmentationPolicyConfig:
         )
         if any(value < 0 for value in nonnegative):
             raise ValueError
-        if self.max_lines != 2:
+        if not 1 <= self.max_lines <= 2:
             raise ValueError
         if self.min_duration_ms > self.max_duration_ms:
             raise ValueError
@@ -96,8 +96,10 @@ class SegmentationPolicyConfig:
             max_text_units = _positive_int(values, "max_text_units")
             hard_gap = _nonnegative_int(values, "hard_gap_ms")
             return cls(
+                min_duration_ms=min(800, max_duration),
                 max_duration_ms=max_duration,
                 target_duration_ms=min(3_500, max_duration),
+                preferred_gap_ms=min(300, hard_gap),
                 hard_gap_ms=hard_gap,
                 max_line_width=min(42, max_text_units),
                 max_cue_width=max_text_units,

@@ -46,6 +46,13 @@ def test_transcript_rejects_float_milliseconds() -> None:
         WordToken("word-1", "hello", 0.5, 1_000)  # type: ignore[arg-type]
 
 
+def test_word_with_equal_timestamps_is_accepted_for_segmentation_normalization() -> None:
+    word = WordToken("word-1", "hello", 100, 100)
+    segment = TranscriptSegment("segment-1", (word.id,), "hello", 100, 100, None)
+    transcript = Transcript("transcript-1", "en", (word,), (segment,), "fake", "model", {})
+    assert transcript.words == (word,)
+
+
 def test_unassigned_word_is_rejected() -> None:
     first = WordToken("word-1", "one", 0, 100)
     second = WordToken("word-2", "two", 100, 200)

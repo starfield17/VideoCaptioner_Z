@@ -224,8 +224,7 @@ class PublishStage:
         targets = tuple((target_name, ref) for _, target_name, ref in target_specs)
         store = LocalArtifactStore(Path(request.config.output_dir))
         if not all(
-            _published_matches(Path(request.config.output_dir) / key, ref)
-            for key, ref in targets
+            _published_matches(Path(request.config.output_dir) / key, ref) for key, ref in targets
         ):
             commit_output_set(
                 store,
@@ -239,13 +238,13 @@ class PublishStage:
         receipt = PublicationReceipt(
             hashlib.sha256("".join(ref.sha256 for _, ref in targets).encode()).hexdigest(),
             tuple(
-            PublishedTarget(
-                str((Path(request.config.output_dir) / key).resolve()),
-                ref.sha256,
-                ref.size_bytes,
-                key,
-            )
-            for key, ref in targets
+                PublishedTarget(
+                    str(_target_path(Path(request.config.output_dir), key)),
+                    ref.sha256,
+                    ref.size_bytes,
+                    key,
+                )
+                for key, ref in targets
             ),
         )
         return (
@@ -304,7 +303,7 @@ def verify_publication(
         "".join(ref.sha256 for _, _, ref in target_specs).encode()
     ).hexdigest()
     expected_targets = {
-        str((output_dir / target_name).resolve()): (ref, target_name)
+        str(_target_path(output_dir, target_name)): (ref, target_name)
         for _, target_name, ref in target_specs
     }
     if (
@@ -370,3 +369,8 @@ def _publication_specs(
         (logical_name, target_name, export_by_name[logical_name])
         for logical_name, target_name in names
     )
+
+
+def _target_path(output_dir: Path, target_name: str) -> Path:
+    """Resolve only the output root; keep the final target path lexical."""
+    return output_dir.expanduser().resolve() / target_name

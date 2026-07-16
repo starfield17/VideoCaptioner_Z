@@ -43,3 +43,30 @@ def test_subtitle_json_rejects_missing_and_unknown_fields() -> None:
     document["subtitle_track"]["unknown"] = True
     with pytest.raises(AppError, match=r"artifact\.codec_invalid"):
         parse(encode_json(document))
+
+
+def test_subtitle_json_rejects_unknown_cue_fields() -> None:
+    track = SubtitleTrack(
+        "track-1",
+        "transcript-1",
+        "en",
+        (SubtitleCue("cue-000001", 0, 100, ("word-1",), "one", None, ("one",)),),
+        0,
+        "policy-test",
+    )
+    document = json.loads(serialize(track))
+    document["subtitle_track"]["cues"][0]["unknown"] = True
+    with pytest.raises(AppError, match=r"artifact\.codec_invalid"):
+        parse(encode_json(document))
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        b'{"schema_version":2,"subtitle_track":{"id":"track","cues":NaN}}',
+        b'{"schema_version":2,"schema_version":2,"subtitle_track":{}}',
+    ],
+)
+def test_subtitle_json_rejects_non_finite_or_duplicate_json(document: bytes) -> None:
+    with pytest.raises(AppError, match=r"artifact\.codec_invalid"):
+        parse(document)

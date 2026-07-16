@@ -21,7 +21,7 @@ from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobProjection
 from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
-from captioner.core.domain.stage import StageName, StageProjection
+from captioner.core.domain.stage import STAGE_PLAN, StageName, StageProjection
 from captioner.core.ports.stage_runner import (
     ProducedArtifact,
     StageExecutionContext,
@@ -55,10 +55,64 @@ class PublishedExportStage:
         )
 
 
+@dataclass(slots=True)
+class FullPublishedExportStage:
+    counts: dict[StageName, int]
+    version: str = "export-v2"
+    name: StageName = StageName.EXPORT
+
+    async def execute(
+        self, request: StageExecutionRequest, context: StageExecutionContext
+    ) -> tuple[ProducedArtifact, ...]:
+        del request
+        context.execution.raise_if_cancelled()
+        self.counts[self.name] = self.counts.get(self.name, 0) + 1
+        return tuple(
+            ProducedArtifact(
+                logical_name,
+                "application/octet-stream",
+                logical_name,
+                data=logical_name.encode(),
+            )
+            for logical_name in (
+                "final-transcript.json",
+                "final-subtitle.json",
+                "final-subtitle.srt",
+                "final-subtitle.vtt",
+                "final-subtitle.ass",
+            )
+        )
+
+
 def _configure_publisher(current: DurablePipelineService) -> None:
     current.runners = {
         **current.runners,
         StageName.EXPORT: PublishedExportStage(),
+        StageName.PUBLISH: PublishStage(current.executor.artifact_store),
+    }
+
+    def verify(job: JobProjection, stage: StageProjection) -> None:
+        if stage.name is not StageName.PUBLISH:
+            return
+        receipt_ref = next(
+            ref for ref in stage.artifacts if ref.logical_name == "publication-receipt.json"
+        )
+        verify_publication(
+            current.executor.artifact_store.read_bytes(receipt_ref),
+            output_dir=Path(job.config.output_dir),
+            input_path=Path(job.input_path),
+            export_refs=job.stage(StageName.EXPORT).artifacts,
+        )
+
+    current.executor.committed_verifier = verify
+
+
+def _configure_full_publisher(
+    current: DurablePipelineService, counts: dict[StageName, int]
+) -> None:
+    current.runners = {
+        **current.runners,
+        StageName.EXPORT: FullPublishedExportStage(counts),
         StageName.PUBLISH: PublishStage(current.executor.artifact_store),
     }
 
@@ -314,3 +368,50 @@ def test_publication_verifier_rejects_altered_receipt_target_metadata(tmp_path: 
             input_path=Path(projection.job("job-000001").input_path),
             export_refs=projection.job("job-000001").stage(StageName.EXPORT).artifacts,
         )
+
+
+@pytest.mark.parametrize("corruption", ["missing", "corrupt"])
+def test_phase3_export_artifact_corruption_reruns_export_and_publish_only(
+    tmp_path: Path, corruption: str
+) -> None:
+    counts: dict[StageName, int] = {}
+    current = service(tmp_path, counts)
+    _configure_full_publisher(current, counts)
+    output = tmp_path / "output"
+    output.mkdir()
+    projection = current.create(
+        "batch-a", (("job-000001", tmp_path / "input.wav", config(tmp_path, output=output)),)
+    )
+    projection = asyncio.run(current.run(projection))
+    job = projection.job("job-000001")
+    bad_ref = next(
+        ref
+        for ref in job.stage(StageName.EXPORT).artifacts
+        if ref.logical_name == "final-subtitle.vtt"
+    )
+    bad_path = current.executor.artifact_store.resolve(bad_ref)
+    if corruption == "missing":
+        bad_path.unlink()
+    else:
+        bad_path.write_bytes(b"corrupt")
+
+    recovered = service(tmp_path, counts)
+    _configure_full_publisher(recovered, counts)
+    result = asyncio.run(recovered.resume())
+    recovered_job = result.job("job-000001")
+    assert recovered_job.state.value == "succeeded"
+    assert recovered_job.stage(StageName.EXPORT).attempt == 2
+    assert recovered_job.stage(StageName.PUBLISH).attempt == 2
+    assert all(
+        recovered_job.stage(stage).attempt == 1
+        for stage in STAGE_PLAN[: STAGE_PLAN.index(StageName.EXPORT)]
+    )
+    recovered_vtt = next(
+        ref
+        for ref in recovered_job.stage(StageName.EXPORT).artifacts
+        if ref.logical_name == "final-subtitle.vtt"
+    )
+    recovered.executor.artifact_store.verify(recovered_vtt)
+    if bad_path.exists():
+        assert bad_path.read_bytes() != b"corrupt"
+    assert recovered.read_status().integrity == "valid"

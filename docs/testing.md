@@ -6,7 +6,7 @@ file, import contracts, i18n catalogs, forbidden patterns, recovery/property/
 packaging tests, and branch coverage with an 85% minimum.
 
 Tests are grouped into `unit`, `property`, `contract`, `recovery`, `integration`,
-and `packaging`. Recovery covers all six Stages at all six fault points.
+`golden`, and `packaging`. Recovery covers all six Stages at all six fault points.
 Property tests use Hypothesis for locale, domain, segmentation and Journal
 transition invariants, including atomic Batch configuration and interrupted
 cancellation. Recovery also covers status purity, exact multi-Artifact cleanup,
@@ -65,3 +65,24 @@ uv run --extra asr-faster-whisper-cuda12 python scripts/run_phase2_real_gpu_smok
 Record the source page, direct URL, license, downloaded SHA-256, duration, GPU,
 CUDA evidence, runtime, Batch/Job IDs, and clean/recovered comparisons. Do not
 claim CUDA success from model selection alone.
+
+Phase 3 deterministic subtitle checks are local and never download models or
+use networks:
+
+```bash
+uv run pytest tests/property/test_segmentation.py -q
+uv run pytest tests/golden -q
+uv run python scripts/run_subtitle_corpus.py tests/fixtures/transcripts
+```
+
+Golden tests are byte-for-byte and never update files. A human may review and
+accept a deliberate corpus change only with:
+
+```bash
+uv run python scripts/update_subtitle_goldens.py \
+  --accept PHASE3_GOLDENS_REVIEWED
+```
+
+The updater lists every changed file before writing, emits canonical LF UTF-8
+bytes and a manifest of policy/exporter versions and SHA-256 hashes. A missing
+or incorrect acknowledgement exits nonzero without modifying any file.

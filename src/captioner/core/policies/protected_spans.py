@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 
@@ -17,12 +18,18 @@ class ProtectedSpan:
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "currency",
-        re.compile(r"(?:US\$|[$€£¥₹])\s?[+-]?\d[\d,]*(?:\.\d+)?|[+-]?\d[\d,]*(?:\.\d+)?\s?(?:元|円|€|£|ドル)"),
+        re.compile(
+            r"(?:US\$|[$€£¥₹])\s?[+-]?\d[\d,]*(?:\.\d+)?|[+-]?\d[\d,]*(?:\.\d+)?\s?(?:元|円|€|£|ドル)"
+        ),
+    ),
+    (
+        "phone",
+        re.compile(r"\+\d{1,3}(?:\s+\d{3,4}){2,3}"),
     ),
     (
         "date-time",
         re.compile(
-            r"(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}:\d{2}(?:\s?[AP]M)?)",
+            r"(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}:\d{2}(?:\s?[AP]M)?|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4})",
             re.IGNORECASE,
         ),
     ),
@@ -39,7 +46,7 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     (
         "abbreviation",
-        re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Prof|St|vs|etc|e\.g|i\.e)\.\b", re.IGNORECASE),
+        re.compile(r"(?<!\w)(?:Mr|Mrs|Ms|Dr|Prof|St|vs|etc|e\.g|i\.e)\.", re.IGNORECASE),
     ),
 )
 
@@ -55,9 +62,12 @@ def find_protected_spans(text: str) -> tuple[ProtectedSpan, ...]:
     return tuple(found)
 
 
-def protected_break_cost(text: str, boundary: int) -> int:
+def protected_break_cost(
+    text: str, boundary: int, spans: Sequence[ProtectedSpan] | None = None
+) -> int:
     """Return one when a boundary is protected and zero otherwise."""
-    return 1 if any(span.start < boundary < span.end for span in find_protected_spans(text)) else 0
+    candidates = find_protected_spans(text) if spans is None else spans
+    return int(any(span.start < boundary < span.end for span in candidates))
 
 
 def punctuation_attachment_cost(text: str, boundary: int) -> int:

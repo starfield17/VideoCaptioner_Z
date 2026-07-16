@@ -31,6 +31,9 @@ from captioner.adapters.pipeline.stages import (
     verify_publication,
 )
 from captioner.adapters.process.asyncio_subprocess import AsyncioSubprocessRunner
+from captioner.adapters.subtitles.ass import serialize_bytes as serialize_ass
+from captioner.adapters.subtitles.json_track import serialize as serialize_track_json
+from captioner.adapters.subtitles.webvtt import serialize_bytes as serialize_webvtt
 from captioner.adapters.testing.fault_injector import ScriptedFaultInjector
 from captioner.core.application.durable_pipeline import DurablePipelineService
 from captioner.core.application.run_single import RunSingleService
@@ -86,6 +89,9 @@ def build_run_service(
         transcript_serializer=serialize_transcript,
         subtitle_serializer=serialize_srt,
         temp_root=application_paths.temp_dir,
+        subtitle_json_serializer=serialize_track_json,
+        webvtt_serializer=serialize_webvtt,
+        ass_serializer=serialize_ass,
     )
 
 

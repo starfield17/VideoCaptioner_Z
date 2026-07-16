@@ -63,14 +63,20 @@ class SubtitleCue:
             )
         object.__setattr__(self, "source_word_ids", cast(tuple[str, ...], raw_word_ids))
         _text(self.source_text, "source_text")
+        if normalize_text(self.source_text) != self.source_text:
+            raise AppError("subtitle.invalid", {"field": "source_text", "reason": "not_canonical"})
         if self.translated_text is not None:
             raise AppError(
                 "subtitle.invalid", {"field": "translated_text", "reason": "phase1_forbidden"}
             )
         raw_lines = tuple(cast(tuple[object, ...], self.lines))
-        if not raw_lines or len(raw_lines) > 2 or any(
-            not isinstance(line, str) or not line.strip() or "\n" in line or "\r" in line
-            for line in raw_lines
+        if (
+            not raw_lines
+            or len(raw_lines) > 2
+            or any(
+                not isinstance(line, str) or not line.strip() or "\n" in line or "\r" in line
+                for line in raw_lines
+            )
         ):
             raise AppError("subtitle.invalid", {"field": "lines", "reason": "empty"})
         lines = cast(tuple[str, ...], raw_lines)
@@ -120,7 +126,7 @@ class SubtitleTrack:
 
 def derive_subtitle_track_id(
     transcript_id: str,
-    language: str,
+    language: str | None,
     cues: Sequence[SubtitleCue],
     config: Mapping[str, object],
 ) -> str:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from tests.support import make_transcript
@@ -35,6 +37,16 @@ def test_unordered_words_produce_identical_track() -> None:
         transcript.metadata,
     )
     assert segment_transcript(transcript) == segment_transcript(shuffled)
+
+
+@settings(deadline=None)
+@given(st.permutations(tuple(range(6))))
+def test_random_word_permutations_produce_identical_track(
+    order: tuple[int, ...],
+) -> None:
+    transcript = make_transcript(tuple(f"word-{index} " for index in range(6)))
+    shuffled = replace(transcript, words=tuple(transcript.words[index] for index in order))
+    assert segment_transcript(shuffled) == segment_transcript(transcript)
 
 
 def test_overlap_and_equal_timestamps_are_normalized_to_legal_cues() -> None:

@@ -45,6 +45,11 @@ def validate_subtitle_track(
 ) -> ValidationReport:
     issues: list[ValidationIssue] = []
     words = {word.id: word for word in transcript.words}
+    canonical_words = tuple(
+        sorted(transcript.words, key=lambda word: (word.start_ms, word.end_ms, word.id))
+    )
+    canonical_indexes = {word.id: index for index, word in enumerate(canonical_words)}
+    full_source = normalize_text("".join(word.text for word in canonical_words))
     assigned: list[str] = []
     previous_end = -1
     for cue_number, cue in enumerate(track.cues, start=1):
@@ -162,6 +167,17 @@ def validate_subtitle_track(
         if len(cue.lines) > 1:
             line_boundary = len(normalize_text(cue.lines[0]))
             if protected_break_cost(normalized_source, line_boundary):
+                issues.append(
+                    ValidationIssue(
+                        "subtitle.protected_span_broken", ValidationSeverity.WARNING, cue.id
+                    )
+                )
+        last_index = canonical_indexes.get(cue.source_word_ids[-1])
+        if last_index is not None and last_index < len(canonical_words) - 1:
+            boundary_text = normalize_text(
+                "".join(word.text for word in canonical_words[: last_index + 1])
+            )
+            if protected_break_cost(full_source, len(boundary_text)):
                 issues.append(
                     ValidationIssue(
                         "subtitle.protected_span_broken", ValidationSeverity.WARNING, cue.id

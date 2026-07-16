@@ -29,11 +29,7 @@ _HEADER = (
 
 def format_timestamp(milliseconds: int) -> str:
     milliseconds = _validated_timestamp(milliseconds)
-    centiseconds = (milliseconds + 5) // 10
-    hours, remainder = divmod(centiseconds, 360_000)
-    minutes, remainder = divmod(remainder, 6_000)
-    seconds, centis = divmod(remainder, 100)
-    return f"{hours}:{minutes:02d}:{seconds:02d}.{centis:02d}"
+    return _format_centiseconds(_rounded_centiseconds(milliseconds))
 
 
 def serialize(track: SubtitleTrack) -> str:
@@ -42,10 +38,12 @@ def serialize(track: SubtitleTrack) -> str:
     for cue in track.cues:
         if cue.start_ms < previous_end or cue.end_ms <= cue.start_ms:
             raise AppError("export.ass_invalid", {"reason": "cue_order", "cue_id": cue.id})
+        start_centiseconds = _rounded_centiseconds(cue.start_ms)
+        end_centiseconds = max(start_centiseconds + 1, _rounded_centiseconds(cue.end_ms))
         text = r"\N".join(_escape(line) for line in cue.lines)
         rows.append(
             "Dialogue: 0,"
-            f"{format_timestamp(cue.start_ms)},{format_timestamp(cue.end_ms)},"
+            f"{_format_centiseconds(start_centiseconds)},{_format_centiseconds(end_centiseconds)},"
             f"Default,,0,0,0,,{text}"
         )
         previous_end = cue.end_ms
@@ -62,7 +60,6 @@ def parse(data: bytes | str) -> ParsedSubtitle:
         raise AppError("export.ass_invalid", {"reason": "header"})
     rows = [line for line in text[len(_HEADER) : -1].split("\n") if line]
     cues: list[ParsedCue] = []
-    previous_end = -1
     for row in rows:
         if not row.startswith("Dialogue: "):
             raise AppError("export.ass_invalid", {"reason": "event"})
@@ -72,10 +69,9 @@ def parse(data: bytes | str) -> ParsedSubtitle:
         start = _parse_timestamp(fields[1])
         end = _parse_timestamp(fields[2])
         lines = _split_ass_lines(fields[9])
-        if start < previous_end or end <= start or not lines or len(lines) > 2:
+        if end <= start or not lines or len(lines) > 2:
             raise AppError("export.ass_invalid", {"reason": "cue_order"})
         cues.append(ParsedCue(start, end, lines))
-        previous_end = end
     return ParsedSubtitle(tuple(cues))
 
 
@@ -100,6 +96,12 @@ def _split_ass_lines(value: str) -> tuple[str, ...]:
                 current = []
                 index += 2
                 continue
+            if next_character in "{}":
+                current.extend((character, next_character))
+                index += 2
+                continue
+        if character == "\\":
+            raise AppError("export.ass_invalid", {"reason": "override_tag"})
         current.append(character)
         index += 1
     raw_lines.append("".join(current))
@@ -113,6 +115,8 @@ def _unescape(value: str) -> str:
         if value[index] == "\\" and index + 1 < len(value) and value[index + 1] in "\\{}":
             result.append(value[index + 1])
             index += 2
+        elif value[index] == "\\" or value[index] in "{}":
+            raise AppError("export.ass_invalid", {"reason": "override_tag"})
         else:
             result.append(value[index])
             index += 1
@@ -142,3 +146,14 @@ def _validated_timestamp(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise AppError("export.ass_invalid", {"reason": "timestamp"})
     return value
+
+
+def _rounded_centiseconds(milliseconds: int) -> int:
+    return (milliseconds + 5) // 10
+
+
+def _format_centiseconds(centiseconds: int) -> str:
+    hours, remainder = divmod(centiseconds, 360_000)
+    minutes, remainder = divmod(remainder, 6_000)
+    seconds, centis = divmod(remainder, 100)
+    return f"{hours}:{minutes:02d}:{seconds:02d}.{centis:02d}"

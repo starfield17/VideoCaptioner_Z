@@ -1,1 +1,1 @@
-"""Application services will be added in a later phase."""
+"""Application orchestration for one-shot and durable subtitle pipelines."""
