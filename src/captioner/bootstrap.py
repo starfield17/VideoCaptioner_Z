@@ -15,12 +15,14 @@ from captioner.adapters.exporters.srt import serialize_bytes as serialize_srt
 from captioner.adapters.exporters.transcript_json import serialize_bytes as serialize_transcript
 from captioner.adapters.llm.http_transport import HTTPTransport
 from captioner.adapters.llm.openai_compatible import OpenAICompatibleClient
+from captioner.adapters.llm.token_counter import CharacterTokenCounter
 from captioner.adapters.media.ffmpeg_audio import FFmpegAudioNormalizer
 from captioner.adapters.media.ffprobe import FFprobeMediaInspector
 from captioner.adapters.persistence.batch_lease import BatchLease
 from captioner.adapters.persistence.content_addressed_artifact_store import (
     ContentAddressedArtifactStore,
 )
+from captioner.adapters.persistence.filesystem_llm_cache import FilesystemLLMCache
 from captioner.adapters.persistence.json_manifest_store import JsonManifestStore
 from captioner.adapters.persistence.jsonl_journal import JsonlJournal
 from captioner.adapters.persistence.local_artifact_store import LocalArtifactStore
@@ -31,6 +33,7 @@ from captioner.adapters.pipeline.stages import (
     PublishStage,
     SegmentStage,
     TranscribeStage,
+    TranslateStage,
     verify_publication,
 )
 from captioner.adapters.process.asyncio_subprocess import AsyncioSubprocessRunner
@@ -49,6 +52,9 @@ from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
 from captioner.core.domain.stage import PipelineProfile, StageName, stage_plan_for
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig
+from captioner.core.ports.llm_cache import LLMCachePort
+from captioner.core.ports.stage_runner import StageRunner
+from captioner.core.ports.token_counter import TokenCounter
 from captioner.infrastructure.app_paths import (
     AppPaths,
     ensure_runtime_layout,
@@ -57,6 +63,7 @@ from captioner.infrastructure.app_paths import (
 )
 from captioner.infrastructure.config import OpenAICompatibleProvider, load_provider_config
 from captioner.infrastructure.ids import new_id
+from captioner.infrastructure.prompts import PromptLoader
 
 
 def build_run_service(
@@ -106,6 +113,11 @@ def build_run_service(
 class DurableServiceBundle:
     service: DurablePipelineService
     batch_dir: Path
+    runtime: LLMRuntime | None = None
+
+    async def close(self) -> None:
+        if self.runtime is not None:
+            await self.runtime.close()
 
 
 @dataclass(slots=True)
@@ -213,14 +225,55 @@ def create_job_config(
         {
             stage.value: {
                 StageName.SEGMENT.value: "segment-v2",
-                StageName.EXPORT.value: "export-v2",
-                StageName.PUBLISH.value: "publish-v2",
+                StageName.EXPORT.value: "export-v3",
+                StageName.PUBLISH.value: "publish-v3",
             }.get(stage.value, "1")
             for stage in stage_plan_for(pipeline_profile)
         },
         pipeline_profile=pipeline_profile,
         llm=None if snapshot is None else _frozen_mapping(snapshot),
     )
+
+
+def create_llm_job_snapshot(
+    *,
+    target_language: str,
+    provider_profile: str,
+    source_language: str | None,
+    paths: AppPaths,
+) -> Mapping[str, FrozenJsonValue]:
+    """Build a redacted fast-profile snapshot from runtime config and prompts."""
+    if not target_language.strip():
+        raise AppError("llm.target_language_missing")
+    if target_language != target_language.strip() or any(
+        not (character.isalnum() or character in "-_") for character in target_language
+    ):
+        raise AppError("llm.target_language_invalid")
+    provider = load_provider_config(paths.config_dir, provider_profile)
+    prompt = PromptLoader(paths.prompt_resource_dir).load("translate_fast", "v1")
+    snapshot: dict[str, object] = {
+        **provider.to_snapshot(),
+        "profile": PipelineProfile.FAST.value,
+        "source_language": source_language,
+        "target_language": target_language.strip(),
+        "prompt": {
+            "prompt_id": prompt.prompt_id,
+            "prompt_version": prompt.prompt_version,
+            "content_sha256": prompt.content_sha256,
+        },
+        "prompt_id": prompt.prompt_id,
+        "prompt_version": prompt.prompt_version,
+        "prompt_content_sha256": prompt.content_sha256,
+        "chunk": {
+            "max_items": 32,
+            "max_input_tokens": 4096,
+            "context_before_items": 1,
+            "context_after_items": 1,
+            "max_audio_context_duration_ms": 120_000,
+        },
+        "response_schema_version": 1,
+    }
+    return _frozen_mapping(snapshot)
 
 
 def create_batch_lease(batch_dir: Path) -> BatchLease:
@@ -276,11 +329,16 @@ def build_durable_service(
     segmentation: Mapping[str, object] | None = None,
     initialize_runtime: bool = True,
     pipeline_profile: PipelineProfile = PipelineProfile.DETERMINISTIC,
+    llm: Mapping[str, FrozenJsonValue] | None = None,
+    llm_runtime: LLMRuntime | None = None,
+    llm_cache: LLMCachePort | None = None,
+    token_counter: TokenCounter | None = None,
 ) -> DurableServiceBundle:
-    if PipelineProfile(pipeline_profile) is not PipelineProfile.DETERMINISTIC:
+    selected_profile = PipelineProfile(pipeline_profile)
+    if selected_profile is PipelineProfile.QUALITY:
         raise AppError(
-            "pipeline.profile_unavailable",
-            {"profile": PipelineProfile(pipeline_profile).value},
+            "llm.profile_unavailable",
+            {"profile": selected_profile.value},
         )
     application_paths = resolve_app_paths() if paths is None else paths
     if initialize_runtime:
@@ -295,7 +353,7 @@ def build_durable_service(
     policy = SegmentationPolicyConfig.from_mapping(
         segmentation or SegmentationPolicyConfig().to_mapping()
     )
-    runners = {
+    runners: dict[StageName, StageRunner] = {
         StageName.INSPECT: InspectStage(FFprobeMediaInspector(process, executable=ffprobe_bin)),
         StageName.NORMALIZE: NormalizeStage(
             FFmpegAudioNormalizer(process, executable=ffmpeg_bin), durable
@@ -312,6 +370,32 @@ def build_durable_service(
         lambda: datetime.now(UTC).isoformat(),
     )
     executor = StageExecutor(journal, manifest, durable, event_factory, batch_dir / "work")
+
+    runtime = llm_runtime
+    cache = llm_cache
+    counter = token_counter
+    if selected_profile is PipelineProfile.FAST:
+        if llm is None:
+            raise AppError("llm.config_missing", {"reason": "job_snapshot"})
+        if runtime is None and initialize_runtime:
+            runtime = build_llm_runtime(
+                provider_profile=_snapshot_string(llm, "provider_profile", "default"),
+                paths=application_paths,
+            )
+        if runtime is not None:
+            cache = cache or FilesystemLLMCache(application_paths.cache_dir)
+            counter = counter or CharacterTokenCounter()
+            prompt = PromptLoader(application_paths.prompt_resource_dir).load(
+                "translate_fast", "v1"
+            )
+            runners[StageName.TRANSLATE] = TranslateStage(
+                durable,
+                runtime.service,
+                cache,
+                counter,
+                prompt,
+                policy,
+            )
 
     def verify_committed(job: object, stage: object) -> None:
         from captioner.core.domain.job import JobProjection
@@ -354,7 +438,15 @@ def build_durable_service(
             journal, manifest, executor, event_factory, runners, batch_dir / "control"
         ),
         batch_dir,
+        runtime,
     )
+
+
+def _snapshot_string(values: Mapping[str, FrozenJsonValue], key: str, default: str) -> str:
+    value = values.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise AppError("llm.config_invalid", {"field": key})
+    return value
 
 
 def _validate_fault_point(point: str) -> None:

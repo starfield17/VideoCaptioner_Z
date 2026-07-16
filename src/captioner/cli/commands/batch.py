@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import socket
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -18,13 +18,14 @@ from captioner.bootstrap import (
     build_durable_service,
     create_batch_lease,
     create_job_config,
+    create_llm_job_snapshot,
 )
 from captioner.core.application.durable_pipeline import BatchStatus, write_cancel_marker
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobState, validate_identifier
 from captioner.core.domain.journal import replay
-from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
+from captioner.core.domain.result import FrozenJsonValue, freeze_json_value, thaw_json_value
 from captioner.core.domain.stage import PipelineProfile, StageName, stage_plan_for
 from captioner.infrastructure.app_paths import AppPaths, resolve_safe_child
 from captioner.infrastructure.ids import new_id
@@ -42,6 +43,8 @@ class BatchRunOptions:
     ffprobe_bin: str
     overwrite: bool
     pipeline_profile: PipelineProfile = PipelineProfile.DETERMINISTIC
+    target_language: str | None = None
+    llm_provider_profile: str = "default"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +56,8 @@ class ResumeOverrides:
     output_dir: Path | None = None
     pipeline_profile: PipelineProfile | None = None
     llm: Mapping[str, object] | None = None
+    target_language: str | None = None
+    llm_provider_profile: str | None = None
 
 
 def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
@@ -60,6 +65,16 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
     batch_id = new_id("batch-")
     output_dir = options.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    llm_snapshot = None
+    if options.pipeline_profile is PipelineProfile.FAST:
+        if options.target_language is None:
+            raise AppError("llm.target_language_missing")
+        llm_snapshot = create_llm_job_snapshot(
+            target_language=options.target_language,
+            provider_profile=options.llm_provider_profile,
+            source_language=options.language,
+            paths=paths,
+        )
     config = create_job_config(
         model_ref=options.model_ref,
         device=options.device,
@@ -70,6 +85,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
         output_dir=output_dir,
         overwrite=options.overwrite,
         pipeline_profile=options.pipeline_profile,
+        llm=llm_snapshot,
     )
     bundle = build_durable_service(
         batch_id,
@@ -81,6 +97,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
         ffprobe_bin=options.ffprobe_bin,
         paths=paths,
         pipeline_profile=options.pipeline_profile,
+        llm=config.llm,
     )
     lease = create_batch_lease(bundle.batch_dir)
     lease.acquire()
@@ -90,7 +107,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
             for index, source in enumerate(options.inputs, 1)
         )
         projection = bundle.service.create(batch_id, jobs)
-        return asyncio.run(bundle.service.run(projection))
+        return asyncio.run(_run_and_close(bundle, lambda: bundle.service.run(projection)))
     finally:
         lease.release()
 
@@ -120,6 +137,7 @@ def resume(
         projection = _read_projection(batch_id, paths=paths, repair=True)
         config = _common_config(projection)
         selected = config if overrides is None else _apply_overrides(config, overrides)
+        selected = _ensure_fast_snapshot(selected, overrides, paths)
         bundle = _bundle(batch_id, selected, paths)
         if selected != config:
             earliest = min(
@@ -131,7 +149,7 @@ def resume(
                 config=selected,
                 earliest_stage=earliest,
             )
-        return asyncio.run(bundle.service.resume())
+        return asyncio.run(_run_and_close(bundle, bundle.service.resume))
     finally:
         lease.release()
 
@@ -144,7 +162,7 @@ def retry(batch_id: str, job_id: str, stage: StageName, *, paths: AppPaths) -> B
         projection = _read_projection(batch_id, paths=paths, repair=True)
         config = _common_config(projection)
         bundle = _bundle(batch_id, config, paths)
-        return asyncio.run(bundle.service.retry(job_id, stage))
+        return asyncio.run(_run_and_close(bundle, lambda: bundle.service.retry(job_id, stage)))
     finally:
         lease.release()
 
@@ -315,6 +333,7 @@ def _bundle(
         paths=paths,
         segmentation=config.segmentation,
         pipeline_profile=config.pipeline_profile,
+        llm=config.llm,
         initialize_runtime=initialize_runtime,
     )
 
@@ -374,6 +393,7 @@ def _read_projection(batch_id: str, *, paths: AppPaths, repair: bool) -> BatchPr
 
 
 def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig:
+    llm = _override_llm(config, overrides)
     if overrides.model_ref is not None:
         candidate = create_job_config(
             model_ref=overrides.model_ref,
@@ -389,7 +409,7 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
             pipeline_profile=config.pipeline_profile
             if overrides.pipeline_profile is None
             else PipelineProfile(overrides.pipeline_profile),
-            llm=config.llm if overrides.llm is None else _frozen_llm(overrides.llm),
+            llm=llm,
         )
         return replace(
             candidate,
@@ -413,8 +433,74 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
         pipeline_profile=config.pipeline_profile
         if overrides.pipeline_profile is None
         else PipelineProfile(overrides.pipeline_profile),
-        llm=config.llm if overrides.llm is None else _frozen_llm(overrides.llm),
+        llm=llm,
     )
+
+
+def _override_llm(
+    config: JobConfig, overrides: ResumeOverrides
+) -> Mapping[str, FrozenJsonValue] | None:
+    if overrides.llm is not None:
+        return _frozen_llm(overrides.llm)
+    if overrides.target_language is None and overrides.llm_provider_profile is None:
+        return config.llm
+    values: dict[str, object] = {}
+    if config.llm is not None:
+        thawed = thaw_json_value(config.llm)
+        if not isinstance(thawed, Mapping):
+            raise AppError("job.config_invalid", {"field": "llm"})
+        values.update(thawed)
+    if overrides.target_language is not None:
+        values["target_language"] = overrides.target_language
+    if overrides.llm_provider_profile is not None:
+        values["provider_profile"] = overrides.llm_provider_profile
+    return _frozen_llm(values)
+
+
+def _ensure_fast_snapshot(
+    config: JobConfig,
+    overrides: ResumeOverrides | None,
+    paths: AppPaths,
+) -> JobConfig:
+    if config.pipeline_profile is not PipelineProfile.FAST:
+        return config
+    target_language = config.target_language
+    if target_language is None:
+        raise AppError("llm.target_language_missing")
+    provider_profile = (
+        overrides.llm_provider_profile
+        if overrides is not None and overrides.llm_provider_profile is not None
+        else config.provider_profile or "default"
+    )
+    required = {"base_url", "model", "provider_profile"}
+    if (
+        config.llm is not None
+        and required.issubset(config.llm)
+        and not (
+            overrides is not None
+            and (
+                overrides.target_language is not None or overrides.llm_provider_profile is not None
+            )
+        )
+    ):
+        return config
+    snapshot = create_llm_job_snapshot(
+        target_language=target_language,
+        provider_profile=provider_profile,
+        source_language=config.language,
+        paths=paths,
+    )
+    return replace(config, llm=snapshot)
+
+
+async def _run_and_close(
+    bundle: DurableServiceBundle,
+    operation: Callable[[], Awaitable[BatchProjection]],
+) -> BatchProjection:
+    try:
+        return await operation()
+    finally:
+        await bundle.close()
 
 
 def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:

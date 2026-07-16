@@ -28,6 +28,8 @@ def _integer_ms(value: object, field: str) -> None:
 def _integer_revision(value: object) -> None:
     if not isinstance(value, int) or isinstance(value, bool):
         raise AppError("subtitle.invalid", {"field": "revision", "reason": "integer"})
+    if value < 0:
+        raise AppError("subtitle.invalid", {"field": "revision", "reason": "negative"})
 
 
 def _time_range(start_ms: int, end_ms: int) -> None:
@@ -68,9 +70,12 @@ class SubtitleCue:
         if normalize_text(self.source_text) != self.source_text:
             raise AppError("subtitle.invalid", {"field": "source_text", "reason": "not_canonical"})
         if self.translated_text is not None:
-            raise AppError(
-                "subtitle.invalid", {"field": "translated_text", "reason": "phase1_forbidden"}
-            )
+            _text(self.translated_text, "translated_text")
+            if normalize_text(self.translated_text) != self.translated_text:
+                raise AppError(
+                    "subtitle.invalid",
+                    {"field": "translated_text", "reason": "not_canonical"},
+                )
         raw_lines = tuple(cast(tuple[object, ...], self.lines))
         if (
             not raw_lines
@@ -103,10 +108,6 @@ class SubtitleTrack:
             _text(self.language, "language")
         cues = tuple(self.cues)
         _integer_revision(self.revision)
-        if self.revision != 0:
-            raise AppError(
-                "subtitle.invalid", {"field": "revision", "reason": "phase1_must_be_zero"}
-            )
         cue_ids = [cue.id for cue in cues]
         if len(set(cue_ids)) != len(cue_ids):
             raise AppError("subtitle.invalid", {"field": "cues", "reason": "duplicate_ids"})

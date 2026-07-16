@@ -49,11 +49,12 @@ def test_track_rejects_duplicate_word_assignment_and_overlap() -> None:
         SubtitleTrack("track-1", "transcript-1", "en", (first, overlap), 0, POLICY_SIGNATURE)
 
 
-def test_translated_text_and_nonzero_revision_are_phase1_invalid() -> None:
-    with pytest.raises(AppError, match="phase1_forbidden"):
-        SubtitleCue("cue-1", 0, 100, ("word-1",), "one", "一", ("one",))
-    with pytest.raises(AppError, match="phase1_must_be_zero"):
-        SubtitleTrack("track-1", "transcript-1", "en", (), 1, POLICY_SIGNATURE)
+def test_translated_text_and_nonzero_revision_are_supported() -> None:
+    cue = SubtitleCue("cue-1", 0, 100, ("word-1",), "one", "一", ("一",))
+    track = SubtitleTrack("track-1", "transcript-1", "zh", (cue,), 1, POLICY_SIGNATURE)
+    assert track.revision == 1
+    with pytest.raises(AppError, match="negative"):
+        SubtitleTrack("track-1", "transcript-1", "en", (cue,), -1, POLICY_SIGNATURE)
 
 
 def test_blank_source_word_ids_are_rejected() -> None:

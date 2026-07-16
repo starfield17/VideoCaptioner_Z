@@ -1,4 +1,4 @@
-"""Pure validation of a rendered subtitle track against its Transcript."""
+"""Pure validation of source and translated subtitle tracks."""
 
 from __future__ import annotations
 
@@ -7,7 +7,11 @@ from enum import StrEnum
 
 from captioner.core.domain.subtitle import SubtitleTrack, derive_subtitle_track_id
 from captioner.core.domain.transcript import Transcript
-from captioner.core.policies.line_breaking import join_rendered_lines
+from captioner.core.policies.line_breaking import break_lines, join_rendered_lines
+from captioner.core.policies.llm_validation import (
+    is_obvious_wrong_language,
+    protected_numeric_tokens,
+)
 from captioner.core.policies.protected_spans import protected_break_cost
 from captioner.core.policies.reading_speed import reading_speed
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
@@ -42,6 +46,50 @@ def validate_subtitle_track(
     track: SubtitleTrack,
     transcript: Transcript,
     config: SegmentationPolicyConfig,
+    target_language: str | None = None,
+) -> ValidationReport:
+    """Validate the appropriate source or translated-track contract."""
+    if _is_translated(track):
+        return validate_translated_track(track, transcript, config, target_language)
+    return validate_source_track(track, transcript, config)
+
+
+def validate_source_mapping(
+    track: SubtitleTrack,
+    transcript: Transcript,
+    config: SegmentationPolicyConfig,
+) -> ValidationReport:
+    """Validate timestamps, cue IDs, and complete source Word assignment."""
+    return _validate(track, transcript, config, translated=False, target_language=None)
+
+
+def validate_source_track(
+    track: SubtitleTrack,
+    transcript: Transcript,
+    config: SegmentationPolicyConfig,
+) -> ValidationReport:
+    """Validate a deterministic source-language track."""
+    return _validate(track, transcript, config, translated=False, target_language=None)
+
+
+def validate_translated_track(
+    track: SubtitleTrack,
+    transcript: Transcript,
+    config: SegmentationPolicyConfig,
+    target_language: str | None = None,
+) -> ValidationReport:
+    """Validate display text while preserving the original source mapping."""
+    expected_language = target_language or track.language
+    return _validate(track, transcript, config, translated=True, target_language=expected_language)
+
+
+def _validate(
+    track: SubtitleTrack,
+    transcript: Transcript,
+    config: SegmentationPolicyConfig,
+    *,
+    translated: bool,
+    target_language: str | None,
 ) -> ValidationReport:
     issues: list[ValidationIssue] = []
     words = {word.id: word for word in transcript.words}
@@ -53,17 +101,47 @@ def validate_subtitle_track(
     full_source = join_token_texts(word.text for word in canonical_words)
     assigned: list[str] = []
     previous_end = -1
+
     if not track.cues:
         issues.append(ValidationIssue("subtitle.cue_empty", ValidationSeverity.ERROR))
-    if track.language != transcript.language:
-        issues.append(
-            ValidationIssue(
-                "subtitle.language_mismatch",
-                ValidationSeverity.ERROR,
-                actual=track.language,
-                limit=transcript.language,
+    if translated:
+        if track.revision < 1:
+            issues.append(
+                ValidationIssue(
+                    "subtitle.revision_invalid",
+                    ValidationSeverity.ERROR,
+                    actual=track.revision,
+                    limit=1,
+                )
             )
-        )
+        if target_language is None or track.language != target_language:
+            issues.append(
+                ValidationIssue(
+                    "subtitle.target_language_mismatch",
+                    ValidationSeverity.ERROR,
+                    actual=track.language,
+                    limit=target_language,
+                )
+            )
+    else:
+        if track.revision != 0:
+            issues.append(
+                ValidationIssue(
+                    "subtitle.revision_invalid",
+                    ValidationSeverity.ERROR,
+                    actual=track.revision,
+                    limit=0,
+                )
+            )
+        if track.language != transcript.language:
+            issues.append(
+                ValidationIssue(
+                    "subtitle.language_mismatch",
+                    ValidationSeverity.ERROR,
+                    actual=track.language,
+                    limit=transcript.language,
+                )
+            )
     if track.policy_signature != config.signature:
         issues.append(
             ValidationIssue(
@@ -73,6 +151,7 @@ def validate_subtitle_track(
                 limit=config.signature,
             )
         )
+
     for cue_number, cue in enumerate(track.cues, start=1):
         if cue.id != f"cue-{cue_number:06d}":
             issues.append(
@@ -117,18 +196,33 @@ def validate_subtitle_track(
                 issues.append(
                     ValidationIssue("subtitle.control_character", ValidationSeverity.ERROR, cue.id)
                 )
-        if measure_text(cue.source_text).display_columns > config.max_cue_width:
+
+        display_text = cue.source_text if not translated else cue.translated_text
+        if display_text is None:
+            issues.append(
+                ValidationIssue(
+                    "subtitle.translated_text_missing", ValidationSeverity.ERROR, cue.id
+                )
+            )
+            display_text = ""
+        else:
+            canonical_display = normalize_text(display_text)
+            if canonical_display != display_text:
+                issues.append(
+                    ValidationIssue("subtitle.text_not_canonical", ValidationSeverity.ERROR, cue.id)
+                )
+        if measure_text(display_text).display_columns > config.max_cue_width:
             issues.append(
                 ValidationIssue(
                     "subtitle.line_width_exceeded",
                     ValidationSeverity.WARNING,
                     cue.id,
-                    actual=measure_text(cue.source_text).display_columns,
+                    actual=measure_text(display_text).display_columns,
                     limit=config.max_cue_width,
                 )
             )
         speed = reading_speed(
-            cue.source_text,
+            display_text,
             cue.end_ms - cue.start_ms,
             target_cps_milli=config.target_cps_milli,
             max_cps_milli=config.max_cps_milli,
@@ -153,11 +247,58 @@ def validate_subtitle_track(
                     limit=config.target_cps_milli,
                 )
             )
+
         normalized_source = normalize_text(cue.source_text)
-        if join_rendered_lines(cue.lines) != normalized_source:
+        original_source = join_token_texts(
+            words[word_id].text for word_id in cue.source_word_ids if word_id in words
+        )
+        protected_source = original_source or normalized_source
+        if translated:
+            if cue.translated_text is not None and join_rendered_lines(cue.lines) != normalize_text(
+                cue.translated_text
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "subtitle.translated_text_mismatch",
+                        ValidationSeverity.ERROR,
+                        cue.id,
+                    )
+                )
+            if cue.translated_text is not None and cue.lines != break_lines(
+                cue.translated_text, config
+            ):
+                issues.append(
+                    ValidationIssue("subtitle.lines_not_derived", ValidationSeverity.ERROR, cue.id)
+                )
+            if (
+                target_language is not None
+                and cue.translated_text is not None
+                and is_obvious_wrong_language(cue.translated_text, target_language)
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "subtitle.language_mismatch",
+                        ValidationSeverity.ERROR,
+                        cue.id,
+                        actual=target_language,
+                    )
+                )
+            if cue.translated_text is not None and (
+                not _protected_numbers_preserved(protected_source, cue.translated_text)
+                or not _protected_numbers_preserved(protected_source, normalized_source)
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "subtitle.protected_token_lost",
+                        ValidationSeverity.ERROR,
+                        cue.id,
+                    )
+                )
+        elif join_rendered_lines(cue.lines) != normalized_source:
             issues.append(
                 ValidationIssue("subtitle.text_mismatch", ValidationSeverity.ERROR, cue.id)
             )
+
         for index, word_id in enumerate(cue.source_word_ids):
             if word_id not in words:
                 issues.append(
@@ -192,18 +333,16 @@ def validate_subtitle_track(
                     actual=known_ids[0],
                 )
             )
-        if known_ids == cue.source_word_ids and known_indexes:
+        if not translated and known_ids == cue.source_word_ids and known_indexes:
             span_start = known_indexes[0]
             span_end = known_indexes[-1] + 1
             expected_text = join_token_texts(
                 word.text for word in canonical_words[span_start:span_end]
             )
-        else:
-            expected_text = ""
-        if known_ids == cue.source_word_ids and expected_text != normalized_source:
-            issues.append(
-                ValidationIssue("subtitle.text_mismatch", ValidationSeverity.ERROR, cue.id)
-            )
+            if expected_text != normalized_source:
+                issues.append(
+                    ValidationIssue("subtitle.text_mismatch", ValidationSeverity.ERROR, cue.id)
+                )
         if len(cue.lines) > 1:
             line_boundary = len(normalize_text(cue.lines[0]))
             if protected_break_cost(normalized_source, line_boundary):
@@ -223,6 +362,7 @@ def validate_subtitle_track(
                         "subtitle.protected_span_broken", ValidationSeverity.WARNING, cue.id
                     )
                 )
+
     if tuple(assigned) != canonical_ids:
         issues.append(
             ValidationIssue(
@@ -248,7 +388,7 @@ def validate_subtitle_track(
         )
     expected_id = derive_subtitle_track_id(
         transcript.id,
-        transcript.language,
+        track.language,
         track.cues,
         config.to_mapping(),
     )
@@ -262,3 +402,18 @@ def validate_subtitle_track(
             )
         )
     return ValidationReport(tuple(issues))
+
+
+def _is_translated(track: SubtitleTrack) -> bool:
+    return track.revision > 0 or any(cue.translated_text is not None for cue in track.cues)
+
+
+def _protected_numbers_preserved(source: str, output: str) -> bool:
+    output_digits = "".join(character for character in output if character.isdigit())
+    cursor = 0
+    for token in protected_numeric_tokens(source):
+        position = output_digits.find(token.digits, cursor)
+        if position < 0 or (token.percent and "%" not in output):
+            return False
+        cursor = position + len(token.digits)
+    return True

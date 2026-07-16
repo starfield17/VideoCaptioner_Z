@@ -20,7 +20,8 @@ from captioner.core.domain.subtitle import (
 from captioner.core.domain.transcript import Transcript, TranscriptSegment, WordToken
 
 SCHEMA_VERSION = 1
-TRACK_SCHEMA_VERSION = 2
+SOURCE_TRACK_SCHEMA_VERSION = 2
+TRACK_SCHEMA_VERSION = 3
 _POLICY_SIGNATURE = re.compile(r"^policy-[0-9a-f]{64}$")
 
 
@@ -185,9 +186,14 @@ def decode_transcript(data: bytes) -> Transcript:
 def encode_track(track: SubtitleTrack) -> bytes:
     if _POLICY_SIGNATURE.fullmatch(track.policy_signature) is None:
         raise AppError("artifact.codec_invalid", {"reason": "policy_signature"})
+    schema_version = (
+        TRACK_SCHEMA_VERSION
+        if track.revision > 0 or any(cue.translated_text is not None for cue in track.cues)
+        else SOURCE_TRACK_SCHEMA_VERSION
+    )
     return encode_json(
         {
-            "schema_version": TRACK_SCHEMA_VERSION,
+            "schema_version": schema_version,
             "subtitle_track": {
                 "id": track.id,
                 "source_transcript_id": track.source_transcript_id,
@@ -218,7 +224,7 @@ def decode_track(data: bytes) -> SubtitleTrack:
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version not in {1, TRACK_SCHEMA_VERSION}
+        or schema_version not in {1, SOURCE_TRACK_SCHEMA_VERSION, TRACK_SCHEMA_VERSION}
         or not isinstance(root.get("subtitle_track"), dict)
     ):
         raise AppError("artifact.codec_invalid", {"reason": "subtitle_track"})

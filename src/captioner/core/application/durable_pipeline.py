@@ -618,14 +618,18 @@ def _cache_config(
     elif stage is StageName.EXPORT:
         values.update(
             {
-                "track_json": "track-json-v2",
+                "track_json": "track-json-v3",
                 "srt": "srt-v2",
                 "webvtt": "webvtt-v1",
                 "ass": "ass-v1",
             }
         )
+        if config.llm is not None:
+            values["llm"] = config.llm
     else:
         values.update({"output_dir": config.output_dir, "overwrite": config.overwrite})
+        if config.llm is not None:
+            values["llm"] = config.llm
     return cast(Mapping[str, FrozenJsonValue], freeze_json_value(values))
 
 

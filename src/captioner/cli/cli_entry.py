@@ -48,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(profile.value for profile in PipelineProfile),
         default=PipelineProfile.DETERMINISTIC.value,
     )
+    run_parser.add_argument("--target-language", default=None)
+    run_parser.add_argument("--llm-provider-profile", default="default")
     run_parser.add_argument("--json", action="store_true", help="Emit JSON")
     run_parser.add_argument("--lang", dest="lang", default=argparse.SUPPRESS)
     corpus_parser = subparsers.add_parser(
@@ -69,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "--profile",
                 choices=tuple(profile.value for profile in PipelineProfile),
             )
+            command_parser.add_argument("--target-language")
+            command_parser.add_argument("--llm-provider-profile")
     retry_parser = subparsers.add_parser("retry")
     retry_parser.add_argument("batch_id")
     retry_parser.add_argument("--job", required=True)
@@ -129,6 +133,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ffprobe_bin=namespace.ffprobe_bin,
                 overwrite=namespace.overwrite,
                 pipeline_profile=PipelineProfile(namespace.profile),
+                target_language=namespace.target_language,
+                llm_provider_profile=namespace.llm_provider_profile,
             )
             projection = batch_command.run(run_options, paths=paths)
             payload = cast(
@@ -159,6 +165,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             None
                             if namespace.profile is None
                             else PipelineProfile(namespace.profile),
+                            target_language=namespace.target_language,
+                            llm_provider_profile=namespace.llm_provider_profile,
                         ),
                     ),
                     paths=paths,

@@ -167,6 +167,8 @@ class LLMChunkExecutor:
             try:
                 return self._validate_and_order(cached, chunk)
             except AppError:
+                # A cached value that fails the complete validator is a miss;
+                # never expose it as a successful response.
                 pass
         generated = await self.client.generate_structured(request, batch_schema, context)
         responses = self._validate_and_order(generated, chunk)
