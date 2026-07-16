@@ -427,10 +427,7 @@ class DurablePipelineService:
             publish = job.stage(StageName.PUBLISH)
             if publish.state is not StageState.COMMITTED:
                 continue
-            if any(
-                stage_name is not StageName.PUBLISH
-                for stage_name in bad_stages.get(job.job_id, set())
-            ):
+            if bad_stages.get(job.job_id):
                 continue
             try:
                 self.executor.verify_stage_external_state(job, publish)

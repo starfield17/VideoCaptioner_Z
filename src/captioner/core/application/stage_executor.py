@@ -114,6 +114,7 @@ class StageExecutor:
             self._hit(projection.batch_id, job_id, runner.name, attempt, point)
 
         committed = False
+        cancelled = False
         post_commit_reason = "recovery"
         try:
             projection = self._append(
@@ -190,6 +191,7 @@ class StageExecutor:
                         "stage.cancellation_projection_failed",
                         {"job_id": job_id, "stage_name": runner.name.value},
                     ) from manifest_error
+                cancelled = True
                 raise
             if committed:
                 raise AppError(
@@ -231,6 +233,8 @@ class StageExecutor:
                             "reason": "workspace_cleanup",
                         },
                     ) from exc
+                if cancelled:
+                    raise AppError("operation.cancelled") from exc
                 raise AppError("stage.workspace_cleanup_failed") from exc
 
     def _append(

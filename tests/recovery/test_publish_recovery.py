@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 from tests.recovery.support import config, service
 
+import captioner.adapters.pipeline.stages as stages_module
 from captioner.adapters.persistence.domain_codecs import (
     decode_publication_receipt,
     encode_publication_receipt,
@@ -118,6 +120,91 @@ def test_publish_target_corruption_invalidates_publish_only(tmp_path: Path) -> N
     assert job.stage(StageName.EXPORT).attempt == 1
     assert job.stage(StageName.PUBLISH).attempt == 2
     assert target.read_bytes() == b"subtitle"
+
+
+@pytest.mark.parametrize("corruption", ["missing", "corrupt"])
+def test_publication_receipt_recovery_reruns_publish_only(tmp_path: Path, corruption: str) -> None:
+    current, projection, counts = _published_batch(tmp_path)
+    receipt_ref = next(
+        ref
+        for ref in projection.job("job-000001").stage(StageName.PUBLISH).artifacts
+        if ref.logical_name == "publication-receipt.json"
+    )
+    receipt_path = current.executor.artifact_store.resolve(receipt_ref)
+    if corruption == "missing":
+        receipt_path.unlink()
+    else:
+        receipt_path.write_bytes(b"corrupt")
+
+    recovered = service(tmp_path, counts)
+    _configure_publisher(recovered)
+    result = asyncio.run(recovered.resume())
+    job = result.job("job-000001")
+
+    assert job.state.value == "succeeded"
+    assert all(
+        job.stage(stage).attempt == 1 for stage in StageName if stage is not StageName.PUBLISH
+    )
+    assert job.stage(StageName.PUBLISH).attempt == 2
+    assert all(
+        event.type not in {"stage.failed", "job.failed"}
+        for event in recovered.journal.read_snapshot().events
+    )
+    new_receipt = next(
+        ref
+        for ref in job.stage(StageName.PUBLISH).artifacts
+        if ref.logical_name == "publication-receipt.json"
+    )
+    recovered.executor.verify_artifact(new_receipt)
+    for ref in job.stage(StageName.EXPORT).artifacts:
+        recovered.executor.verify_artifact(ref)
+    if corruption == "corrupt":
+        assert receipt_path.read_bytes() != b"corrupt"
+    assert recovered.read_status().integrity == "valid"
+
+
+def test_publication_verifier_wraps_target_disappearance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current, projection, _ = _published_batch(tmp_path)
+    receipt_ref = projection.job("job-000001").stage(StageName.PUBLISH).artifacts[0]
+    receipt = current.executor.artifact_store.read_bytes(receipt_ref)
+
+    def disappear(path: Path) -> str:
+        del path
+        raise OSError
+
+    monkeypatch.setattr(stages_module, "_sha256", disappear)
+    with pytest.raises(AppError, match=r"output\.publication_invalid"):
+        verify_publication(
+            receipt,
+            output_dir=Path(projection.job("job-000001").config.output_dir),
+            input_path=Path(projection.job("job-000001").input_path),
+            export_refs=projection.job("job-000001").stage(StageName.EXPORT).artifacts,
+        )
+
+
+def test_publication_verifier_checks_each_target_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current, projection, _ = _published_batch(tmp_path)
+    receipt_ref = projection.job("job-000001").stage(StageName.PUBLISH).artifacts[0]
+    receipt = current.executor.artifact_store.read_bytes(receipt_ref)
+    calls = 0
+
+    def count_hash(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(stages_module, "_sha256", count_hash)
+    verify_publication(
+        receipt,
+        output_dir=Path(projection.job("job-000001").config.output_dir),
+        input_path=Path(projection.job("job-000001").input_path),
+        export_refs=projection.job("job-000001").stage(StageName.EXPORT).artifacts,
+    )
+    assert calls == 2
 
 
 @pytest.mark.parametrize("target_name", ["input.transcript.json", "input.srt"])

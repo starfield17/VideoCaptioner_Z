@@ -202,8 +202,7 @@ class PublishStage:
             )
         for key, ref in targets:
             published = Path(request.config.output_dir) / key
-            if published.stat().st_size != ref.size_bytes or _sha256(published) != ref.sha256:
-                raise AppError("output.publication_invalid", {"logical_name": key})
+            _verify_published_target(published, ref, key)
         receipt = PublicationReceipt(
             hashlib.sha256("".join(ref.sha256 for _, ref in targets).encode()).hexdigest(),
             tuple(
@@ -242,12 +241,21 @@ def _sha256(path: Path) -> str:
 
 
 def _published_matches(path: Path, ref: ArtifactRef) -> bool:
-    return (
-        not path.is_symlink()
-        and path.is_file()
-        and path.stat().st_size == ref.size_bytes
-        and _sha256(path) == ref.sha256
-    )
+    try:
+        _verify_published_target(path, ref, path.name)
+    except AppError:
+        return False
+    return True
+
+
+def _verify_published_target(path: Path, ref: ArtifactRef, logical_name: str) -> None:
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise AppError("output.publication_invalid", {"logical_name": logical_name})
+        if path.stat().st_size != ref.size_bytes or _sha256(path) != ref.sha256:
+            raise AppError("output.publication_invalid", {"logical_name": logical_name})
+    except OSError as exc:
+        raise AppError("output.publication_invalid", {"logical_name": logical_name}) from exc
 
 
 def verify_publication(
@@ -291,19 +299,4 @@ def verify_publication(
         ):
             raise AppError("output.publication_invalid", {"reason": "target_metadata"})
         path = Path(target.path)
-        try:
-            if path.is_symlink() or not path.is_file():
-                raise AppError("output.publication_invalid", {"logical_name": target.logical_name})
-            if path.stat().st_size != target.size_bytes or _sha256(path) != target.sha256:
-                raise AppError("output.publication_invalid", {"logical_name": target.logical_name})
-        except OSError as exc:
-            raise AppError(
-                "output.publication_invalid", {"logical_name": target.logical_name}
-            ) from exc
-        if target.sha256 != expected[0].sha256 or target.size_bytes != expected[0].size_bytes:
-            raise AppError("output.publication_invalid", {"reason": "target_metadata"})
-        path = Path(target.path)
-        if path.is_symlink() or not path.is_file():
-            raise AppError("output.publication_invalid", {"reason": "target_missing"})
-        if path.stat().st_size != target.size_bytes or _sha256(path) != target.sha256:
-            raise AppError("output.publication_invalid", {"reason": "target_hash"})
+        _verify_published_target(path, expected[0], target.logical_name)

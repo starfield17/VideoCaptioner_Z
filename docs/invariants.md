@@ -52,6 +52,10 @@
   never removed during detection.
 - A cooperative cancel marker is removed only after cancellation events and Manifest projection
   are durable; an interrupted Job may transition directly to `cancelled`.
+- Workspace cleanup failure after durable cancellation preserves `cancelled` and never creates a
+  failure event.
 - A Batch uses one common runtime configuration and distinct publication targets.
 - Failed and cancelled Jobs require an explicit `job.retry_requested` before retry.
 - Publication receipts are strict and reverify both final target files.
+- Publication target verification performs one complete regular-file, size, and hash pass; target
+  races and I/O failures are exposed as `output.publication_invalid`.
