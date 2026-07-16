@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import pytest
+from hypothesis import given
+from hypothesis import strategies as st
+
+from captioner.core.domain.errors import AppError
+from captioner.core.domain.llm import FastTranslationResponse
+from captioner.core.policies.llm_validation import (
+    is_obvious_wrong_language,
+    protected_numeric_tokens,
+    validate_responses,
+)
+
+
+@given(st.text(alphabet=st.characters(blacklist_categories=("Cs",)), min_size=1, max_size=30))
+def test_validated_response_rejects_noncanonical_model_text(text: str) -> None:
+    if text != text.strip() or text != text.replace("\n", " "):
+        with pytest.raises(AppError):
+            validate_responses(
+                ({"id": "unit-1", "corrected_source": "source", "translated_text": text},),
+                ("unit-1",),
+            )
+
+
+def test_response_validator_covers_id_context_language_and_numbers() -> None:
+    with pytest.raises(AppError, match=r"llm\.missing_id"):
+        validate_responses((), ("unit-1",))
+    with pytest.raises(AppError, match=r"llm\.duplicate_id"):
+        validate_responses(
+            (
+                FastTranslationResponse("unit-1", "one", "一"),
+                FastTranslationResponse("unit-1", "one", "一"),
+            ),
+            ("unit-1", "unit-2"),
+        )
+    with pytest.raises(AppError, match=r"llm\.context_id_returned"):
+        validate_responses(
+            (FastTranslationResponse("context-1", "one", "一"),),
+            ("unit-1",),
+            context_ids=("context-1",),
+        )
+    with pytest.raises(AppError, match=r"llm\.wrong_language"):
+        validate_responses(
+            (FastTranslationResponse("unit-1", "one", "hello"),),
+            ("unit-1",),
+            target_language="zh-CN",
+        )
+    with pytest.raises(AppError, match=r"llm\.protected_token_lost"):
+        validate_responses(
+            (FastTranslationResponse("unit-1", "Price 20%", "价格"),),
+            ("unit-1",),
+            source_texts={"unit-1": "Price 20%"},
+        )
+
+
+def test_script_heuristic_and_protected_token_extraction_are_deterministic() -> None:
+    assert is_obvious_wrong_language("hello", "zh-CN")
+    assert not is_obvious_wrong_language("你好", "zh-CN")
+    assert protected_numeric_tokens("USD 12.50 and 20%")
