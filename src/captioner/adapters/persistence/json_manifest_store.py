@@ -13,6 +13,7 @@ from typing import cast
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.result import JsonValue
+from captioner.core.ports.manifest import ManifestStatus
 
 MANIFEST_SCHEMA_VERSION = 1
 
@@ -97,26 +98,41 @@ class JsonManifestStore:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
-    def reconcile(self, projection: BatchProjection) -> str:
-        manifest = self.read()
+    def inspect(self, projection: BatchProjection) -> ManifestStatus:
+        try:
+            manifest = self.read()
+        except AppError:
+            return "invalid"
         if manifest is None:
-            self.write(projection)
-            return "rebuilt"
+            return "missing"
         seq = manifest.get("last_event_seq")
         if not isinstance(seq, int) or isinstance(seq, bool):
-            raise AppError("manifest.inconsistent", {"reason": "last_event_seq"})
+            return "invalid"
         if seq > projection.last_event_seq:
-            raise AppError("manifest.inconsistent", {"reason": "ahead_of_journal"})
+            return "ahead"
         if seq < projection.last_event_seq:
-            self.write(projection)
-            return "rebuilt"
+            return "stale"
         expected_data = projected_data(projection)
         expected_hash = projection_hash(expected_data)
         actual_hash = manifest.get("projection_hash")
         actual_data = {key: value for key, value in manifest.items() if key != "projection_hash"}
         if actual_hash != expected_hash or actual_data != expected_data:
-            raise AppError("manifest.inconsistent", {"reason": "projection_mismatch"})
+            return "projection_mismatch"
         return "current"
+
+    def reconcile(self, projection: BatchProjection) -> ManifestStatus:
+        status = self.inspect(projection)
+        if status in {"missing", "stale"}:
+            self.write(projection)
+            return "current"
+        if status != "current":
+            reason = {
+                "ahead": "ahead_of_journal",
+                "projection_mismatch": "projection_mismatch",
+                "invalid": "invalid_json",
+            }[status]
+            raise AppError("manifest.inconsistent", {"reason": reason})
+        return status
 
 
 def _fsync_directory(path: Path) -> None:

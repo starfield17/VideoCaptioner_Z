@@ -8,6 +8,9 @@ from pathlib import Path
 
 from platformdirs import user_cache_dir, user_config_dir, user_data_dir, user_log_dir
 
+from captioner.core.domain.errors import AppError
+from captioner.core.domain.job import validate_identifier
+
 APP_NAME = "Captioner"
 
 
@@ -86,6 +89,16 @@ def ensure_runtime_layout(paths: AppPaths) -> None:
     paths.batches_dir.mkdir(parents=True, exist_ok=True)
     (paths.artifacts_dir / ".incoming").mkdir(parents=True, exist_ok=True)
     (paths.artifacts_dir / "sha256").mkdir(parents=True, exist_ok=True)
+
+
+def resolve_safe_child(root: Path, identifier: str, *, field: str) -> Path:
+    """Resolve one validated identifier directly below ``root``."""
+    validated = validate_identifier(identifier, field=field)
+    resolved_root = root.expanduser().resolve()
+    child = (resolved_root / validated).resolve()
+    if child.parent != resolved_root:
+        raise AppError("path.outside_runtime_root", {"field": field})
+    return child
 
 
 def _normalize_platform(value: str) -> str:

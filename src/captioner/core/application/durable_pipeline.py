@@ -41,7 +41,7 @@ class DurablePipelineService:
     control_dir: Path
 
     def create(self, batch_id: str, jobs: Sequence[tuple[str, Path, JobConfig]]) -> BatchProjection:
-        if self.journal.read():
+        if self.journal.read_snapshot().events:
             raise AppError("batch.exists", {"batch_id": batch_id})
         first = JournalEvent(
             1,
@@ -79,7 +79,7 @@ class DurablePipelineService:
         return projection
 
     async def resume(self) -> BatchProjection:
-        events = self.journal.read()
+        events = self.journal.repair_and_read()
         if not events:
             raise AppError("batch.not_found")
         projection = replay(events)
@@ -90,16 +90,11 @@ class DurablePipelineService:
         return await self.run(projection)
 
     def status(self) -> BatchProjection:
-        events = self.journal.read()
+        snapshot = self.journal.read_snapshot()
+        events = snapshot.events
         if not events:
             raise AppError("batch.not_found")
         projection = replay(events)
-        self.manifest.reconcile(projection)
-        for job in projection.jobs:
-            for stage in job.stages:
-                if stage.state is StageState.COMMITTED:
-                    for artifact in stage.artifacts:
-                        self.executor.artifact_store.verify(artifact)
         return projection
 
     def update_config(
@@ -175,7 +170,7 @@ class DurablePipelineService:
                     context=context,
                 )
         except AppError as exc:
-            current = replay(self.journal.read())
+            current = replay(self.journal.repair_and_read())
             if (
                 exc.code == "operation.cancelled"
                 and current.job(job_id).state is not JobState.CANCELLED
@@ -210,7 +205,7 @@ class DurablePipelineService:
                             "attempt": stage.attempt,
                         },
                     )
-        if projection.last_event_seq != replay(self.journal.read()).last_event_seq:
+        if projection.last_event_seq != replay(self.journal.repair_and_read()).last_event_seq:
             raise AppError("journal.corrupt")
         self.manifest.write(projection)
         return projection
@@ -242,9 +237,9 @@ class DurablePipelineService:
         self, projection: BatchProjection, event_type: str, payload: Mapping[str, FrozenJsonValue]
     ) -> BatchProjection:
         event = self.event_factory.create(projection, event_type, payload)
-        apply_event(projection, event)
+        updated = apply_event(projection, event)
         self.journal.append(event)
-        return replay(self.journal.read())
+        return updated
 
     def _remove_stale_workspaces(self) -> None:
         import shutil

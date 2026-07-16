@@ -69,7 +69,7 @@ def service(
     journal = JsonlJournal(batch_dir / "journal.jsonl")
     manifest = JsonManifestStore(batch_dir / "manifest.json")
     artifacts = ContentAddressedArtifactStore(root / "artifacts")
-    sequence = len(journal.read())
+    sequence = len(journal.read_snapshot().events)
 
     def next_id() -> str:
         nonlocal sequence

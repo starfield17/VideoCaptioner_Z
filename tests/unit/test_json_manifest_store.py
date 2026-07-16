@@ -22,8 +22,8 @@ def test_missing_and_stale_manifest_are_rebuilt(tmp_path: Path) -> None:
     store = JsonManifestStore(tmp_path / "manifest.json")
     first = BatchProjection("batch-a", last_event_seq=1)
     second = BatchProjection("batch-a", last_event_seq=2)
-    assert store.reconcile(first) == "rebuilt"
-    assert store.reconcile(second) == "rebuilt"
+    assert store.reconcile(first) == "current"
+    assert store.reconcile(second) == "current"
     assert store.read()["last_event_seq"] == 2  # type: ignore[index]  # read is asserted non-None
 
 
@@ -40,3 +40,14 @@ def test_manifest_ahead_and_same_seq_mismatch_are_rejected(tmp_path: Path) -> No
     store.path.write_text(json.dumps(value), encoding="utf-8")
     with pytest.raises(AppError, match="projection_mismatch"):
         store.reconcile(projection)
+
+
+def test_inspect_is_read_only_and_reports_actual_status(tmp_path: Path) -> None:
+    store = JsonManifestStore(tmp_path / "manifest.json")
+    projection = BatchProjection("batch-a", last_event_seq=2)
+    assert store.inspect(projection) == "missing"
+    assert not store.path.exists()
+    store.write(BatchProjection("batch-a", last_event_seq=1))
+    previous = store.path.read_bytes()
+    assert store.inspect(projection) == "stale"
+    assert store.path.read_bytes() == previous

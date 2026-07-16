@@ -12,7 +12,7 @@ from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.cache_key import derive_stage_cache_key
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
-from captioner.core.domain.journal import JournalEvent, apply_event, replay
+from captioner.core.domain.journal import JournalEvent, apply_event
 from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
 from captioner.core.domain.stage import StageName, StageState
 from captioner.core.ports.durable_artifact_store import DurableArtifactStorePort
@@ -172,9 +172,9 @@ class StageExecutor:
         payload: Mapping[str, FrozenJsonValue],
     ) -> BatchProjection:
         event = self.event_factory.create(projection, event_type, payload)
-        apply_event(projection, event)
+        updated = apply_event(projection, event)
         self.journal.append(event)
-        return replay(self.journal.read())
+        return updated
 
     def _import(self, produced: ProducedArtifact) -> ArtifactRef:
         if produced.data is not None:

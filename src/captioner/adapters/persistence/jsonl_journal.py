@@ -11,6 +11,7 @@ from typing import cast
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.journal import JournalEvent
+from captioner.core.ports.journal import JournalSnapshot
 
 MAX_EVENT_LINE_BYTES = 1024 * 1024
 
@@ -35,15 +36,26 @@ def canonical_event_bytes(event: JournalEvent) -> bytes:
 class JsonlJournal:
     path: Path
 
-    def read(self) -> tuple[JournalEvent, ...]:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def read_snapshot(self) -> JournalSnapshot:
+        if not self.path.exists():
+            return JournalSnapshot((), "clean")
+        try:
+            data = self.path.read_bytes()
+        except OSError as exc:
+            raise AppError("journal.read_failed", {"path": str(self.path)}) from exc
+        tail_status = "clean" if not data or data.endswith(b"\n") else "incomplete"
+        complete = data if tail_status == "clean" else data[: data.rfind(b"\n") + 1]
+        events = self._parse_complete_lines(complete)
+        return JournalSnapshot(events, tail_status)
+
+    def repair_and_read(self) -> tuple[JournalEvent, ...]:
         if not self.path.exists():
             return ()
         self._repair_tail()
-        try:
-            raw_lines = self.path.read_bytes().splitlines(keepends=True)
-        except OSError as exc:
-            raise AppError("journal.read_failed", {"path": str(self.path)}) from exc
+        return self.read_snapshot().events
+
+    def _parse_complete_lines(self, data: bytes) -> tuple[JournalEvent, ...]:
+        raw_lines = data.splitlines(keepends=True)
         events: list[JournalEvent] = []
         for line_number, line in enumerate(raw_lines, start=1):
             if len(line) > MAX_EVENT_LINE_BYTES:
@@ -68,7 +80,7 @@ class JsonlJournal:
         return tuple(events)
 
     def append(self, event: JournalEvent) -> None:
-        events = self.read()
+        events = self.read_snapshot().events
         if event.seq != len(events) + 1:
             raise AppError("journal.append_failed", {"reason": "sequence"})
         if events and event.batch_id != events[0].batch_id:
@@ -90,7 +102,10 @@ class JsonlJournal:
             self.append(event)
 
     def _event_is_durable(self, expected: JournalEvent) -> bool:
-        events = self.read()
+        snapshot = self.read_snapshot()
+        if snapshot.tail_status == "incomplete":
+            return False
+        events = snapshot.events
         matching = [event for event in events if event.event_id == expected.event_id]
         if not matching:
             return False

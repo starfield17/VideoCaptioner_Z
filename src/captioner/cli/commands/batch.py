@@ -9,19 +9,21 @@ import socket
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from captioner.adapters.persistence.json_manifest_store import JsonManifestStore
+from captioner.adapters.persistence.jsonl_journal import JsonlJournal
 from captioner.bootstrap import (
     DurableServiceBundle,
     build_durable_service,
     create_batch_lease,
     create_job_config,
-    load_batch_config,
 )
 from captioner.core.application.durable_pipeline import write_cancel_marker
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.job import JobConfig
+from captioner.core.domain.job import JobConfig, JobState, validate_identifier
+from captioner.core.domain.journal import replay
 from captioner.core.domain.stage import StageName
-from captioner.infrastructure.app_paths import AppPaths
+from captioner.infrastructure.app_paths import AppPaths, resolve_safe_child
 from captioner.infrastructure.ids import new_id
 
 
@@ -85,21 +87,22 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
 
 
 def status(batch_id: str, *, paths: AppPaths) -> BatchProjection:
-    config = load_batch_config(batch_id, paths=paths)
-    return _bundle(batch_id, config, paths).service.status()
+    projection = _read_projection(batch_id, paths=paths, repair=False)
+    return projection
 
 
 def resume(
     batch_id: str, *, paths: AppPaths, overrides: ResumeOverrides | None = None
 ) -> BatchProjection:
-    config = load_batch_config(batch_id, paths=paths)
-    selected = config if overrides is None else _apply_overrides(config, overrides)
-    bundle = _bundle(batch_id, selected, paths)
-    lease = create_batch_lease(bundle.batch_dir)
+    batch_dir = resolve_safe_child(paths.batches_dir, batch_id, field="batch_id")
+    lease = create_batch_lease(batch_dir)
     lease.acquire()
     try:
+        projection = _read_projection(batch_id, paths=paths, repair=True)
+        config = projection.jobs[0].config
+        selected = config if overrides is None else _apply_overrides(config, overrides)
+        bundle = _bundle(batch_id, selected, paths)
         if selected != config:
-            projection = bundle.service.status()
             bundle.service.update_config(
                 projection,
                 job_id=projection.jobs[0].job_id,
@@ -112,18 +115,30 @@ def resume(
 
 
 def retry(batch_id: str, job_id: str, stage: StageName, *, paths: AppPaths) -> BatchProjection:
-    config = load_batch_config(batch_id, paths=paths)
-    bundle = _bundle(batch_id, config, paths)
-    lease = create_batch_lease(bundle.batch_dir)
+    batch_dir = resolve_safe_child(paths.batches_dir, batch_id, field="batch_id")
+    lease = create_batch_lease(batch_dir)
     lease.acquire()
     try:
+        projection = _read_projection(batch_id, paths=paths, repair=True)
+        config = projection.jobs[0].config
+        bundle = _bundle(batch_id, config, paths)
         return asyncio.run(bundle.service.retry(job_id, stage))
     finally:
         lease.release()
 
 
 def cancel(batch_id: str, job_id: str | None, *, paths: AppPaths) -> Path:
-    return write_cancel_marker(paths.batches_dir / batch_id / "control", job_id=job_id)
+    projection = _read_projection(batch_id, paths=paths, repair=False)
+    if job_id is not None:
+        validate_identifier(job_id, field="job_id")
+        try:
+            job = projection.job(job_id)
+        except StopIteration as exc:
+            raise AppError("batch.job_not_found", {"job_id": job_id}) from exc
+        if job.state in {JobState.SUCCEEDED, JobState.CANCELLED}:
+            raise AppError("batch.cancel_invalid", {"reason": "terminal"})
+    batch_dir = resolve_safe_child(paths.batches_dir, batch_id, field="batch_id")
+    return write_cancel_marker(batch_dir / "control", job_id=job_id)
 
 
 def projection_payload(projection: BatchProjection, *, paths: AppPaths) -> dict[str, object]:
@@ -136,7 +151,10 @@ def projection_payload(projection: BatchProjection, *, paths: AppPaths) -> dict[
         if stale_execution and projection.state.value == "running"
         else projection.state.value,
         "last_event_seq": projection.last_event_seq,
-        "manifest_status": "current",
+        "manifest_status": JsonManifestStore(
+            resolve_safe_child(paths.batches_dir, projection.batch_id, field="batch_id")
+            / "manifest.json"
+        ).inspect(projection),
         "cancel_requested": (control / "cancel-batch").exists()
         or any(control.glob("cancel-job-*")),
         "jobs": [
@@ -225,6 +243,15 @@ def _bundle(batch_id: str, config: JobConfig, paths: AppPaths) -> DurableService
         ffprobe_bin=config.ffprobe_bin,
         paths=paths,
     )
+
+
+def _read_projection(batch_id: str, *, paths: AppPaths, repair: bool) -> BatchProjection:
+    batch_dir = resolve_safe_child(paths.batches_dir, batch_id, field="batch_id")
+    journal = JsonlJournal(batch_dir / "journal.jsonl")
+    events = journal.repair_and_read() if repair else journal.read_snapshot().events
+    if not events:
+        raise AppError("batch.not_found", {"batch_id": batch_id})
+    return replay(events)
 
 
 def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig:

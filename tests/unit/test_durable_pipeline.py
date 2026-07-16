@@ -103,7 +103,7 @@ def _service(
     journal = JsonlJournal(batch_dir / "journal.jsonl")
     manifest = JsonManifestStore(batch_dir / "manifest.json")
     artifacts = ContentAddressedArtifactStore(tmp_path / "artifacts")
-    sequence = len(journal.read())
+    sequence = len(journal.read_snapshot().events)
 
     def next_id() -> str:
         nonlocal sequence
@@ -187,7 +187,10 @@ def test_cancel_marker_produces_cancelled_not_failed(tmp_path: Path) -> None:
     status = service.status()
     assert status.job("job-000001").state is JobState.CANCELLED
     assert all(stage.state is StageState.PENDING for stage in status.job("job-000001").stages)
-    assert all(event.type not in {"stage.failed", "job.failed"} for event in service.journal.read())
+    assert all(
+        event.type not in {"stage.failed", "job.failed"}
+        for event in service.journal.read_snapshot().events
+    )
 
 
 @pytest.mark.parametrize(

@@ -17,7 +17,7 @@ def _event() -> JournalEvent:
 def test_only_unterminated_tail_is_repaired(tmp_path: Path, tail: bytes) -> None:
     path = tmp_path / "journal.jsonl"
     path.write_bytes(canonical_event_bytes(_event()) + tail)
-    assert JsonlJournal(path).read() == (_event(),)
+    assert JsonlJournal(path).repair_and_read() == (_event(),)
 
 
 @pytest.mark.parametrize("bad", [b"bad\n", b"\xff\n"])
@@ -25,4 +25,4 @@ def test_complete_bad_line_is_never_repaired(tmp_path: Path, bad: bytes) -> None
     path = tmp_path / "journal.jsonl"
     path.write_bytes(canonical_event_bytes(_event()) + bad)
     with pytest.raises(AppError, match=r"journal\.corrupt"):
-        JsonlJournal(path).read()
+        JsonlJournal(path).repair_and_read()

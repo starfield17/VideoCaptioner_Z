@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import os
 import socket
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+
+from filelock import FileLock, Timeout
 
 from captioner.core.domain.errors import AppError
 
@@ -31,36 +34,40 @@ class BatchLease:
     pid_is_alive: Callable[[int], bool]
     _acquired: bool = False
 
+    @property
+    def _guard_path(self) -> Path:
+        return self.path.with_name(f".{self.path.name}.guard")
+
     def acquire(self) -> LeaseOwner:
         owner = LeaseOwner(self.token, self.pid, self.hostname, self.created_timestamp)
-        encoded = _lease_bytes(owner)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with self.path.open("xb") as handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except FileExistsError:
-            existing = self.read_owner()
-            if existing.hostname != self.hostname:
-                raise AppError("batch.busy", {"reason": "remote_host"}) from None
-            if self.pid_is_alive(existing.pid):
-                raise AppError("batch.busy", {"reason": "active_pid"}) from None
-            self._reclaim_stale(existing)
-            return self.acquire()
+            with FileLock(self._guard_path, timeout=10):
+                if self.path.exists():
+                    existing = self.read_owner()
+                    if existing.hostname != self.hostname:
+                        raise AppError("batch.busy", {"reason": "remote_host"})
+                    if self.pid_is_alive(existing.pid):
+                        raise AppError("batch.busy", {"reason": "active_pid"})
+                    self._reclaim_stale(existing)
+                _atomic_write(self.path, _lease_bytes(owner))
+                self._acquired = True
+        except Timeout as exc:
+            raise AppError("batch.busy", {"reason": "lease_guard"}) from exc
         except OSError as exc:
             raise AppError("batch.lease_failed") from exc
-        self._acquired = True
         return owner
 
     def release(self) -> None:
         if not self._acquired:
             return
-        existing = self.read_owner()
-        if existing.token != self.token:
-            raise AppError("batch.lease_failed", {"reason": "token_mismatch"})
         try:
-            self.path.unlink()
+            with FileLock(self._guard_path, timeout=10):
+                existing = self.read_owner()
+                if existing.token != self.token:
+                    raise AppError("batch.lease_failed", {"reason": "token_mismatch"})
+                self.path.unlink()
+                _fsync_directory(self.path.parent)
         except OSError as exc:
             raise AppError("batch.lease_failed", {"reason": "release"}) from exc
         self._acquired = False
@@ -133,6 +140,33 @@ def _lease_bytes(owner: LeaseOwner) -> bytes:
         )
         + "\n"
     ).encode()
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    temporary: Path | None = None
+    try:
+        descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        temporary = Path(name)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        _fsync_directory(path.parent)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _pid_is_alive(pid: int) -> bool:

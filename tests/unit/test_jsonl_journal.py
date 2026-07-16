@@ -24,9 +24,9 @@ def _event(seq: int = 1) -> JournalEvent:
 
 def test_empty_and_complete_journal(tmp_path: Path) -> None:
     journal = JsonlJournal(tmp_path / "journal.jsonl")
-    assert journal.read() == ()
+    assert journal.read_snapshot().events == ()
     journal.append(_event())
-    assert journal.read() == (_event(),)
+    assert journal.read_snapshot().events == (_event(),)
     assert journal.path.read_bytes().endswith(b"\n")
 
 
@@ -37,7 +37,7 @@ def test_empty_and_complete_journal(tmp_path: Path) -> None:
 def test_unterminated_tail_is_truncated(tmp_path: Path, fragment: bytes) -> None:
     path = tmp_path / "journal.jsonl"
     path.write_bytes(canonical_event_bytes(_event()) + fragment)
-    assert JsonlJournal(path).read() == (_event(),)
+    assert JsonlJournal(path).repair_and_read() == (_event(),)
     assert path.read_bytes() == canonical_event_bytes(_event())
 
 
@@ -53,7 +53,7 @@ def test_complete_corrupt_line_is_rejected(tmp_path: Path, content: bytes) -> No
     path = tmp_path / "journal.jsonl"
     path.write_bytes(content)
     with pytest.raises(AppError, match=r"journal\.corrupt"):
-        JsonlJournal(path).read()
+        JsonlJournal(path).repair_and_read()
 
 
 def test_missing_and_duplicate_sequence_are_rejected(tmp_path: Path) -> None:
@@ -61,10 +61,10 @@ def test_missing_and_duplicate_sequence_are_rejected(tmp_path: Path) -> None:
     second = _event(2).to_dict()
     path.write_bytes((json.dumps(second) + "\n").encode())
     with pytest.raises(AppError, match=r"journal\.corrupt"):
-        JsonlJournal(path).read()
+        JsonlJournal(path).repair_and_read()
     path.write_bytes(canonical_event_bytes(_event()) * 2)
     with pytest.raises(AppError, match=r"journal\.corrupt"):
-        JsonlJournal(path).read()
+        JsonlJournal(path).repair_and_read()
 
 
 def test_event_codec_is_canonical_and_round_trips() -> None:
@@ -89,4 +89,14 @@ def test_uncertain_append_is_reconciled_by_event_identity(
 
     monkeypatch.setattr(os, "fsync", fsync_then_fail)
     journal.append(_event())
-    assert journal.read() == (_event(),)
+    assert journal.read_snapshot().events == (_event(),)
+
+
+def test_snapshot_reports_incomplete_tail_without_truncating(tmp_path: Path) -> None:
+    path = tmp_path / "journal.jsonl"
+    original = canonical_event_bytes(_event()) + b'{"partial":'
+    path.write_bytes(original)
+    snapshot = JsonlJournal(path).read_snapshot()
+    assert snapshot.events == (_event(),)
+    assert snapshot.tail_status == "incomplete"
+    assert path.read_bytes() == original

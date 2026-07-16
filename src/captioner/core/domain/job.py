@@ -6,7 +6,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import cast
 
 from captioner.core.domain.errors import AppError
@@ -18,7 +18,16 @@ _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 def validate_identifier(value: str, *, field: str) -> str:
-    if _ID_RE.fullmatch(value) is None or ".." in value:
+    if (
+        not value
+        or value != value.strip()
+        or _ID_RE.fullmatch(value) is None
+        or ".." in value
+        or PurePosixPath(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+        or PureWindowsPath(value).drive
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
         raise AppError("job.identity_invalid", {"field": field})
     return value
 

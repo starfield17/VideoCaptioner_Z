@@ -37,7 +37,12 @@ from captioner.core.domain.job import JobConfig
 from captioner.core.domain.journal import replay
 from captioner.core.domain.stage import StageName
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig
-from captioner.infrastructure.app_paths import AppPaths, ensure_runtime_layout, resolve_app_paths
+from captioner.infrastructure.app_paths import (
+    AppPaths,
+    ensure_runtime_layout,
+    resolve_app_paths,
+    resolve_safe_child,
+)
 from captioner.infrastructure.ids import new_id
 
 
@@ -139,7 +144,8 @@ def _pid_alive(pid: int) -> bool:
 
 def load_batch_config(batch_id: str, *, paths: AppPaths | None = None) -> JobConfig:
     application_paths = resolve_app_paths() if paths is None else paths
-    events = JsonlJournal(application_paths.batches_dir / batch_id / "journal.jsonl").read()
+    batch_dir = resolve_safe_child(application_paths.batches_dir, batch_id, field="batch_id")
+    events = JsonlJournal(batch_dir / "journal.jsonl").read_snapshot().events
     if not events:
         from captioner.core.domain.errors import AppError
 
@@ -165,7 +171,7 @@ def build_durable_service(
 ) -> DurableServiceBundle:
     application_paths = resolve_app_paths() if paths is None else paths
     ensure_runtime_layout(application_paths)
-    batch_dir = application_paths.batches_dir / batch_id
+    batch_dir = resolve_safe_child(application_paths.batches_dir, batch_id, field="batch_id")
     process = AsyncioSubprocessRunner()
     durable = ContentAddressedArtifactStore(application_paths.artifacts_dir)
     config = FasterWhisperConfig(model_ref, device, compute_type, language)

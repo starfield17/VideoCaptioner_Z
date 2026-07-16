@@ -9,6 +9,7 @@ description = "Durable batch subtitle generation with resumable verified artifac
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "filelock>=3.18,<4",
     "PySide6>=6.8,<7",
     "platformdirs>=4.3,<5",
 ]
