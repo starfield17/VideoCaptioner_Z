@@ -15,15 +15,20 @@ from captioner.infrastructure.app_paths import AppPaths, ensure_runtime_layout, 
 
 def build_run_service(
     *,
-    model_id: str,
+    model_ref: str = "tiny",
     device: str,
     compute_type: str,
     language: str | None,
     ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
     paths: AppPaths | None = None,
+    model_id: str | None = None,
 ) -> RunSingleService:
     """Assemble concrete adapters for one CLI invocation."""
+    if model_id is not None:
+        if model_ref != "tiny" and model_ref != model_id:
+            raise ValueError
+        model_ref = model_id
     application_paths = resolve_app_paths() if paths is None else paths
     ensure_runtime_layout(application_paths)
     process = AsyncioSubprocessRunner()
@@ -31,7 +36,7 @@ def build_run_service(
     normalizer = FFmpegAudioNormalizer(process, executable=ffmpeg_bin)
     engine = FasterWhisperEngine(
         FasterWhisperConfig(
-            model_id=model_id,
+            model_ref=model_ref,
             device=device,
             compute_type=compute_type,
             language=language,

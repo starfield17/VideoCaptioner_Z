@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Transcribe one media file")
     run_parser.add_argument("input", type=Path, help="One input audio or video file")
     run_parser.add_argument("--output", type=Path, required=True, help="Output directory")
-    run_parser.add_argument("--model", dest="model_id", default="tiny")
+    run_parser.add_argument("--model", dest="model_ref", default="tiny")
     run_parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     run_parser.add_argument("--compute-type", default="default")
     run_parser.add_argument("--language", default=None)
@@ -68,7 +68,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_options = run_command.RunOptions(
                 input_path=namespace.input,
                 output_dir=namespace.output,
-                model_id=namespace.model_id,
+                model_ref=namespace.model_ref,
                 device=namespace.device,
                 compute_type=namespace.compute_type,
                 language=namespace.language,

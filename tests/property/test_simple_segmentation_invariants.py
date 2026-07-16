@@ -14,10 +14,8 @@ from captioner.core.policies.simple_segmentation import (
 def test_segmentation_assigns_every_word_once_and_never_overlaps(lengths: list[int]) -> None:
     texts = tuple("x" * length + " " for length in lengths)
     transcript = make_transcript(texts)
-    track = segment_transcript(
-        transcript,
-        SimpleSegmentationConfig(max_duration_ms=800, max_text_units=20, hard_gap_ms=700),
-    )
+    config = SimpleSegmentationConfig(max_duration_ms=800, max_text_units=20, hard_gap_ms=700)
+    track = segment_transcript(transcript, config)
     assigned = [word_id for cue in track.cues for word_id in cue.source_word_ids]
     assert assigned == [word.id for word in transcript.words]
     assert len(set(assigned)) == len(assigned)
@@ -25,6 +23,12 @@ def test_segmentation_assigns_every_word_once_and_never_overlaps(lengths: list[i
         left.end_ms <= right.start_ms
         for left, right in zip(track.cues, track.cues[1:], strict=False)
     )
-    assert segment_transcript(transcript, SimpleSegmentationConfig()) == segment_transcript(
-        transcript, SimpleSegmentationConfig()
+    assert all(
+        len(cue.source_word_ids) == 1
+        or (
+            cue.end_ms - cue.start_ms <= config.max_duration_ms
+            and len(cue.source_text) <= config.max_text_units
+        )
+        for cue in track.cues
     )
+    assert segment_transcript(transcript, config) == segment_transcript(transcript, config)

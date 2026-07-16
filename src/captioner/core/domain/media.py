@@ -6,10 +6,10 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
+from typing import cast
 
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.result import JsonValue, validate_json_value
+from captioner.core.domain.result import FrozenJsonValue, JsonValue, freeze_json_value
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -31,10 +31,10 @@ def _require_sha256(value: str, field: str) -> None:
 
 def _freeze_metadata(metadata: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
     try:
-        validate_json_value(metadata)
+        frozen = cast(Mapping[str, FrozenJsonValue], freeze_json_value(metadata))
     except (TypeError, ValueError) as exc:
         raise AppError("media.invalid", {"field": "metadata", "reason": str(exc)}) from exc
-    return MappingProxyType(dict(metadata))
+    return cast(Mapping[str, JsonValue], frozen)
 
 
 @dataclass(frozen=True, slots=True)

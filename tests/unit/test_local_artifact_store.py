@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+import captioner.adapters.persistence.local_artifact_store as local_store_module
 from captioner.adapters.persistence.local_artifact_store import LocalArtifactStore
 from captioner.core.domain.errors import AppError
 
@@ -21,6 +23,143 @@ def test_local_artifact_store_writes_atomically_and_requires_overwrite(tmp_path:
     assert not list(target.parent.glob(".*.tmp"))
     store.delete("nested/字幕.srt")
     assert not store.exists("nested/字幕.srt")
+
+
+def test_staged_artifact_is_single_use_and_discard_removes_temp(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    root.mkdir()
+    store = LocalArtifactStore(root)
+    staged = store.stage_bytes("result.srt", b"data")
+    assert list(root.glob(".*.tmp"))
+    assert staged.commit(overwrite=False) == root / "result.srt"
+    with pytest.raises(AppError, match=r"output\.stage_invalid"):
+        staged.commit(overwrite=True)
+    staged.discard()
+
+    discarded = store.stage_bytes("discarded.srt", b"data")
+    discarded.discard()
+    with pytest.raises(AppError, match=r"output\.stage_invalid"):
+        discarded.commit(overwrite=False)
+    assert not (root / "discarded.srt").exists()
+    assert not list(root.glob(".*.tmp"))
+
+
+def test_replace_then_interrupt_reconciles_committed_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "output"
+    root.mkdir()
+    staged = LocalArtifactStore(root).stage_bytes("result.srt", b"new bytes")
+    real_replace = os.replace
+
+    def replace_then_interrupt(source: Path, target: Path) -> None:
+        real_replace(source, target)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(local_store_module.os, "replace", replace_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        staged.commit(overwrite=False)
+
+    assert staged.committed is True
+    assert (root / "result.srt").read_bytes() == b"new bytes"
+    assert not list(root.glob(".*.tmp"))
+
+
+def test_replace_oserror_before_consuming_temporary_remains_staged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "output"
+    root.mkdir()
+    staged = LocalArtifactStore(root).stage_bytes("result.srt", b"new bytes")
+    temporary = next(root.glob(".*.tmp"))
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError
+
+    monkeypatch.setattr(local_store_module.os, "replace", fail_replace)
+    with pytest.raises(AppError, match=r"output\.write_failed"):
+        staged.commit(overwrite=False)
+
+    assert staged.committed is False
+    assert temporary.exists()
+    staged.discard()
+    assert not temporary.exists()
+
+
+def test_replace_then_oserror_reconciles_committed_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "output"
+    root.mkdir()
+    staged = LocalArtifactStore(root).stage_bytes("result.srt", b"new bytes")
+    real_replace = os.replace
+
+    def replace_then_fail(source: Path, target: Path) -> None:
+        real_replace(source, target)
+        raise OSError
+
+    monkeypatch.setattr(local_store_module.os, "replace", replace_then_fail)
+    with pytest.raises(OSError):
+        staged.commit(overwrite=False)
+
+    assert staged.committed is True
+    assert (root / "result.srt").read_bytes() == b"new bytes"
+    assert not list(root.glob(".*.tmp"))
+
+
+def test_discard_retries_same_temporary_after_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "output"
+    root.mkdir()
+    staged = LocalArtifactStore(root).stage_bytes("result.srt", b"data")
+    temporary = next(root.glob(".*.tmp"))
+    real_unlink = Path.unlink
+    attempts = 0
+
+    def fail_once(path: Path, missing_ok: bool = False) -> None:
+        nonlocal attempts
+        if path == temporary:
+            attempts += 1
+            if attempts == 1:
+                raise OSError
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_once)
+    with pytest.raises(AppError, match=r"output\.cleanup_failed"):
+        staged.discard()
+    assert temporary.exists()
+
+    staged.discard()
+    assert attempts == 2
+    assert not temporary.exists()
+    with pytest.raises(AppError, match=r"output\.stage_invalid"):
+        staged.commit(overwrite=False)
+
+
+def test_local_store_does_not_follow_symlink_outside_root(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside")
+    (root / "escape.txt").symlink_to(outside)
+    with pytest.raises(AppError, match=r"output\.path_invalid"):
+        LocalArtifactStore(root).stage_bytes("escape.txt", b"new")
+
+
+def test_keyboard_interrupt_during_staging_runs_finally_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "output"
+    root.mkdir()
+
+    def interrupt(_descriptor: int) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(local_store_module.os, "fsync", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        LocalArtifactStore(root).stage_bytes("interrupted.srt", b"data")
+    assert not list(root.glob(".*.tmp"))
 
 
 @pytest.mark.parametrize("key", ["../escape", "/absolute", "C:\\absolute", "nested/../../escape"])

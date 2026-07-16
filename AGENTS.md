@@ -18,6 +18,16 @@ This file is the repository-local contract for humans and coding agents.
   once at the adapter boundary.
 - The final SRT is committed only after ASR, domain validation, segmentation,
   and both exports succeed. Exporters do not mutate domain objects.
+- Output artifacts are staged and fsynced before commit; cancellation or failure
+  must roll back every current-run commit and restore overwrite targets.
+- Domain JSON metadata is recursively frozen; exporters must thaw fresh mutable
+  JSON values rather than exposing internal containers.
+- Transcript words belong to exactly one segment and referenced words must lie
+  within segment time ranges.
+- Faster Whisper `model_ref` is an SDK loading reference; only stable
+  `model_identity` may enter public Transcript data.
+- Non-empty malformed ASR segments must raise a structured error rather than be
+  silently discarded.
 - Coding agents must not lower strictness, coverage, or lint standards to make CI pass.
 - Coding agents must not automatically batch-update golden files.
 - Every patch must report the tests run and known limitations.

@@ -78,7 +78,14 @@ class FFmpegAudioNormalizer:
         if duration_ms <= 0:
             _remove(output)
             raise AppError("media.normalized_audio_invalid", {"reason": "duration"})
-        sha256 = _sha256(output)
+        try:
+            sha256 = _sha256(output, context)
+        except AppError:
+            _remove(output)
+            raise
+        except OSError as exc:
+            _remove(output)
+            raise AppError("media.normalized_audio_read_failed", {"reason": "read"}) from exc
         return AudioArtifact(
             artifact_id=f"audio-{sha256}",
             path=output,
@@ -100,11 +107,18 @@ def _read_wav_format(path: Path) -> tuple[int, int, int, int]:
         )
 
 
-def _sha256(path: Path) -> str:
+def _sha256(path: Path, context: ExecutionContext) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
+    try:
+        context.raise_if_cancelled()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                context.raise_if_cancelled()
+                digest.update(chunk)
+    except AppError:
+        raise
+    except OSError as exc:
+        raise AppError("media.normalized_audio_read_failed", {"reason": "read"}) from exc
     return digest.hexdigest()
 
 

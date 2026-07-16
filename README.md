@@ -1,7 +1,7 @@
 # Captioner
 
-Captioner is a batch subtitle-generation application. Phase 1 provides a
-single-input vertical slice: FFprobe inspection, FFmpeg normalization to
+Captioner is a subtitle-generation application with an extensible core. Phase 1
+provides a single-input vertical slice: FFprobe inspection, FFmpeg normalization to
 16 kHz mono PCM WAV, optional Faster Whisper transcription, deterministic
 Transcript JSON, and SRT export.
 
@@ -34,8 +34,11 @@ python scripts/validate_subtitle.py build/output/input.srt
 ```
 
 The run writes `<source-stem>.transcript.json` and `<source-stem>.srt` only
-after successful transcription, validation, and atomic artifact commits. Use
-`--overwrite` to replace existing outputs.
+after successful transcription, validation, and a staged atomic artifact
+transaction. Cancellation or failure rolls back outputs committed by the
+current run; `--overwrite` restores the previous bytes when rollback is needed.
+Domain JSON metadata is recursively immutable, and public model identities do
+not contain machine-specific local model paths.
 
 CLI exit codes are stable: `0` success, `2` usage/configuration, `3`
 media/FFmpeg, `4` ASR/runtime/model, `5` output/export, and `130` cancellation.

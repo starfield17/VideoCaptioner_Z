@@ -8,7 +8,9 @@ and branch coverage with an 85% minimum.
 Tests are grouped into `unit`, `property`, `contract`, `integration`, and
 `packaging`. Property tests use Hypothesis for locale, domain and segmentation
 invariants. Unit tests use fake processes, fake ASR models and local artifact
-stores; they do not execute FFmpeg or download models. Integration tests use
+stores; they do not execute FFmpeg or download models. Output-transaction unit
+tests exercise every cancellation/interrupt boundary, overwrite restoration,
+staging cleanup, and staged-artifact single-use rule. Integration tests use
 the installed FFprobe/FFmpeg and are marked `integration`. The real Faster
 Whisper test is marked `slow`, uses the optional extra and a configurable model
 cache, and is not part of default PR CI. Packaging tests inspect commands and

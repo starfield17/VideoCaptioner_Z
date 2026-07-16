@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import NoReturn
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
@@ -16,7 +17,7 @@ from captioner.core.policies.simple_segmentation import (
     SimpleSegmentationConfig,
     segment_transcript,
 )
-from captioner.core.ports.artifact_store import ArtifactStorePort
+from captioner.core.ports.artifact_store import ArtifactStorePort, StagedArtifact
 from captioner.core.ports.asr import ASREngine, TranscriptionRequest
 from captioner.core.ports.media import AudioNormalizer, MediaInspector
 
@@ -89,6 +90,7 @@ class RunSingleService:
                 transcript_bytes=transcript_bytes,
                 srt_bytes=srt_bytes,
                 overwrite=request.overwrite,
+                context=execution,
             )
 
 
@@ -117,6 +119,7 @@ def _commit_outputs(
     transcript_bytes: bytes,
     srt_bytes: bytes,
     overwrite: bool,
+    context: ExecutionContext,
 ) -> RunSingleResult:
     transcript_key = f"{asset.source_path.stem}.transcript.json"
     subtitle_key = f"{asset.source_path.stem}.srt"
@@ -124,31 +127,86 @@ def _commit_outputs(
     previous: dict[str, bytes | None] = {
         key: store.read_bytes(key) if store.exists(key) else None for key in keys
     }
+    staged: list[StagedArtifact] = []
     committed: list[str] = []
+    transcript_path = store.root / transcript_key
+    subtitle_path = store.root / subtitle_key
     try:
-        transcript_path = store.write_bytes(transcript_key, transcript_bytes, overwrite=overwrite)
-        committed.append(transcript_key)
-        subtitle_path = store.write_bytes(subtitle_key, srt_bytes, overwrite=overwrite)
-    except AppError as exc:
-        _rollback(store, committed, previous, exc)
+        staged.append(store.stage_bytes(transcript_key, transcript_bytes))
+        staged.append(store.stage_bytes(subtitle_key, srt_bytes))
+        context.raise_if_cancelled()
+        transcript_path = _commit_staged(staged[0], overwrite=overwrite, committed=committed)
+        context.raise_if_cancelled()
+        subtitle_path = _commit_staged(staged[1], overwrite=overwrite, committed=committed)
+        context.raise_if_cancelled()
+        result = RunSingleResult(
+            media_id=asset.id,
+            transcript_id=transcript.id,
+            transcript_path=transcript_path,
+            subtitle_path=subtitle_path,
+            detected_language=transcript.language,
+            word_count=len(transcript.words),
+            cue_count=len(track.cues),
+        )
+        cleanup_error = _discard_all(staged)
+        if cleanup_error is not None:
+            _raise_cleanup_failed(cleanup_error)
+        context.raise_if_cancelled()
+    except BaseException as original:
+        _record_committed_stages(staged, committed)
+        rollback_error = _rollback(store, committed, previous)
+        cleanup_error = _discard_all(staged)
+        if rollback_error is not None or cleanup_error is not None:
+            reason = (
+                "output.cleanup_failed"
+                if cleanup_error is not None
+                else _rollback_failure_reason(rollback_error)
+            )
+            raise AppError("output.rollback_failed", {"reason": reason}) from original
         raise
-    return RunSingleResult(
-        media_id=asset.id,
-        transcript_id=transcript.id,
-        transcript_path=transcript_path,
-        subtitle_path=subtitle_path,
-        detected_language=transcript.language,
-        word_count=len(transcript.words),
-        cue_count=len(track.cues),
-    )
+    return result
+
+
+def _commit_staged(artifact: StagedArtifact, *, overwrite: bool, committed: list[str]) -> Path:
+    try:
+        path = artifact.commit(overwrite=overwrite)
+    except BaseException:
+        if artifact.committed and artifact.key not in committed:
+            committed.append(artifact.key)
+        raise
+    committed.append(artifact.key)
+    return path
+
+
+def _record_committed_stages(staged: list[StagedArtifact], committed: list[str]) -> None:
+    for artifact in staged:
+        if artifact.committed and artifact.key not in committed:
+            committed.append(artifact.key)
+
+
+def _discard_all(staged: list[StagedArtifact]) -> AppError | None:
+    first_error: AppError | None = None
+    for artifact in reversed(staged):
+        try:
+            artifact.discard()
+        except AppError as exc:
+            if first_error is None:
+                first_error = exc
+    return first_error
+
+
+def _raise_cleanup_failed(cleanup_error: AppError) -> NoReturn:
+    raise AppError(
+        "output.cleanup_failed",
+        {"reason": cleanup_error.code},
+    ) from cleanup_error
 
 
 def _rollback(
     store: ArtifactStorePort,
     committed: list[str],
     previous: dict[str, bytes | None],
-    original: AppError,
-) -> None:
+) -> BaseException | None:
     try:
         for key in reversed(committed):
             old_value = previous[key]
@@ -156,5 +214,12 @@ def _rollback(
                 store.delete(key)
             else:
                 store.write_bytes(key, old_value, overwrite=True)
-    except AppError as rollback_error:
-        raise AppError("output.rollback_failed", {"reason": rollback_error.code}) from original
+    except BaseException as rollback_error:
+        return rollback_error
+    return None
+
+
+def _rollback_failure_reason(rollback_error: BaseException | None) -> str:
+    if isinstance(rollback_error, AppError):
+        return rollback_error.code
+    return "output.rollback_failed"

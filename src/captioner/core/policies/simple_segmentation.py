@@ -104,14 +104,20 @@ def _choose_end(words: list[WordToken], start: int, config: SimpleSegmentationCo
             break
     if fit_end <= start:
         return start + 1
-    boundaries = [fit_end]
+
+    if fit_end == len(words):
+        return fit_end
+
+    preferred: list[int] = []
     for end in range(start + 1, fit_end + 1):
         current = words[end - 1]
         punctuation = current.text.rstrip().endswith(tuple(_PUNCTUATION))
         silence = end < len(words) and words[end].start_ms - current.end_ms >= config.hard_gap_ms
         if punctuation or silence:
-            boundaries.append(end)
-    return max(boundaries)
+            preferred.append(end)
+    if preferred:
+        return preferred[-1]
+    return fit_end
 
 
 def _join_words(words: list[WordToken]) -> str:
