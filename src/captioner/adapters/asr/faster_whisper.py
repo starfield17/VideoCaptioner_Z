@@ -338,7 +338,12 @@ def _normalize_model_ref(model_ref: object) -> str:
     if not normalized:
         raise ValueError
     candidate = Path(normalized).expanduser()
-    local_hint = candidate.is_absolute() or normalized.startswith((".", "~"))
+    # Keep POSIX-style absolute references recognizable when the CLI is being
+    # exercised on Windows.  ``WindowsPath('/missing/model').is_absolute()``
+    # is false, but the user still supplied a path rather than a model name.
+    local_hint = (
+        candidate.is_absolute() or normalized.startswith("/") or normalized.startswith((".", "~"))
+    )
     if local_hint or candidate.exists():
         if not candidate.is_dir():
             raise AppError(
