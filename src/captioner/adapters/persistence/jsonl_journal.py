@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -84,7 +85,7 @@ class JsonlJournal:
                 return
             raise AppError("journal.append_failed", {"seq": event.seq}) from exc
 
-    def append_many(self, events: tuple[JournalEvent, ...]) -> None:
+    def append_many(self, events: Sequence[JournalEvent]) -> None:
         for event in events:
             self.append(event)
 

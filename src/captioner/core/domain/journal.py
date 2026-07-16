@@ -292,9 +292,9 @@ def _apply_job_terminal(job: JobProjection, event_type: str) -> JobProjection:
             raise AppError("journal.transition_invalid", {"reason": "stages_uncommitted"})
         return replace(job, state=JobState.SUCCEEDED)
     if event_type == "job.cancelled":
-        if job.state is not JobState.CANCELLED:
+        if job.state not in {JobState.PENDING, JobState.RUNNING, JobState.CANCELLED}:
             raise AppError("journal.transition_invalid", {"reason": "job_not_cancelled"})
-        return job
+        return replace(job, state=JobState.CANCELLED)
     if event_type == "job.failed":
         if job.state is not JobState.FAILED:
             raise AppError("journal.transition_invalid", {"reason": "job_not_failed"})

@@ -2,15 +2,42 @@
 
 from __future__ import annotations
 
+import os
+import socket
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
 from captioner.adapters.asr.faster_whisper import FasterWhisperConfig, FasterWhisperEngine
 from captioner.adapters.exporters.srt import serialize_bytes as serialize_srt
 from captioner.adapters.exporters.transcript_json import serialize_bytes as serialize_transcript
 from captioner.adapters.media.ffmpeg_audio import FFmpegAudioNormalizer
 from captioner.adapters.media.ffprobe import FFprobeMediaInspector
+from captioner.adapters.persistence.batch_lease import BatchLease
+from captioner.adapters.persistence.content_addressed_artifact_store import (
+    ContentAddressedArtifactStore,
+)
+from captioner.adapters.persistence.json_manifest_store import JsonManifestStore
+from captioner.adapters.persistence.jsonl_journal import JsonlJournal
 from captioner.adapters.persistence.local_artifact_store import LocalArtifactStore
+from captioner.adapters.pipeline.stages import (
+    ExportStage,
+    InspectStage,
+    NormalizeStage,
+    PublishStage,
+    SegmentStage,
+    TranscribeStage,
+)
 from captioner.adapters.process.asyncio_subprocess import AsyncioSubprocessRunner
+from captioner.core.application.durable_pipeline import DurablePipelineService
 from captioner.core.application.run_single import RunSingleService
+from captioner.core.application.stage_executor import EventFactory, StageExecutor
+from captioner.core.domain.job import JobConfig
+from captioner.core.domain.journal import replay
+from captioner.core.domain.stage import StageName
+from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig
 from captioner.infrastructure.app_paths import AppPaths, ensure_runtime_layout, resolve_app_paths
+from captioner.infrastructure.ids import new_id
 
 
 def build_run_service(
@@ -50,4 +77,118 @@ def build_run_service(
         transcript_serializer=serialize_transcript,
         subtitle_serializer=serialize_srt,
         temp_root=application_paths.temp_dir,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DurableServiceBundle:
+    service: DurablePipelineService
+    batch_dir: Path
+
+
+def create_job_config(
+    *,
+    model_ref: str,
+    device: str,
+    compute_type: str,
+    language: str | None,
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    output_dir: Path,
+    overwrite: bool,
+) -> JobConfig:
+    model = FasterWhisperConfig(model_ref, device, compute_type, language)
+    return JobConfig(
+        model.model_ref,
+        model.model_identity,
+        device,
+        compute_type,
+        language,
+        True,
+        ffmpeg_bin,
+        ffprobe_bin,
+        {"codec": "pcm_s16le", "sample_rate": 16000, "channels": 1},
+        {"max_duration_ms": 7000, "max_text_units": 84, "hard_gap_ms": 700},
+        str(output_dir.expanduser().resolve()),
+        overwrite,
+        {stage.value: "1" for stage in StageName},
+    )
+
+
+def create_batch_lease(batch_dir: Path) -> BatchLease:
+    return BatchLease(
+        batch_dir / "lease.json",
+        new_id("lease-"),
+        os.getpid(),
+        socket.gethostname(),
+        datetime.now(UTC).isoformat(),
+        _pid_alive,
+    )
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def load_batch_config(batch_id: str, *, paths: AppPaths | None = None) -> JobConfig:
+    application_paths = resolve_app_paths() if paths is None else paths
+    events = JsonlJournal(application_paths.batches_dir / batch_id / "journal.jsonl").read()
+    if not events:
+        from captioner.core.domain.errors import AppError
+
+        raise AppError("batch.not_found", {"batch_id": batch_id})
+    projection = replay(events)
+    if not projection.jobs:
+        from captioner.core.domain.errors import AppError
+
+        raise AppError("batch.invalid", {"batch_id": batch_id})
+    return projection.jobs[0].config
+
+
+def build_durable_service(
+    batch_id: str,
+    *,
+    model_ref: str,
+    device: str,
+    compute_type: str,
+    language: str | None,
+    ffmpeg_bin: str = "ffmpeg",
+    ffprobe_bin: str = "ffprobe",
+    paths: AppPaths | None = None,
+) -> DurableServiceBundle:
+    application_paths = resolve_app_paths() if paths is None else paths
+    ensure_runtime_layout(application_paths)
+    batch_dir = application_paths.batches_dir / batch_id
+    process = AsyncioSubprocessRunner()
+    durable = ContentAddressedArtifactStore(application_paths.artifacts_dir)
+    config = FasterWhisperConfig(model_ref, device, compute_type, language)
+    engine = FasterWhisperEngine(config)
+    runners = {
+        StageName.INSPECT: InspectStage(FFprobeMediaInspector(process, executable=ffprobe_bin)),
+        StageName.NORMALIZE: NormalizeStage(
+            FFmpegAudioNormalizer(process, executable=ffmpeg_bin), durable
+        ),
+        StageName.TRANSCRIBE: TranscribeStage(engine, durable),
+        StageName.SEGMENT: SegmentStage(durable, SimpleSegmentationConfig()),
+        StageName.EXPORT: ExportStage(durable),
+        StageName.PUBLISH: PublishStage(durable),
+    }
+    journal = JsonlJournal(batch_dir / "journal.jsonl")
+    manifest = JsonManifestStore(batch_dir / "manifest.json")
+    event_factory = EventFactory(
+        lambda: new_id("event-"),
+        lambda: datetime.now(UTC).isoformat(),
+    )
+    executor = StageExecutor(journal, manifest, durable, event_factory, batch_dir / "work")
+    return DurableServiceBundle(
+        DurablePipelineService(
+            journal, manifest, executor, event_factory, runners, batch_dir / "control"
+        ),
+        batch_dir,
     )
