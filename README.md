@@ -36,6 +36,20 @@ captioner retry batch-... --job job-000001 --stage transcribe --json
 captioner cancel batch-... --job job-000001 --json
 ```
 
+Phase 3's deterministic fixture command runs without ASR, FFmpeg, models or
+network access. It performs DP segmentation, Track validation, canonical JSON
+decode/re-encode, and SRT/WebVTT/ASS round trips:
+
+```bash
+uv run captioner subtitle-corpus tests/fixtures/transcripts --json
+./dist/captioner/captioner --cli subtitle-corpus tests/fixtures/transcripts --json
+```
+
+The committed subtitle golden manifest is strict: it binds the complete fixture
+file set, policy signature, exporter versions and every file SHA-256. Goldens
+can be changed only after reviewing the updater's proposed semantic diff and
+passing `--accept PHASE3_GOLDENS_REVIEWED` explicitly.
+
 For Linux CUDA 12 systems, install the reproducible optional runtime and run
 the guarded manual diagnostic:
 

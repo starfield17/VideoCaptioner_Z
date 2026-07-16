@@ -28,11 +28,14 @@ from captioner.adapters.pipeline.stages import (
     TranscribeStage,
 )
 from captioner.core.domain.artifact import ArtifactRef
+from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.media import AudioArtifact, MediaAsset
 from captioner.core.domain.stage import STAGE_PLAN
+from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack, derive_subtitle_track_id
 from captioner.core.domain.transcript import Transcript
+from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig, segment_transcript
 from captioner.core.ports.asr import ASRCapabilities, TranscriptionRequest
 from captioner.core.ports.stage_runner import StageExecutionContext, StageExecutionRequest
@@ -213,6 +216,33 @@ def test_export_mid_execute_occurs_between_representations(
         )
     )
     assert order == ["mid_execute", "srt"]
+
+
+def test_export_stage_rejects_reordered_word_assignment(tmp_path: Path) -> None:
+    store = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    transcript = make_transcript(("one ", "two ", "three"))
+    config = SegmentationPolicyConfig()
+    cues = (
+        SubtitleCue("cue-000001", 0, 500, ("word-000002",), "two", None, ("two",)),
+        SubtitleCue("cue-000002", 600, 1_100, ("word-000001",), "one", None, ("one",)),
+        SubtitleCue("cue-000003", 1_200, 1_700, ("word-000003",), "three", None, ("three",)),
+    )
+    track = SubtitleTrack(
+        derive_subtitle_track_id(transcript.id, transcript.language, cues, config.to_mapping()),
+        transcript.id,
+        transcript.language,
+        cues,
+        0,
+        config.signature,
+    )
+    transcript_ref = _put(store, encode_transcript(transcript), "transcript.json")
+    track_ref = _put(store, encode_track(track), "subtitle-track.json")
+    with pytest.raises(AppError, match=r"subtitle\.validation_failed"):
+        asyncio.run(
+            ExportStage(store, config).execute(
+                _request(tmp_path, (transcript_ref, track_ref)), _context(tmp_path)
+            )
+        )
 
 
 def test_publish_mid_execute_occurs_after_first_target_commit(tmp_path: Path) -> None:

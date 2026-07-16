@@ -233,6 +233,53 @@ def test_publication_receipt_recovery_reruns_publish_only(tmp_path: Path, corrup
     assert recovered.read_status().integrity == "valid"
 
 
+@pytest.mark.parametrize("corruption", ["missing", "corrupt"])
+def test_publish_v2_receipt_recovery_reruns_publish_only(tmp_path: Path, corruption: str) -> None:
+    current, projection, counts = _full_published_batch(tmp_path)
+    receipt_ref = next(
+        ref
+        for ref in projection.job("job-000001").stage(StageName.PUBLISH).artifacts
+        if ref.logical_name == "publication-receipt.json"
+    )
+    receipt_path = current.executor.artifact_store.resolve(receipt_ref)
+    if corruption == "missing":
+        receipt_path.unlink()
+    else:
+        receipt_path.write_bytes(b"corrupt")
+
+    recovered = service(tmp_path, counts)
+    _configure_full_publisher(recovered, counts)
+    result = asyncio.run(recovered.resume())
+    job = result.job("job-000001")
+
+    assert job.state.value == "succeeded"
+    assert all(job.stage(stage).attempt == 1 for stage in STAGE_PLAN[:-1])
+    assert job.stage(StageName.PUBLISH).attempt == 2
+    assert counts[StageName.EXPORT] == 1
+    new_receipt = next(
+        ref
+        for ref in job.stage(StageName.PUBLISH).artifacts
+        if ref.logical_name == "publication-receipt.json"
+    )
+    recovered.executor.verify_artifact(new_receipt)
+    for ref in job.stage(StageName.EXPORT).artifacts:
+        recovered.executor.verify_artifact(ref)
+    output = Path(job.config.output_dir)
+    assert all(
+        (output / name).is_file()
+        for name in (
+            "input.transcript.json",
+            "input.subtitle.json",
+            "input.srt",
+            "input.vtt",
+            "input.ass",
+        )
+    )
+    if corruption == "corrupt":
+        assert receipt_path.read_bytes() != b"corrupt"
+    assert recovered.read_status().integrity == "valid"
+
+
 def test_publication_verifier_wraps_target_disappearance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -466,8 +513,9 @@ def test_publish_v2_rejects_receipt_metadata_mismatch(tmp_path: Path, mutation: 
         )
 
 
-def test_publication_receipt_constructor_rejects_duplicate_path_and_name() -> None:
-    target = PublishedTarget("/tmp/a.srt", "0" * 64, 0, "a")
+def test_publication_receipt_constructor_rejects_duplicate_path_and_name(tmp_path: Path) -> None:
+    target_path = (tmp_path / "a.srt").resolve()
+    target = PublishedTarget(str(target_path), "0" * 64, 0, "a")
     with pytest.raises(AppError, match=r"output\.publication_invalid"):
         PublicationReceipt(
             "generation", (target, PublishedTarget(target.path, target.sha256, 0, "b"))

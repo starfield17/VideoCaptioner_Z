@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 from captioner import __version__
+from captioner.adapters.subtitles.corpus import run_project_subtitle_corpus
 from captioner.cli.commands import batch as batch_command
 from captioner.cli.commands import doctor
 from captioner.cli.outcomes import exit_code_for_error
@@ -44,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--overwrite", action="store_true")
     run_parser.add_argument("--json", action="store_true", help="Emit JSON")
     run_parser.add_argument("--lang", dest="lang", default=argparse.SUPPRESS)
+    corpus_parser = subparsers.add_parser(
+        "subtitle-corpus", help="Run deterministic subtitle fixtures without ASR"
+    )
+    corpus_parser.add_argument("fixture_directory", type=Path)
+    corpus_parser.add_argument("--json", action="store_true", help="Emit JSON")
     for command in ("status", "resume"):
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument("batch_id")
@@ -75,7 +81,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     as_json = True
     try:
         namespace = parser.parse_args(None if argv is None else list(argv))
-        if namespace.command not in (None, "doctor", "run", "status", "resume", "retry", "cancel"):
+        if namespace.command not in (
+            None,
+            "doctor",
+            "run",
+            "status",
+            "resume",
+            "retry",
+            "cancel",
+            "subtitle-corpus",
+        ):
             parser.error(f"unknown command: {namespace.command}")
         paths = resolve_app_paths()
         service = I18nService(
@@ -84,6 +99,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             strict=True,
         )
         as_json = bool(getattr(namespace, "json", False))
+        if namespace.command == "subtitle-corpus":
+            report = run_project_subtitle_corpus(namespace.fixture_directory)
+            payload = cast(dict[str, JsonValue], report.to_dict())
+            print(render(payload, as_json=as_json))
+            return int(report.failed != 0 or bool(report.errors))
         if namespace.command in (None, "doctor"):
             options = doctor.DoctorOptions(locale=namespace.lang, as_json=as_json, paths=paths)
             payload = doctor.run(options, service=service)

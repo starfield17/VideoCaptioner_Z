@@ -75,3 +75,17 @@ Phase 3 subtitle invariants:
   acknowledgement.
 - No LLM participates in Phase 3 subtitle segmentation, validation, line
   breaking or export.
+- All supported segmentation configuration forms execute the same current
+  deterministic dynamic-programming policy; no legacy greedy runtime path remains.
+- A schema-2 SubtitleTrack is valid only when its policy signature matches the
+  active canonical policy configuration.
+- Track identity and language are bound to the source Transcript and active policy.
+- Flattening Cue Word assignments yields the complete canonical Transcript Word
+  order exactly, and every Cue owns one contiguous canonical Word span.
+- ASS export never emits overlapping Dialogue events; unrepresentable timing
+  sequences fail with `export.ass_unrepresentable`.
+- The committed golden manifest is enforced, including its exact file set,
+  policy signature, exporter versions and SHA-256 values.
+- `publish-v2` receipts contain the exact five published target formats.
+- Source and packaged `subtitle-corpus` execution performs actual JSON, SRT,
+  WebVTT and ASS round trips without ASR, models or network access.

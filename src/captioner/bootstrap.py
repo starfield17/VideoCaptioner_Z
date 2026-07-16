@@ -240,7 +240,7 @@ def build_durable_service(
             output_dir=Path(job.config.output_dir),
             input_path=Path(job.input_path),
             export_refs=export_refs,
-            publication_version=stage.version,
+            publication_version=runners[stage.name].version,
         )
 
     executor.committed_verifier = verify_committed

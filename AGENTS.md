@@ -39,3 +39,17 @@ Journal is authoritative, Manifest is rebuildable, and Stage commit cannot
 precede durable artifact verification. The repository still has no GUI
 workflow, parallel execution, LLM, translation, alignment, distributed
 workers, runtime installation, muxing, or release behavior.
+
+Phase 3 subtitle processing is deterministic and has no legacy greedy runtime
+path: all supported segmentation configurations execute the same bounded DP
+solver. Current schema-2 SubtitleTracks require a policy signature bound to the
+active policy, a verified Track ID, canonical Word order, and contiguous Cue
+spans. ASS serialization quantizes the complete ordered track and rejects
+timings that cannot be represented within its 10 ms tolerance. The strict
+`publish-v2` receipt contains exactly the five transcript/subtitle targets.
+
+The `subtitle-corpus` command is a normal application command that performs
+the deterministic subtitle pipeline through source or Nuitka builds without
+ASR, FFmpeg, network or model access. Golden manifests are enforced by tests;
+golden updates require explicit human-review acknowledgement and must not be
+performed automatically by pytest or CI.

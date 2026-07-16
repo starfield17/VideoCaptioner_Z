@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tests.golden.manifest import verify_manifest
+
 from captioner.adapters.exporters import srt
 from captioner.adapters.persistence.domain_codecs import decode_transcript
 from captioner.adapters.subtitles import ass, json_track, webvtt
@@ -13,6 +15,7 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "transcripts"
 
 
 def test_exporter_goldens_are_reviewed_and_byte_exact() -> None:
+    verify_manifest(ROOT, FIXTURES)
     exporters = {
         "track.json": json_track.serialize,
         "srt": srt.serialize_bytes,

@@ -33,6 +33,12 @@ half-up centisecond rounding. Canonical parsing preserves lines and stays
 within 10 ms of source Cue timing. Arbitrary third-party override tags are not
 an import target.
 
+ASS quantization is global across the ordered Track. Each event is rounded
+half-up, clamped to the previous event's end, and kept at least one centisecond
+long; a sequence that would shift either endpoint by more than 10 ms raises
+`export.ass_unrepresentable`. The parser rejects overlapping or out-of-order
+Dialogue rows.
+
 Publish commits this exact logical Export set:
 
 ```text
@@ -45,3 +51,6 @@ final-subtitle.ass
 
 The PublicationReceipt uses that logical order and verifies the exact target
 set, regular-file/symlink policy, path, size, SHA-256, and output generation.
+New `publish-v2` receipts reject omitted, extra, duplicate or permuted targets;
+the historical two-target form is accepted only through explicit `publish-v1`
+compatibility.

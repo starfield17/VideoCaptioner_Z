@@ -69,3 +69,15 @@ than being dropped or split inside an emoji grapheme.
 The complete immutable configuration is part of the policy signature and Track
 ID. Phase 2’s three-field mapping is read as a legacy mapping with deterministic
 Phase 3 defaults; new Jobs persist the full canonical mapping.
+
+Legacy `SimpleSegmentationConfig` is only a compatibility facade. It expands to
+the complete policy and calls the same bounded DP solver as a current
+`SegmentationPolicyConfig`; it never selects a separate greedy algorithm.
+Flattening the resulting Cue Word IDs must equal the canonical Word sequence,
+and each Cue must cover one contiguous interval of that sequence.
+
+Current schema-2 Tracks require a nonempty `policy-*` signature. Validation
+compares that signature and the deterministic Track ID with the active policy,
+and requires the Track language to equal the Transcript language. Schema-1
+Tracks remain readable with the explicit `legacy-policy-unknown` sentinel, but
+are not treated as fully bound current Tracks.

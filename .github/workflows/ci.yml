@@ -46,6 +46,13 @@ jobs:
         run: uv sync --frozen
       - name: Full quality gate
         run: uv run python scripts/check.py --full
+      - name: Subtitle corpus source smoke
+        run: uv run captioner subtitle-corpus tests/fixtures/transcripts --json
+      - name: Nuitka subtitle corpus smoke
+        if: runner.os == 'Linux'
+        run: |
+          uv run python scripts/build_nuitka.py --clean --version 0.0.0
+          ./dist/captioner/captioner --cli subtitle-corpus tests/fixtures/transcripts --json
       - name: CLI help smoke test
         run: uv run python main.py --cli --help
       - name: GUI smoke test
