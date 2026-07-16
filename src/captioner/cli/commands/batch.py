@@ -6,8 +6,10 @@ import asyncio
 import json
 import os
 import socket
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 from captioner.adapters.persistence.json_manifest_store import JsonManifestStore
 from captioner.adapters.persistence.jsonl_journal import JsonlJournal
@@ -22,7 +24,8 @@ from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobState, validate_identifier
 from captioner.core.domain.journal import replay
-from captioner.core.domain.stage import STAGE_PLAN, StageName
+from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
+from captioner.core.domain.stage import PipelineProfile, StageName, stage_plan_for
 from captioner.infrastructure.app_paths import AppPaths, resolve_safe_child
 from captioner.infrastructure.ids import new_id
 
@@ -38,6 +41,7 @@ class BatchRunOptions:
     ffmpeg_bin: str
     ffprobe_bin: str
     overwrite: bool
+    pipeline_profile: PipelineProfile = PipelineProfile.DETERMINISTIC
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +51,8 @@ class ResumeOverrides:
     compute_type: str | None = None
     language: str | None = None
     output_dir: Path | None = None
+    pipeline_profile: PipelineProfile | None = None
+    llm: Mapping[str, object] | None = None
 
 
 def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
@@ -63,6 +69,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
         ffprobe_bin=options.ffprobe_bin,
         output_dir=output_dir,
         overwrite=options.overwrite,
+        pipeline_profile=options.pipeline_profile,
     )
     bundle = build_durable_service(
         batch_id,
@@ -73,6 +80,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
         ffmpeg_bin=options.ffmpeg_bin,
         ffprobe_bin=options.ffprobe_bin,
         paths=paths,
+        pipeline_profile=options.pipeline_profile,
     )
     lease = create_batch_lease(bundle.batch_dir)
     lease.acquire()
@@ -116,7 +124,7 @@ def resume(
         if selected != config:
             earliest = min(
                 (_earliest_change(job.config, selected) for job in projection.jobs),
-                key=STAGE_PLAN.index,
+                key=lambda stage: stage_plan_for(selected.pipeline_profile).index(stage),
             )
             projection = bundle.service.update_config(
                 projection,
@@ -306,6 +314,7 @@ def _bundle(
         ffprobe_bin=config.ffprobe_bin,
         paths=paths,
         segmentation=config.segmentation,
+        pipeline_profile=config.pipeline_profile,
         initialize_runtime=initialize_runtime,
     )
 
@@ -377,6 +386,10 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
             if overrides.output_dir is None
             else overrides.output_dir,
             overwrite=config.overwrite,
+            pipeline_profile=config.pipeline_profile
+            if overrides.pipeline_profile is None
+            else PipelineProfile(overrides.pipeline_profile),
+            llm=config.llm if overrides.llm is None else _frozen_llm(overrides.llm),
         )
         return replace(
             candidate,
@@ -386,6 +399,8 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
             normalization=config.normalization,
             segmentation=config.segmentation,
             stage_versions=config.stage_versions,
+            pipeline_profile=candidate.pipeline_profile,
+            llm=candidate.llm,
         )
     return replace(
         config,
@@ -395,10 +410,15 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
         output_dir=config.output_dir
         if overrides.output_dir is None
         else str(overrides.output_dir.resolve()),
+        pipeline_profile=config.pipeline_profile
+        if overrides.pipeline_profile is None
+        else PipelineProfile(overrides.pipeline_profile),
+        llm=config.llm if overrides.llm is None else _frozen_llm(overrides.llm),
     )
 
 
 def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:
+    plan = stage_plan_for(new.pipeline_profile)
     if old.ffprobe_bin != new.ffprobe_bin:
         return StageName.INSPECT
     if old.ffmpeg_bin != new.ffmpeg_bin or old.normalization != new.normalization:
@@ -421,8 +441,37 @@ def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:
         return StageName.TRANSCRIBE
     if old.segmentation != new.segmentation:
         return StageName.SEGMENT
+    if old.pipeline_profile != new.pipeline_profile:
+        if new.pipeline_profile is PipelineProfile.QUALITY:
+            return StageName.CORRECT_SOURCE
+        if new.pipeline_profile is PipelineProfile.FAST:
+            return StageName.TRANSLATE
+        return StageName.SEGMENT
+    if old.llm != new.llm:
+        old_llm: Mapping[str, FrozenJsonValue] = {} if old.llm is None else old.llm
+        new_llm: Mapping[str, FrozenJsonValue] = {} if new.llm is None else new.llm
+        changed = set(old_llm) | set(new_llm)
+        if changed & {
+            "provider_profile",
+            "base_url",
+            "model",
+            "temperature",
+            "timeout_sec",
+            "max_retries",
+            "chunk",
+            "correction",
+            "correct_source",
+            "prompt_id",
+            "prompt_version",
+            "prompt_content_sha256",
+        }:
+            return _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        if changed & {"target_language", "translation", "translate", "translation_prompt"}:
+            return _available_stage(StageName.TRANSLATE, plan)
+        if changed & {"review", "review_prompt_id", "review_prompt_version"}:
+            return _available_stage(StageName.REVIEW, plan)
     if old.stage_versions != new.stage_versions:
-        for stage in STAGE_PLAN:
+        for stage in plan:
             if old.stage_versions.get(stage.value) != new.stage_versions.get(stage.value):
                 return stage
         raise AppError("batch.config_inconsistent", {"reason": "stage_versions"})
@@ -431,3 +480,26 @@ def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:
     if old != new:
         raise AppError("batch.config_inconsistent", {"reason": "unknown_config_change"})
     return StageName.PUBLISH
+
+
+def _available_stage(
+    preferred: StageName,
+    plan: tuple[StageName, ...],
+    *,
+    fallback: StageName | None = None,
+) -> StageName:
+    if preferred in plan:
+        return preferred
+    if fallback is not None and fallback in plan:
+        return fallback
+    for candidate in (StageName.SEGMENT, StageName.EXPORT, StageName.PUBLISH):
+        if candidate in plan:
+            return candidate
+    raise AppError("batch.config_inconsistent", {"reason": "empty_stage_plan"})
+
+
+def _frozen_llm(value: Mapping[str, object]) -> Mapping[str, FrozenJsonValue]:
+    frozen = freeze_json_value(value)
+    if not isinstance(frozen, Mapping):
+        raise AppError("job.config_invalid", {"field": "llm"})
+    return cast(Mapping[str, FrozenJsonValue], frozen)

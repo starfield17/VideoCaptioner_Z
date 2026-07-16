@@ -17,7 +17,7 @@ from captioner.core.application.durable_pipeline import DurablePipelineService
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobProjection, JobState
-from captioner.core.domain.stage import StageName
+from captioner.core.domain.stage import PipelineProfile, StageName
 from captioner.infrastructure.app_paths import resolve_app_paths
 
 batch_private = import_module("captioner.cli.commands.batch")
@@ -149,6 +149,21 @@ def test_batch_helpers_cover_override_and_collision_policies(tmp_path: Path) -> 
     assert (
         earliest_change(base, replace(base, output_dir=str(tmp_path / "other")))
         is StageName.PUBLISH
+    )
+    fast = replace(
+        base,
+        pipeline_profile=PipelineProfile.FAST,
+        llm={"target_language": "zh-CN", "model": "fake"},
+    )
+    quality = replace(
+        base,
+        pipeline_profile=PipelineProfile.QUALITY,
+        llm={"target_language": "zh-CN", "model": "fake"},
+    )
+    assert earliest_change(base, fast) is StageName.TRANSLATE
+    assert earliest_change(base, quality) is StageName.CORRECT_SOURCE
+    assert (
+        earliest_change(fast, replace(fast, llm={"target_language": "de"})) is StageName.TRANSLATE
     )
     with pytest.raises(AppError, match=r"batch\.output_collision"):
         validate_collisions(

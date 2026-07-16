@@ -16,7 +16,7 @@ from captioner.cli.outcomes import exit_code_for_error
 from captioner.cli.output import doctor_labels, render
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.result import JsonValue
-from captioner.core.domain.stage import StageName
+from captioner.core.domain.stage import PipelineProfile, StageName
 from captioner.i18n.service import I18nService
 from captioner.infrastructure.app_paths import resolve_app_paths
 
@@ -43,6 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     run_parser.add_argument("--ffprobe-bin", default="ffprobe")
     run_parser.add_argument("--overwrite", action="store_true")
+    run_parser.add_argument(
+        "--profile",
+        choices=tuple(profile.value for profile in PipelineProfile),
+        default=PipelineProfile.DETERMINISTIC.value,
+    )
     run_parser.add_argument("--json", action="store_true", help="Emit JSON")
     run_parser.add_argument("--lang", dest="lang", default=argparse.SUPPRESS)
     corpus_parser = subparsers.add_parser(
@@ -60,6 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument("--compute-type")
             command_parser.add_argument("--language")
             command_parser.add_argument("--output", type=Path)
+            command_parser.add_argument(
+                "--profile",
+                choices=tuple(profile.value for profile in PipelineProfile),
+            )
     retry_parser = subparsers.add_parser("retry")
     retry_parser.add_argument("batch_id")
     retry_parser.add_argument("--job", required=True)
@@ -119,6 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ffmpeg_bin=namespace.ffmpeg_bin,
                 ffprobe_bin=namespace.ffprobe_bin,
                 overwrite=namespace.overwrite,
+                pipeline_profile=PipelineProfile(namespace.profile),
             )
             projection = batch_command.run(run_options, paths=paths)
             payload = cast(
@@ -146,6 +156,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                             namespace.compute_type,
                             namespace.language,
                             namespace.output,
+                            None
+                            if namespace.profile is None
+                            else PipelineProfile(namespace.profile),
                         ),
                     ),
                     paths=paths,

@@ -38,9 +38,11 @@ from captioner.adapters.testing.fault_injector import ScriptedFaultInjector
 from captioner.core.application.durable_pipeline import DurablePipelineService
 from captioner.core.application.run_single import RunSingleService
 from captioner.core.application.stage_executor import EventFactory, StageExecutor
+from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.journal import replay
-from captioner.core.domain.stage import StageName
+from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
+from captioner.core.domain.stage import PipelineProfile, StageName, stage_plan_for
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig
 from captioner.infrastructure.app_paths import (
@@ -111,8 +113,45 @@ def create_job_config(
     ffprobe_bin: str,
     output_dir: Path,
     overwrite: bool,
+    pipeline_profile: PipelineProfile = PipelineProfile.DETERMINISTIC,
+    llm: Mapping[str, object] | None = None,
+    target_language: str | None = None,
+    provider_profile: str | None = None,
+    llm_base_url: str | None = None,
+    llm_model: str | None = None,
+    temperature: float | None = None,
+    timeout_sec: int | None = None,
+    max_retries: int | None = None,
+    chunk: Mapping[str, object] | None = None,
+    prompt_identity: Mapping[str, object] | None = None,
 ) -> JobConfig:
     model = FasterWhisperConfig(model_ref, device, compute_type, language)
+    snapshot: Mapping[str, object] | None = llm
+    if snapshot is None and any(
+        item is not None
+        for item in (
+            target_language,
+            provider_profile,
+            llm_base_url,
+            llm_model,
+            temperature,
+            timeout_sec,
+            max_retries,
+            chunk,
+            prompt_identity,
+        )
+    ):
+        snapshot = {
+            **({"target_language": target_language} if target_language is not None else {}),
+            **({"provider_profile": provider_profile} if provider_profile is not None else {}),
+            **({"base_url": llm_base_url} if llm_base_url is not None else {}),
+            **({"model": llm_model} if llm_model is not None else {}),
+            **({"temperature": temperature} if temperature is not None else {}),
+            **({"timeout_sec": timeout_sec} if timeout_sec is not None else {}),
+            **({"max_retries": max_retries} if max_retries is not None else {}),
+            **({"chunk": chunk} if chunk is not None else {}),
+            **({"prompt": prompt_identity} if prompt_identity is not None else {}),
+        }
     return JobConfig(
         model.model_ref,
         model.model_identity,
@@ -132,8 +171,10 @@ def create_job_config(
                 StageName.EXPORT.value: "export-v2",
                 StageName.PUBLISH.value: "publish-v2",
             }.get(stage.value, "1")
-            for stage in StageName
+            for stage in stage_plan_for(pipeline_profile)
         },
+        pipeline_profile=pipeline_profile,
+        llm=None if snapshot is None else _frozen_mapping(snapshot),
     )
 
 
@@ -158,18 +199,21 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _frozen_mapping(value: Mapping[str, object]) -> Mapping[str, FrozenJsonValue]:
+    frozen = freeze_json_value(value)
+    if not isinstance(frozen, Mapping):
+        raise AppError("job.config_invalid", {"field": "llm"})
+    return frozen
+
+
 def load_batch_config(batch_id: str, *, paths: AppPaths | None = None) -> JobConfig:
     application_paths = resolve_app_paths() if paths is None else paths
     batch_dir = resolve_safe_child(application_paths.batches_dir, batch_id, field="batch_id")
     events = JsonlJournal(batch_dir / "journal.jsonl").read_snapshot().events
     if not events:
-        from captioner.core.domain.errors import AppError
-
         raise AppError("batch.not_found", {"batch_id": batch_id})
     projection = replay(events)
     if not projection.jobs:
-        from captioner.core.domain.errors import AppError
-
         raise AppError("batch.invalid", {"batch_id": batch_id})
     return projection.jobs[0].config
 
@@ -186,7 +230,13 @@ def build_durable_service(
     paths: AppPaths | None = None,
     segmentation: Mapping[str, object] | None = None,
     initialize_runtime: bool = True,
+    pipeline_profile: PipelineProfile = PipelineProfile.DETERMINISTIC,
 ) -> DurableServiceBundle:
+    if PipelineProfile(pipeline_profile) is not PipelineProfile.DETERMINISTIC:
+        raise AppError(
+            "pipeline.profile_unavailable",
+            {"profile": PipelineProfile(pipeline_profile).value},
+        )
     application_paths = resolve_app_paths() if paths is None else paths
     if initialize_runtime:
         ensure_runtime_layout(application_paths)
@@ -231,8 +281,6 @@ def build_durable_service(
             None,
         )
         if receipt_ref is None:
-            from captioner.core.domain.errors import AppError
-
             raise AppError("output.publication_invalid", {"reason": "receipt_missing"})
         export_refs = job.stage(StageName.EXPORT).artifacts
         verify_publication(
@@ -247,8 +295,6 @@ def build_durable_service(
     fault_spec = os.environ.get("CAPTIONER_FAULT_POINT")
     if fault_spec is not None:
         if os.environ.get("CAPTIONER_ENABLE_FAULT_INJECTION") != "1":
-            from captioner.core.domain.errors import AppError
-
             raise AppError("fault_injection.disabled")
         try:
             stage_name, point = fault_spec.split(":", maxsplit=1)
@@ -256,8 +302,6 @@ def build_durable_service(
                 StageName(stage_name)
             _validate_fault_point(point)
         except ValueError as exc:
-            from captioner.core.domain.errors import AppError
-
             raise AppError("fault_injection.invalid") from exc
         executor.fault_injector = ScriptedFaultInjector(stage_name, point)
     return DurableServiceBundle(

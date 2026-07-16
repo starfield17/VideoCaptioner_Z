@@ -17,7 +17,7 @@ from captioner.core.domain.execution import CancellationToken, ExecutionContext
 from captioner.core.domain.job import JobConfig, JobProjection, JobState
 from captioner.core.domain.journal import JournalEvent, apply_event, replay
 from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
-from captioner.core.domain.stage import STAGE_PLAN, StageName, StageState
+from captioner.core.domain.stage import StageName, StageState, stage_plan_for
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.ports.journal import JournalPort
 from captioner.core.ports.manifest import ManifestStatus, ManifestStorePort
@@ -334,19 +334,22 @@ class DurablePipelineService:
         )
         context = ExecutionContext(token)
         try:
-            for name in STAGE_PLAN:
+            plan = stage_plan_for(job.config.pipeline_profile)
+            for name in plan:
                 context.raise_if_cancelled()
                 job = projection.job(job_id)
+                runner = _runner_for(self.runners, name, job.config.pipeline_profile.value)
+                plan = stage_plan_for(job.config.pipeline_profile)
                 inputs = tuple(
                     artifact
-                    for prior in job.stages[: STAGE_PLAN.index(name)]
+                    for prior in job.stages[: plan.index(name)]
                     for artifact in prior.artifacts
                     if prior.state is StageState.COMMITTED
                 )
                 projection = await self.executor.execute(
                     projection,
                     job_id=job_id,
-                    runner=self.runners[name],
+                    runner=runner,
                     input_artifacts=inputs,
                     cache_config=_cache_config(job.config, name, Path(job.input_path)),
                     context=context,
@@ -447,7 +450,8 @@ class DurablePipelineService:
             invalidated = bad_stages.get(job.job_id)
             if not invalidated:
                 continue
-            earliest = min(invalidated, key=STAGE_PLAN.index)
+            plan = stage_plan_for(job.config.pipeline_profile)
+            earliest = min(invalidated, key=plan.index)
             stage = job.stage(earliest)
             projection = self._append(
                 projection,
@@ -578,22 +582,26 @@ def write_cancel_marker(control_dir: Path, *, job_id: str | None) -> Path:
 def _cache_config(
     config: JobConfig, stage: StageName, input_path: Path
 ) -> Mapping[str, FrozenJsonValue]:
-    values: dict[str, object]
+    values: dict[str, object] = {"profile": config.pipeline_profile.value}
     if stage is StageName.INSPECT:
-        values = {
-            "source_sha256": _source_sha256(input_path),
-            "ffprobe_bin": config.ffprobe_bin,
-        }
+        values.update(
+            {
+                "source_sha256": _source_sha256(input_path),
+                "ffprobe_bin": config.ffprobe_bin,
+            }
+        )
     elif stage is StageName.NORMALIZE:
-        values = {"ffmpeg_bin": config.ffmpeg_bin, "normalization": config.normalization}
+        values.update({"ffmpeg_bin": config.ffmpeg_bin, "normalization": config.normalization})
     elif stage is StageName.TRANSCRIBE:
-        values = {
-            "model_identity": config.model_identity,
-            "language": config.language,
-            "vad_filter": config.vad_filter,
-            "device": config.device,
-            "compute_type": config.compute_type,
-        }
+        values.update(
+            {
+                "model_identity": config.model_identity,
+                "language": config.language,
+                "vad_filter": config.vad_filter,
+                "device": config.device,
+                "compute_type": config.compute_type,
+            }
+        )
     elif stage is StageName.SEGMENT:
         try:
             segmentation = SegmentationPolicyConfig.from_mapping(config.segmentation).to_mapping()
@@ -603,17 +611,34 @@ def _cache_config(
             if set(config.segmentation) != {"limit"}:
                 raise
             segmentation = dict(config.segmentation)
-        values = {"policy_version": "segment-v2", "segmentation": segmentation}
+        values.update({"policy_version": "segment-v2", "segmentation": segmentation})
+    elif stage in {StageName.CORRECT_SOURCE, StageName.TRANSLATE, StageName.REVIEW}:
+        values["llm"] = config.llm
+        values["stage"] = stage.value
     elif stage is StageName.EXPORT:
-        values = {
-            "track_json": "track-json-v2",
-            "srt": "srt-v2",
-            "webvtt": "webvtt-v1",
-            "ass": "ass-v1",
-        }
+        values.update(
+            {
+                "track_json": "track-json-v2",
+                "srt": "srt-v2",
+                "webvtt": "webvtt-v1",
+                "ass": "ass-v1",
+            }
+        )
     else:
-        values = {"output_dir": config.output_dir, "overwrite": config.overwrite}
+        values.update({"output_dir": config.output_dir, "overwrite": config.overwrite})
     return cast(Mapping[str, FrozenJsonValue], freeze_json_value(values))
+
+
+def _runner_for(
+    runners: Mapping[StageName, StageRunner], stage: StageName, profile: str
+) -> StageRunner:
+    runner = runners.get(stage)
+    if runner is None:
+        raise AppError(
+            "pipeline.runner_unavailable",
+            {"profile": profile, "stage_name": stage.value},
+        )
+    return runner
 
 
 def _source_sha256(path: Path) -> str:

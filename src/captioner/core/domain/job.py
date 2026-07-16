@@ -11,9 +11,10 @@ from typing import cast
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.result import FrozenJsonValue, JsonValue, freeze_json_value
-from captioner.core.domain.stage import STAGE_PLAN, StageName, StageProjection
+from captioner.core.domain.stage import PipelineProfile, StageName, StageProjection, stage_plan_for
 
-JOB_CONFIG_SCHEMA_VERSION = 1
+JOB_CONFIG_SCHEMA_VERSION = 2
+LEGACY_JOB_CONFIG_SCHEMA_VERSION = 1
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
@@ -57,10 +58,21 @@ class JobConfig:
     overwrite: bool
     stage_versions: Mapping[str, FrozenJsonValue]
     schema_version: int = JOB_CONFIG_SCHEMA_VERSION
+    pipeline_profile: PipelineProfile = PipelineProfile.DETERMINISTIC
+    llm: Mapping[str, FrozenJsonValue] | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != JOB_CONFIG_SCHEMA_VERSION:
+        if self.schema_version not in {LEGACY_JOB_CONFIG_SCHEMA_VERSION, JOB_CONFIG_SCHEMA_VERSION}:
             raise AppError("job.config_invalid", {"field": "schema_version"})
+        try:
+            profile = PipelineProfile(self.pipeline_profile)
+        except ValueError as exc:
+            raise AppError("job.config_invalid", {"field": "pipeline_profile"}) from exc
+        if self.schema_version == LEGACY_JOB_CONFIG_SCHEMA_VERSION:
+            profile = PipelineProfile.DETERMINISTIC
+            if self.llm is not None:
+                raise AppError("job.config_invalid", {"field": "llm"})
+        object.__setattr__(self, "pipeline_profile", profile)
         required = (self.model_ref, self.model_identity, self.device, self.compute_type)
         if any(not value.strip() for value in required):
             raise AppError("job.config_invalid", {"field": "model"})
@@ -73,11 +85,22 @@ class JobConfig:
         for name in ("normalization", "segmentation", "stage_versions"):
             frozen = freeze_json_value(getattr(self, name))
             object.__setattr__(self, name, cast(Mapping[str, FrozenJsonValue], frozen))
+        if self.llm is not None:
+            frozen_llm = freeze_json_value(self.llm)
+            if not isinstance(frozen_llm, Mapping):
+                raise AppError("job.config_invalid", {"field": "llm"})
+            if _contains_secret_key(frozen_llm):
+                raise AppError("job.config_invalid", {"field": "llm"})
+            object.__setattr__(
+                self,
+                "llm",
+                cast(Mapping[str, FrozenJsonValue], frozen_llm),
+            )
 
     def to_dict(self) -> dict[str, JsonValue]:
         from captioner.core.domain.result import thaw_json_value
 
-        return {
+        value: dict[str, JsonValue] = {
             "schema_version": self.schema_version,
             "model_ref": self.model_ref,
             "model_identity": self.model_identity,
@@ -93,6 +116,10 @@ class JobConfig:
             "overwrite": self.overwrite,
             "stage_versions": thaw_json_value(self.stage_versions),
         }
+        if self.schema_version == JOB_CONFIG_SCHEMA_VERSION:
+            value["pipeline_profile"] = self.pipeline_profile.value
+            value["llm"] = None if self.llm is None else thaw_json_value(self.llm)
+        return value
 
     @property
     def runtime_signature(self) -> tuple[object, ...]:
@@ -108,7 +135,21 @@ class JobConfig:
             _hashable_json(self.normalization),
             _hashable_json(self.segmentation),
             _hashable_json(self.stage_versions),
+            self.pipeline_profile.value,
+            _hashable_json(self.llm) if self.llm is not None else None,
         )
+
+    @property
+    def target_language(self) -> str | None:
+        return _llm_string(self.llm, "target_language")
+
+    @property
+    def provider_profile(self) -> str | None:
+        return _llm_string(self.llm, "provider_profile")
+
+    @property
+    def llm_model(self) -> str | None:
+        return _llm_string(self.llm, "model")
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,15 +158,29 @@ class JobProjection:
     input_path: str
     config: JobConfig
     state: JobState = JobState.PENDING
-    stages: tuple[StageProjection, ...] = tuple(StageProjection(name) for name in STAGE_PLAN)
+    stages: tuple[StageProjection, ...] = ()
 
     def __post_init__(self) -> None:
         validate_identifier(self.job_id, field="job_id")
         if not Path(self.input_path).is_absolute():
             raise AppError("job.config_invalid", {"field": "input_path"})
+        expected = stage_plan_for(self.config.pipeline_profile)
+        stages = tuple(self.stages)
+        if not stages:
+            stages = tuple(StageProjection(name) for name in expected)
+        if tuple(stage.name for stage in stages) != expected:
+            raise AppError("job.stage_plan_invalid", {"job_id": self.job_id})
+        object.__setattr__(self, "stages", stages)
 
     def stage(self, name: StageName) -> StageProjection:
-        return self.stages[STAGE_PLAN.index(name)]
+        try:
+            index = next(index for index, stage in enumerate(self.stages) if stage.name is name)
+            return self.stages[index]
+        except StopIteration as exc:
+            raise AppError(
+                "job.stage_unavailable",
+                {"job_id": self.job_id, "stage_name": name.value},
+            ) from exc
 
 
 def _hashable_json(value: FrozenJsonValue) -> object:
@@ -134,3 +189,22 @@ def _hashable_json(value: FrozenJsonValue) -> object:
     if isinstance(value, tuple):
         return tuple(_hashable_json(item) for item in value)
     return value
+
+
+def _contains_secret_key(value: FrozenJsonValue) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            key.lower().replace("-", "_") in {"api_key", "authorization", "access_token"}
+            or _contains_secret_key(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, tuple):
+        return any(_contains_secret_key(item) for item in value)
+    return False
+
+
+def _llm_string(value: Mapping[str, FrozenJsonValue] | None, key: str) -> str | None:
+    if value is None:
+        return None
+    item = value.get(key)
+    return item if isinstance(item, str) else None
