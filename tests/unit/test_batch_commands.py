@@ -49,11 +49,11 @@ def test_failed_batch_remains_statusable_resumable_and_cancellable(tmp_path: Pat
     projection = batch.status(batch_id, paths=paths)
     assert projection.jobs[0].state is JobState.FAILED
     assert load_batch_config(batch_id, paths=paths) == projection.jobs[0].config
+    resumed = batch.resume(batch_id, paths=paths)
+    assert resumed.jobs[0].state is JobState.FAILED
+    with pytest.raises(AppError, match=r"batch\.cancel_invalid"):
+        batch.cancel(batch_id, "job-000001", paths=paths)
     with pytest.raises(AppError, match=r"media\.input_missing"):
-        batch.resume(batch_id, paths=paths)
-    marker = batch.cancel(batch_id, "job-000001", paths=paths)
-    assert marker.is_file()
-    with pytest.raises(AppError, match=r"retry\.stage_invalid"):
         batch.retry(batch_id, "job-000001", StageName.INSPECT, paths=paths)
 
 

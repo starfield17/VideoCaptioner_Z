@@ -22,6 +22,35 @@ class SimpleSegmentationConfig:
     max_text_units: int = 84
     hard_gap_ms: int = 700
 
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, object]) -> SimpleSegmentationConfig:
+        expected = {"max_duration_ms", "max_text_units", "hard_gap_ms"}
+        if set(values) != expected:
+            raise AppError("job.config_invalid", {"field": "segmentation"})
+        max_duration_ms = values["max_duration_ms"]
+        max_text_units = values["max_text_units"]
+        hard_gap_ms = values["hard_gap_ms"]
+        if (
+            not isinstance(max_duration_ms, int)
+            or isinstance(max_duration_ms, bool)
+            or not isinstance(max_text_units, int)
+            or isinstance(max_text_units, bool)
+            or not isinstance(hard_gap_ms, int)
+            or isinstance(hard_gap_ms, bool)
+        ):
+            raise AppError("job.config_invalid", {"field": "segmentation"})
+        try:
+            result = cls(
+                max_duration_ms,
+                max_text_units,
+                hard_gap_ms,
+            )
+        except (TypeError, ValueError) as exc:
+            raise AppError("job.config_invalid", {"field": "segmentation"}) from exc
+        if result.max_duration_ms < 1 or result.max_text_units < 1 or result.hard_gap_ms < 0:
+            raise AppError("job.config_invalid", {"field": "segmentation"})
+        return result
+
     def __post_init__(self) -> None:
         if self.max_duration_ms <= 0 or self.max_text_units <= 0 or self.hard_gap_ms < 0:
             raise ValueError

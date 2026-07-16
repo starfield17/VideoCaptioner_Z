@@ -94,6 +94,22 @@ class JobConfig:
             "stage_versions": thaw_json_value(self.stage_versions),
         }
 
+    @property
+    def runtime_signature(self) -> tuple[object, ...]:
+        return (
+            self.model_ref,
+            self.model_identity,
+            self.device,
+            self.compute_type,
+            self.language,
+            self.vad_filter,
+            self.ffmpeg_bin,
+            self.ffprobe_bin,
+            self.normalization,
+            self.segmentation,
+            self.stage_versions,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class JobProjection:

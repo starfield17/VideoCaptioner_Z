@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import socket
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -169,21 +170,27 @@ def build_durable_service(
     ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
     paths: AppPaths | None = None,
+    segmentation: Mapping[str, object] | None = None,
 ) -> DurableServiceBundle:
     application_paths = resolve_app_paths() if paths is None else paths
     ensure_runtime_layout(application_paths)
     batch_dir = resolve_safe_child(application_paths.batches_dir, batch_id, field="batch_id")
     process = AsyncioSubprocessRunner()
     durable = ContentAddressedArtifactStore(application_paths.artifacts_dir)
-    config = FasterWhisperConfig(model_ref, device, compute_type, language)
-    engine = FasterWhisperEngine(config)
+    engine_config = FasterWhisperConfig(model_ref, device, compute_type, language)
+    engine = FasterWhisperEngine(engine_config)
     runners = {
         StageName.INSPECT: InspectStage(FFprobeMediaInspector(process, executable=ffprobe_bin)),
         StageName.NORMALIZE: NormalizeStage(
             FFmpegAudioNormalizer(process, executable=ffmpeg_bin), durable
         ),
         StageName.TRANSCRIBE: TranscribeStage(engine, durable),
-        StageName.SEGMENT: SegmentStage(durable, SimpleSegmentationConfig()),
+        StageName.SEGMENT: SegmentStage(
+            durable,
+            SimpleSegmentationConfig.from_mapping(
+                segmentation or {"max_duration_ms": 7000, "max_text_units": 84, "hard_gap_ms": 700}
+            ),
+        ),
         StageName.EXPORT: ExportStage(durable),
         StageName.PUBLISH: PublishStage(durable),
     }

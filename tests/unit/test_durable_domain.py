@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from captioner.core.domain.artifact import ArtifactRef
-from captioner.core.domain.batch import BatchState
+from captioner.core.domain.batch import BatchProjection, BatchState
 from captioner.core.domain.cache_key import derive_stage_cache_key
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.job import JobConfig
+from captioner.core.domain.job import JobConfig, JobProjection, JobState
 from captioner.core.domain.journal import JournalEvent, apply_event, replay
 from captioner.core.domain.result import freeze_json_value
 from captioner.core.domain.stage import STAGE_PLAN, StageName, StageState
@@ -170,3 +171,30 @@ def test_cache_key_is_canonical_and_input_sensitive() -> None:
     )
     assert left == right
     assert changed != left
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [
+        ((JobState.FAILED, JobState.PENDING), BatchState.FAILED),
+        ((JobState.CANCELLED, JobState.PENDING), BatchState.PARTIAL),
+        ((JobState.SUCCEEDED, JobState.CANCELLED), BatchState.PARTIAL),
+        ((JobState.SUCCEEDED, JobState.SUCCEEDED), BatchState.SUCCEEDED),
+    ],
+)
+def test_batch_aggregate_state_is_deterministic(
+    tmp_path: Path, states: tuple[JobState, JobState], expected: BatchState
+) -> None:
+    config = _config(tmp_path)
+    jobs = tuple(
+        replace(
+            JobProjection(
+                f"job-{index:06d}",
+                str((tmp_path / f"input-{index}.wav").resolve()),
+                config,
+            ),
+            state=state,
+        )
+        for index, state in enumerate(states, 1)
+    )
+    assert BatchProjection("batch-0123456789abcdef", jobs).state is expected

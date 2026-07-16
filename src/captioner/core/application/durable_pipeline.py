@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,22 @@ class DurablePipelineService:
     control_dir: Path
 
     def create(self, batch_id: str, jobs: Sequence[tuple[str, Path, JobConfig]]) -> BatchProjection:
+        if not jobs:
+            raise AppError("batch.config_inconsistent", {"reason": "no_jobs"})
+        first_config = jobs[0][2]
+        if any(
+            config.runtime_signature != first_config.runtime_signature for _, _, config in jobs[1:]
+        ):
+            raise AppError("batch.config_inconsistent", {"reason": "runtime"})
+        targets: set[str] = set()
+        for _, input_path, config in jobs:
+            for suffix in (".transcript.json", ".srt"):
+                target = os.path.normcase(
+                    str(Path(config.output_dir) / f"{input_path.stem}{suffix}")
+                )
+                if target in targets:
+                    raise AppError("batch.output_collision", {"logical_name": Path(target).name})
+                targets.add(target)
         if self.journal.read_snapshot().events:
             raise AppError("batch.exists", {"batch_id": batch_id})
         first = JournalEvent(
@@ -73,9 +90,22 @@ class DurablePipelineService:
 
     async def run(self, projection: BatchProjection) -> BatchProjection:
         for job in projection.jobs:
-            if job.state is JobState.CANCELLED:
+            if job.state in {JobState.CANCELLED, JobState.FAILED}:
                 continue
-            projection = await self._run_job(projection, job.job_id)
+            try:
+                projection = await self._run_job(projection, job.job_id)
+            except AppError as exc:
+                if (
+                    exc.code == "operation.cancelled"
+                    and len(projection.jobs) > 1
+                    and exc.params.get("scope") != "batch"
+                ):
+                    projection = replay(self.journal.repair_and_read())
+                    continue
+                raise
+            if (self.control_dir / "cancel-batch").exists():
+                projection = self._cancel_pending_jobs(projection)
+                break
         return projection
 
     async def resume(self) -> BatchProjection:
@@ -95,6 +125,13 @@ class DurablePipelineService:
         if not events:
             raise AppError("batch.not_found")
         projection = replay(events)
+        if projection.jobs:
+            first_config = projection.jobs[0].config
+            if any(
+                job.config.runtime_signature != first_config.runtime_signature
+                for job in projection.jobs[1:]
+            ):
+                raise AppError("batch.config_inconsistent", {"reason": "runtime"})
         for job in projection.jobs:
             for stage in job.stages:
                 if stage.state is StageState.COMMITTED:
@@ -133,17 +170,12 @@ class DurablePipelineService:
 
     async def retry(self, job_id: str, stage: StageName) -> BatchProjection:
         projection = self.status()
-        job = projection.job(job_id)
-        current = job.stage(stage)
-        if current.state is not StageState.COMMITTED:
-            raise AppError("retry.stage_invalid", {"stage_name": stage.value})
         projection = self._append(
             projection,
-            "stage.invalidated",
+            "job.retry_requested",
             {
                 "job_id": job_id,
                 "stage_name": stage.value,
-                "attempt": current.attempt,
             },
         )
         self.manifest.write(projection)
@@ -175,25 +207,44 @@ class DurablePipelineService:
                 )
         except AppError as exc:
             current = replay(self.journal.repair_and_read())
+            batch_requested = (self.control_dir / "cancel-batch").exists()
             if (
                 exc.code == "operation.cancelled"
                 and current.job(job_id).state is not JobState.CANCELLED
             ):
                 current = self._append(current, "job.cancelled", {"job_id": job_id})
                 self.manifest.write(current)
-                self._clear_markers(job_id)
+                self._clear_job_marker(job_id)
+                if (self.control_dir / "cancel-batch").exists():
+                    self._cancel_pending_jobs(current)
             elif (
                 exc.code not in {"operation.cancelled", "stage.post_commit_failed"}
                 and current.job(job_id).state is not JobState.FAILED
             ):
                 current = self._append(current, "job.failed", {"job_id": job_id})
                 self.manifest.write(current)
+            if exc.code == "operation.cancelled" and batch_requested:
+                raise AppError("operation.cancelled", {"scope": "batch"}) from exc
             raise
         if projection.job(job_id).state is JobState.SUCCEEDED:
             return projection
+        try:
+            context.raise_if_cancelled()
+        except AppError as exc:
+            if exc.code == "operation.cancelled":
+                batch_requested = (self.control_dir / "cancel-batch").exists()
+                projection = self._append(projection, "job.cancelled", {"job_id": job_id})
+                self.manifest.write(projection)
+                self._clear_job_marker(job_id)
+                if (self.control_dir / "cancel-batch").exists():
+                    projection = self._cancel_pending_jobs(projection)
+                if batch_requested:
+                    raise AppError("operation.cancelled", {"scope": "batch"}) from exc
+                raise
+            raise
         projection = self._append(projection, "job.succeeded", {"job_id": job_id})
         self.manifest.write(projection)
-        self._clear_markers(job_id)
+        self._clear_job_marker(job_id)
         return projection
 
     def _interrupt_open_attempts(self, projection: BatchProjection) -> BatchProjection:
@@ -253,16 +304,45 @@ class DurablePipelineService:
             shutil.rmtree(self.executor.work_root)
 
     def _clear_markers(self, job_id: str) -> None:
-        (self.control_dir / f"cancel-{job_id}").unlink(missing_ok=True)
+        self._clear_job_marker(job_id)
         (self.control_dir / "cancel-batch").unlink(missing_ok=True)
+
+    def _clear_job_marker(self, job_id: str) -> None:
+        (self.control_dir / f"cancel-{job_id}").unlink(missing_ok=True)
+
+    def _cancel_pending_jobs(self, projection: BatchProjection) -> BatchProjection:
+        for job in projection.jobs:
+            if job.state in {JobState.PENDING, JobState.RUNNING, JobState.INTERRUPTED}:
+                projection = self._append(projection, "job.cancelled", {"job_id": job.job_id})
+        self.manifest.write(projection)
+        (self.control_dir / "cancel-batch").unlink(missing_ok=True)
+        return projection
 
 
 def write_cancel_marker(control_dir: Path, *, job_id: str | None) -> Path:
+    import os
+    import tempfile
+
     control_dir.mkdir(parents=True, exist_ok=True)
     target = control_dir / ("cancel-batch" if job_id is None else f"cancel-{job_id}")
-    temporary = target.with_suffix(".tmp")
-    temporary.write_bytes(b"cancel\n")
-    temporary.replace(target)
+    descriptor, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=control_dir)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(b"cancel\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        if os.name != "nt":
+            directory = os.open(control_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except OSError as exc:
+        raise AppError("batch.cancel_marker_failed") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
     return target
 
 

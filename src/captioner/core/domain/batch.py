@@ -37,16 +37,15 @@ class BatchProjection:
             return BatchState.RUNNING
         if JobState.INTERRUPTED in states:
             return BatchState.INTERRUPTED
+        if JobState.FAILED in states:
+            return BatchState.FAILED
         if states == {JobState.SUCCEEDED}:
             return BatchState.SUCCEEDED
         if states == {JobState.CANCELLED}:
             return BatchState.CANCELLED
-        if states == {JobState.FAILED}:
-            return BatchState.FAILED
-        terminal = {JobState.SUCCEEDED, JobState.CANCELLED, JobState.FAILED}
-        if states <= terminal:
+        if states <= {JobState.SUCCEEDED, JobState.CANCELLED}:
             return BatchState.PARTIAL
-        return BatchState.RUNNING
+        return BatchState.PARTIAL
 
     def job(self, job_id: str) -> JobProjection:
         return next(job for job in self.jobs if job.job_id == job_id)

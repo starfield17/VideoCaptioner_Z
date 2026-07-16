@@ -50,6 +50,7 @@ class ResumeOverrides:
 
 
 def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
+    _validate_output_collisions(options.inputs, options.output_dir)
     batch_id = new_id("batch-")
     output_dir = options.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -88,6 +89,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
 
 def status(batch_id: str, *, paths: AppPaths) -> BatchProjection:
     projection = _read_projection(batch_id, paths=paths, repair=False)
+    _common_config(projection)
     return projection
 
 
@@ -99,16 +101,17 @@ def resume(
     lease.acquire()
     try:
         projection = _read_projection(batch_id, paths=paths, repair=True)
-        config = projection.jobs[0].config
+        config = _common_config(projection)
         selected = config if overrides is None else _apply_overrides(config, overrides)
         bundle = _bundle(batch_id, selected, paths)
         if selected != config:
-            bundle.service.update_config(
-                projection,
-                job_id=projection.jobs[0].job_id,
-                config=selected,
-                earliest_stage=_earliest_change(config, selected),
-            )
+            for job in projection.jobs:
+                projection = bundle.service.update_config(
+                    projection,
+                    job_id=job.job_id,
+                    config=selected,
+                    earliest_stage=_earliest_change(job.config, selected),
+                )
         return asyncio.run(bundle.service.resume())
     finally:
         lease.release()
@@ -120,7 +123,7 @@ def retry(batch_id: str, job_id: str, stage: StageName, *, paths: AppPaths) -> B
     lease.acquire()
     try:
         projection = _read_projection(batch_id, paths=paths, repair=True)
-        config = projection.jobs[0].config
+        config = _common_config(projection)
         bundle = _bundle(batch_id, config, paths)
         return asyncio.run(bundle.service.retry(job_id, stage))
     finally:
@@ -135,7 +138,7 @@ def cancel(batch_id: str, job_id: str | None, *, paths: AppPaths) -> Path:
             job = projection.job(job_id)
         except StopIteration as exc:
             raise AppError("batch.job_not_found", {"job_id": job_id}) from exc
-        if job.state in {JobState.SUCCEEDED, JobState.CANCELLED}:
+        if job.state in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED}:
             raise AppError("batch.cancel_invalid", {"reason": "terminal"})
     batch_dir = resolve_safe_child(paths.batches_dir, batch_id, field="batch_id")
     return write_cancel_marker(batch_dir / "control", job_id=job_id)
@@ -242,7 +245,34 @@ def _bundle(batch_id: str, config: JobConfig, paths: AppPaths) -> DurableService
         ffmpeg_bin=config.ffmpeg_bin,
         ffprobe_bin=config.ffprobe_bin,
         paths=paths,
+        segmentation=config.segmentation,
     )
+
+
+def _common_config(projection: BatchProjection) -> JobConfig:
+    if not projection.jobs:
+        raise AppError("batch.config_inconsistent", {"reason": "no_jobs"})
+    config = projection.jobs[0].config
+    if any(job.config.runtime_signature != config.runtime_signature for job in projection.jobs[1:]):
+        raise AppError("batch.config_inconsistent", {"reason": "runtime"})
+    return config
+
+
+def _validate_output_collisions(inputs: tuple[Path, ...], output_dir: Path) -> None:
+    normalized: dict[str, Path] = {}
+    target_root = output_dir.expanduser().resolve()
+    for source in inputs:
+        stem = source.expanduser().resolve().stem
+        for suffix in (".transcript.json", ".srt"):
+            target = target_root / f"{stem}{suffix}"
+            key = os.path.normcase(str(target))
+            previous = normalized.get(key)
+            if previous is not None:
+                raise AppError(
+                    "batch.output_collision",
+                    {"logical_name": target.name},
+                )
+            normalized[key] = source
 
 
 def _read_projection(batch_id: str, *, paths: AppPaths, repair: bool) -> BatchProjection:

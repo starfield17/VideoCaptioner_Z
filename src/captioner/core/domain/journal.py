@@ -32,6 +32,7 @@ EVENT_TYPES = frozenset(
         "batch.created",
         "job.created",
         "job.config_updated",
+        "job.retry_requested",
         "stage.started",
         "stage.interrupted",
         "stage.committed",
@@ -186,6 +187,8 @@ def _apply_payload(projection: BatchProjection, event: JournalEvent) -> BatchPro
     job_index, job = _find_job(projection, job_id)
     if event.type == "job.config_updated":
         job = replace(job, config=_config_from_value(event.payload.get("config")))
+    elif event.type == "job.retry_requested":
+        job = _retry_job(job, event.payload)
     elif event.type.startswith("stage."):
         job = _apply_stage_event(job, event.type, event.payload)
     else:
@@ -239,6 +242,26 @@ def _apply_stage_event(
         replacement, job_state = _terminal_stage(event_type, current, payload)
     stages[STAGE_PLAN.index(stage_name)] = replacement
     return replace(job, state=job_state, stages=tuple(stages))
+
+
+def _retry_job(job: JobProjection, payload: Mapping[str, FrozenJsonValue]) -> JobProjection:
+    try:
+        stage_name = StageName(_required_str(payload, "stage_name"))
+    except ValueError as exc:
+        raise AppError("journal.transition_invalid", {"reason": "stage_name"}) from exc
+    current = job.stage(stage_name)
+    if current.state is StageState.PENDING and job.state not in {
+        JobState.FAILED,
+        JobState.CANCELLED,
+    }:
+        raise AppError("journal.transition_invalid", {"reason": "retry_pending"})
+    if any(job.stage(dep).state is not StageState.COMMITTED for dep in dependencies(stage_name)):
+        raise AppError("journal.transition_invalid", {"reason": "retry_dependency"})
+    stages = list(job.stages)
+    for name in stage_suffix(stage_name):
+        prior = stages[STAGE_PLAN.index(name)]
+        stages[STAGE_PLAN.index(name)] = StageProjection(name, StageState.PENDING, prior.attempt)
+    return replace(job, state=JobState.PENDING, stages=tuple(stages))
 
 
 def _terminal_stage(
