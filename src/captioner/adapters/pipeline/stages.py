@@ -66,7 +66,6 @@ class NormalizeStage:
     ) -> tuple[ProducedArtifact, ...]:
         media = decode_media(self.artifacts.read_bytes(_ref(request, "media.json")))
         audio = await self.normalizer.normalize(media, context.workspace, context.execution)
-        context.checkpoint("mid_execute")
         return (
             ProducedArtifact(
                 "normalized-wav", "audio/wav", "normalized.wav", source_path=audio.path
@@ -98,7 +97,6 @@ class TranscribeStage:
         transcript = await self.engine.transcribe(
             TranscriptionRequest(audio, request.config.language), context.execution
         )
-        context.checkpoint("mid_execute")
         return (
             ProducedArtifact(
                 "transcript-json",
@@ -121,8 +119,20 @@ class SegmentStage:
     ) -> tuple[ProducedArtifact, ...]:
         context.execution.raise_if_cancelled()
         transcript = decode_transcript(self.artifacts.read_bytes(_ref(request, "transcript.json")))
-        context.checkpoint("mid_execute")
-        track = segment_transcript(transcript, self.config)
+
+        midpoint_emitted = False
+
+        def midpoint() -> None:
+            nonlocal midpoint_emitted
+            if not midpoint_emitted:
+                midpoint_emitted = True
+                context.checkpoint("mid_execute")
+
+        track = segment_transcript(
+            transcript,
+            self.config,
+            progress=midpoint,
+        )
         return (
             ProducedArtifact(
                 "subtitle-track-json",
@@ -146,6 +156,7 @@ class ExportStage:
         transcript_bytes = self.artifacts.read_bytes(_ref(request, "transcript.json"))
         track = decode_track(self.artifacts.read_bytes(_ref(request, "subtitle-track.json")))
         context.checkpoint("mid_execute")
+        subtitle_bytes = serialize_srt(track)
         return (
             ProducedArtifact(
                 "final-transcript-json",
@@ -157,7 +168,7 @@ class ExportStage:
                 "final-subtitle-srt",
                 "application/x-subrip",
                 "final-subtitle.srt",
-                data=serialize_srt(track),
+                data=subtitle_bytes,
             ),
         )
 
@@ -193,7 +204,6 @@ class PublishStage:
             published = Path(request.config.output_dir) / key
             if published.stat().st_size != ref.size_bytes or _sha256(published) != ref.sha256:
                 raise AppError("output.publication_invalid", {"logical_name": key})
-        context.checkpoint("mid_execute")
         receipt = PublicationReceipt(
             hashlib.sha256("".join(ref.sha256 for _, ref in targets).encode()).hexdigest(),
             tuple(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from captioner.core.domain.errors import AppError
@@ -59,6 +59,7 @@ class SimpleSegmentationConfig:
 def segment_transcript(
     transcript: Transcript,
     config: SimpleSegmentationConfig | None = None,
+    progress: Callable[[], None] | None = None,
 ) -> SubtitleTrack:
     """Segment each source transcript segment greedily at word boundaries."""
     settings = SimpleSegmentationConfig() if config is None else config
@@ -66,7 +67,7 @@ def segment_transcript(
     cues: list[SubtitleCue] = []
     next_cue_number = 1
     assigned: set[str] = set()
-    for segment in transcript.segments:
+    for segment_index, segment in enumerate(transcript.segments):
         words = _resolve_words(segment, words_by_id)
         while words:
             end = _choose_end(words, 0, settings)
@@ -88,6 +89,10 @@ def segment_transcript(
                 )
             )
             next_cue_number += 1
+            if progress is not None and (
+                words[end:] or segment_index < len(transcript.segments) - 1
+            ):
+                progress()
             words = words[end:]
 
     expected = {word.id for word in transcript.words}

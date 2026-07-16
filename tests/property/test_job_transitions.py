@@ -77,12 +77,24 @@ def test_attempts_must_strictly_increase(attempt: int) -> None:
         ),
     ]
     projection = replay(base)
+    cancelled = apply_event(
+        projection,
+        JournalEvent(
+            5,
+            "event-5",
+            "2026-01-01T00:00:00+00:00",
+            "batch-a",
+            "job.cancelled",
+            {"job_id": "job-000001"},
+        ),
+    )
+    assert cancelled.jobs[0].state.value == "cancelled"
     with pytest.raises(AppError, match="attempt_reused"):
         apply_event(
-            projection,
+            cancelled,
             JournalEvent(
-                5,
-                "event-5",
+                6,
+                "event-6",
                 "2026-01-01T00:00:00+00:00",
                 "batch-a",
                 "stage.started",

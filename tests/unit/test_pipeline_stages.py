@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from tests.support import make_audio, make_media, make_transcript
 
+import captioner.adapters.pipeline.stages as stages_module
 from captioner.adapters.persistence.content_addressed_artifact_store import (
     ContentAddressedArtifactStore,
 )
@@ -102,10 +104,10 @@ def _request(tmp_path: Path, refs: tuple[ArtifactRef, ...] = ()) -> StageExecuti
     )
 
 
-def _context(tmp_path: Path) -> StageExecutionContext:
+def _context(tmp_path: Path, hook: Callable[[str], None] | None = None) -> StageExecutionContext:
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
-    return StageExecutionContext(ExecutionContext(), workspace)
+    return StageExecutionContext(ExecutionContext(checkpoint_hook=hook), workspace)
 
 
 def _put(store: ContentAddressedArtifactStore, data: bytes, name: str):
@@ -162,6 +164,66 @@ def test_all_stage_runners_execute_with_durable_inputs(tmp_path: Path) -> None:
         PublishStage(store).execute(_request(tmp_path, final_refs), _context(tmp_path))
     )
     assert repeated[0].data == published[0].data
+
+
+def test_segment_mid_execute_occurs_during_segmentation(tmp_path: Path) -> None:
+    store = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    transcript = make_transcript(("one ", "two ", "three"))
+    transcript_ref = _put(store, encode_transcript(transcript), "transcript.json")
+    checkpoints: list[str] = []
+    result = asyncio.run(
+        SegmentStage(
+            store,
+            SimpleSegmentationConfig(max_text_units=5),
+        ).execute(
+            _request(tmp_path, (transcript_ref,)),
+            _context(tmp_path, checkpoints.append),
+        )
+    )
+    assert result[0].data is not None
+    assert checkpoints == ["mid_execute"]
+
+
+def test_export_mid_execute_occurs_between_representations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    transcript = make_transcript()
+    transcript_ref = _put(store, encode_transcript(transcript), "transcript.json")
+    track_ref = _put(store, encode_track(segment_transcript(transcript)), "subtitle-track.json")
+    order: list[str] = []
+    real_srt = stages_module.serialize_srt
+
+    def serialize_with_observation(track: object) -> bytes:
+        order.append("srt")
+        return real_srt(track)  # type: ignore[arg-type]  # test observation wrapper
+
+    monkeypatch.setattr(stages_module, "serialize_srt", serialize_with_observation)
+    asyncio.run(
+        ExportStage(store).execute(
+            _request(tmp_path, (transcript_ref, track_ref)),
+            _context(tmp_path, lambda point: order.append(point)),
+        )
+    )
+    assert order == ["mid_execute", "srt"]
+
+
+def test_publish_mid_execute_occurs_after_first_target_commit(tmp_path: Path) -> None:
+    store = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    output = tmp_path / "output"
+    output.mkdir()
+    refs = (
+        _put(store, b"transcript", "final-transcript.json"),
+        _put(store, b"srt", "final-subtitle.srt"),
+    )
+    checkpoints: list[str] = []
+    result = asyncio.run(
+        PublishStage(store).execute(
+            _request(tmp_path, refs), _context(tmp_path, checkpoints.append)
+        )
+    )
+    assert result[0].data is not None
+    assert checkpoints == ["mid_execute"]
 
 
 @pytest.mark.parametrize("target_name", ["input.transcript.json", "input.srt"])

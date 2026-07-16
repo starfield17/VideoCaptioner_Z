@@ -41,6 +41,17 @@
   Artifact verification either repair it or fail explicitly.
 - External Batch and Job IDs are validated before durable path construction.
 - Status never repairs Journal or rewrites Manifest; repair requires the writer lease.
+- Status verifies committed content-addressed Artifacts and PublicationReceipt targets without
+  changing durable state.
+- A Journal-derived `succeeded` state does not by itself prove current output integrity.
+- At every complete Journal event boundary, all Jobs in a Batch share one runtime configuration
+  signature.
+- Batch-wide configuration changes are represented by one crash-atomic `batch.config_updated`
+  event.
+- A corrupt CAS blob is removed only through its validated `ArtifactRef`; a healthy sibling is
+  never removed during detection.
+- A cooperative cancel marker is removed only after cancellation events and Manifest projection
+  are durable; an interrupted Job may transition directly to `cancelled`.
 - A Batch uses one common runtime configuration and distinct publication targets.
 - Failed and cancelled Jobs require an explicit `job.retry_requested` before retry.
 - Publication receipts are strict and reverify both final target files.

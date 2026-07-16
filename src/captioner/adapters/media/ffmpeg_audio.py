@@ -109,12 +109,16 @@ def _read_wav_format(path: Path) -> tuple[int, int, int, int]:
 
 def _sha256(path: Path, context: ExecutionContext) -> str:
     digest = hashlib.sha256()
+    first_chunk = True
     try:
         context.raise_if_cancelled()
         with path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
                 context.raise_if_cancelled()
                 digest.update(chunk)
+                if first_chunk:
+                    first_chunk = False
+                    context.checkpoint("mid_execute")
     except AppError:
         raise
     except OSError as exc:

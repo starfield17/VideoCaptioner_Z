@@ -7,9 +7,12 @@ packaging tests, and branch coverage with an 85% minimum.
 
 Tests are grouped into `unit`, `property`, `contract`, `recovery`, `integration`,
 and `packaging`. Recovery covers all six Stages at all six fault points.
-Property tests use Hypothesis for locale, domain and segmentation
-invariants. Unit tests use fake processes, fake ASR models and local artifact
-stores; they do not execute FFmpeg or download models. Output-transaction unit
+Property tests use Hypothesis for locale, domain, segmentation and Journal
+transition invariants, including atomic Batch configuration and interrupted
+cancellation. Recovery also covers status purity, exact multi-Artifact cleanup,
+publication-target corruption and Batch cancellation acknowledgement. Unit
+tests use fake processes, fake ASR models and local artifact stores; they do not
+execute FFmpeg or download models. Output-transaction unit
 tests exercise every cancellation/interrupt boundary, overwrite restoration,
 staging cleanup, and staged-artifact single-use rule. Integration tests use
 the installed FFprobe/FFmpeg and are marked `integration`. The real Faster

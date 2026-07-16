@@ -60,6 +60,46 @@ def test_export_second_artifact_corruption_removes_exact_blob(
     )
 
 
+def test_corruption_in_upstream_and_downstream_stages_cleans_both_hash_paths(
+    tmp_path: Path,
+) -> None:
+    counts: dict[StageName, int] = {}
+    current = service(tmp_path, counts)
+    current.runners = {
+        **current.runners,
+        StageName.NORMALIZE: MultiArtifactStage(
+            StageName.NORMALIZE,
+            (("normalized.wav", b"normalized"), ("normalized-audio.json", b"metadata")),
+        ),
+        StageName.TRANSCRIBE: MultiArtifactStage(
+            StageName.TRANSCRIBE,
+            (("transcript.json", b"transcript"),),
+        ),
+    }
+    projection = current.create(
+        "batch-a", (("job-000001", tmp_path / "input.wav", config(tmp_path)),)
+    )
+    projection = asyncio.run(current.run(projection))
+    normalize_ref = projection.job("job-000001").stage(StageName.NORMALIZE).artifacts[0]
+    transcribe_ref = projection.job("job-000001").stage(StageName.TRANSCRIBE).artifacts[0]
+    normalize_path = current.executor.artifact_store.resolve(normalize_ref)
+    transcribe_path = current.executor.artifact_store.resolve(transcribe_ref)
+    normalize_path.write_bytes(b"bad-normalize")
+    transcribe_path.write_bytes(b"bad-transcribe")
+
+    recovered = service(tmp_path, counts)
+    recovered.runners = {
+        **recovered.runners,
+        StageName.NORMALIZE: current.runners[StageName.NORMALIZE],
+        StageName.TRANSCRIBE: current.runners[StageName.TRANSCRIBE],
+    }
+    result = asyncio.run(recovered.resume())
+
+    assert result.job("job-000001").state.value == "succeeded"
+    recovered.executor.artifact_store.verify(normalize_ref)
+    recovered.executor.artifact_store.verify(transcribe_ref)
+
+
 def _run_and_recover_multi_artifact(
     tmp_path: Path,
     stage: StageName,

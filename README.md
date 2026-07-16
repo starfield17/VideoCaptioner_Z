@@ -68,9 +68,13 @@ by the operating system's standard application directories through
 `platformdirs`.
 
 Batch and Job IDs are validated before durable path construction. Status is a
-non-mutating read: it reports incomplete Journal tails and Manifest status but
-does not repair or rewrite either file. Resume and retry acquire the Batch
-writer lease before repair. All Jobs in one Batch share runtime
-ASR/media/segmentation settings; output target collisions are rejected before
-`batch.created`. Failed or cancelled Jobs require explicit `retry`, which
-appends `job.retry_requested`.
+non-mutating read: it reports incomplete Journal tails and Manifest status,
+verifies every committed Artifact and publication target, and does not repair
+or rewrite either file. Journal-derived state and current output integrity are
+separate; a durable `succeeded` state can therefore be reported with
+`integrity: invalid`. JSON status returns the document with its integrity
+errors instead of converting that result into an exception. Resume and retry
+acquire the Batch writer lease before repair. At every complete Journal event
+boundary, all Jobs in a Batch share one runtime configuration signature; a
+Batch-wide override is one `batch.config_updated` event. Failed or cancelled
+Jobs require explicit `retry`, which appends `job.retry_requested`.

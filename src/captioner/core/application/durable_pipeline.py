@@ -130,8 +130,7 @@ class DurablePipelineService:
         if self._has_cancel_requests(projection):
             batch_requested = (self.control_dir / "cancel-batch").exists()
             job_requested = any(
-                (self.control_dir / f"cancel-{job.job_id}").exists()
-                for job in projection.jobs
+                (self.control_dir / f"cancel-{job.job_id}").exists() for job in projection.jobs
             )
             projection = self.acknowledge_cancel_requests(projection, active_job_id=None)
             if batch_requested:
@@ -142,9 +141,7 @@ class DurablePipelineService:
             if job.state in {JobState.CANCELLED, JobState.FAILED}:
                 continue
             if (self.control_dir / "cancel-batch").exists():
-                projection = self.acknowledge_cancel_requests(
-                    projection, active_job_id=None
-                )
+                projection = self.acknowledge_cancel_requests(projection, active_job_id=None)
                 raise AppError("operation.cancelled", {"scope": "batch"})
             try:
                 projection = await self._run_job(projection, job.job_id)
@@ -158,9 +155,7 @@ class DurablePipelineService:
                     continue
                 raise
             if (self.control_dir / "cancel-batch").exists():
-                projection = self.acknowledge_cancel_requests(
-                    projection, active_job_id=None
-                )
+                projection = self.acknowledge_cancel_requests(projection, active_job_id=None)
                 break
         return projection
 
@@ -357,9 +352,7 @@ class DurablePipelineService:
                 "stage.cancellation_projection_failed",
             }
             if cancellation:
-                current = self.acknowledge_cancel_requests(
-                    current, active_job_id=job_id
-                )
+                current = self.acknowledge_cancel_requests(current, active_job_id=job_id)
             elif (
                 exc.code != "stage.post_commit_failed"
                 and current.job(job_id).state is not JobState.FAILED
@@ -378,9 +371,7 @@ class DurablePipelineService:
         except AppError as exc:
             if exc.code == "operation.cancelled":
                 batch_requested = (self.control_dir / "cancel-batch").exists()
-                projection = self.acknowledge_cancel_requests(
-                    projection, active_job_id=job_id
-                )
+                projection = self.acknowledge_cancel_requests(projection, active_job_id=job_id)
                 if batch_requested:
                     raise AppError("operation.cancelled", {"scope": "batch"}) from exc
                 raise
@@ -409,11 +400,17 @@ class DurablePipelineService:
         return projection
 
     def _invalidate_corrupt_artifacts(self, projection: BatchProjection) -> BatchProjection:
+        bad_stages: dict[str, set[StageName]] = {}
+        bad_refs: list[ArtifactRef] = []
+
+        # Complete the durable verification pass before appending any
+        # invalidation.  An upstream invalidation changes the replayed suffix
+        # to INVALIDATED; collecting first ensures a corrupt downstream blob
+        # is still found and removed instead of being left at its hash path.
         for job in projection.jobs:
             for stage in job.stages:
                 if stage.state is not StageState.COMMITTED:
                     continue
-                bad_refs: list[ArtifactRef] = []
                 for artifact in stage.artifacts:
                     try:
                         self.executor.verify_artifact(artifact)
@@ -421,33 +418,42 @@ class DurablePipelineService:
                         if exc.code not in {"artifact.missing", "artifact.corrupt"}:
                             raise
                         bad_refs.append(artifact)
-                if bad_refs:
-                    for artifact in bad_refs:
-                        self.executor.artifact_store.remove_corrupt(artifact)
-                    projection = self._append(
-                        projection,
-                        "stage.invalidated",
-                        {
-                            "job_id": job.job_id,
-                            "stage_name": stage.name.value,
-                            "attempt": stage.attempt,
-                        },
-                    )
-                    continue
-                try:
-                    self.executor.verify_stage_external_state(job, stage)
-                except AppError as exc:
-                    if exc.code != "output.publication_invalid":
-                        raise
-                    projection = self._append(
-                        projection,
-                        "stage.invalidated",
-                        {
-                            "job_id": job.job_id,
-                            "stage_name": stage.name.value,
-                            "attempt": stage.attempt,
-                        },
-                    )
+                        bad_stages.setdefault(job.job_id, set()).add(stage.name)
+
+        for artifact in bad_refs:
+            self.executor.artifact_store.remove_corrupt(artifact)
+
+        for job in projection.jobs:
+            publish = job.stage(StageName.PUBLISH)
+            if publish.state is not StageState.COMMITTED:
+                continue
+            if any(
+                stage_name is not StageName.PUBLISH
+                for stage_name in bad_stages.get(job.job_id, set())
+            ):
+                continue
+            try:
+                self.executor.verify_stage_external_state(job, publish)
+            except AppError as exc:
+                if exc.code != "output.publication_invalid":
+                    raise
+                bad_stages.setdefault(job.job_id, set()).add(StageName.PUBLISH)
+
+        for job in projection.jobs:
+            invalidated = bad_stages.get(job.job_id)
+            if not invalidated:
+                continue
+            earliest = min(invalidated, key=STAGE_PLAN.index)
+            stage = job.stage(earliest)
+            projection = self._append(
+                projection,
+                "stage.invalidated",
+                {
+                    "job_id": job.job_id,
+                    "stage_name": earliest.value,
+                    "attempt": stage.attempt,
+                },
+            )
         self.manifest.write(projection)
         return projection
 
@@ -529,7 +535,11 @@ class DurablePipelineService:
         if batch_requested:
             (self.control_dir / "cancel-batch").unlink(missing_ok=True)
         for job_id in targeted:
-            if projection.job(job_id).state is JobState.CANCELLED:
+            if projection.job(job_id).state in {
+                JobState.SUCCEEDED,
+                JobState.FAILED,
+                JobState.CANCELLED,
+            }:
                 self._clear_job_marker(job_id)
         return projection
 
@@ -618,6 +628,5 @@ def _issue_params(issue: IntegrityIssue) -> dict[str, str]:
 
 def _has_job_cancel_event(events: tuple[JournalEvent, ...], job_id: str) -> bool:
     return any(
-        event.type == "job.cancelled" and event.payload.get("job_id") == job_id
-        for event in events
+        event.type == "job.cancelled" and event.payload.get("job_id") == job_id for event in events
     )

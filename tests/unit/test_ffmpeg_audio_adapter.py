@@ -60,6 +60,27 @@ def test_ffmpeg_normalizes_selected_stream_and_returns_artifact(tmp_path: Path) 
     asyncio.run(scenario())
 
 
+def test_normalize_mid_execute_occurs_during_hashing(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        source = tmp_path / "input.wav"
+        source.write_bytes(b"source")
+        workspace = tmp_path / "workspace"
+        checkpoints: list[str] = []
+
+        def checkpoint(point: str) -> None:
+            assert (workspace / "normalized.wav").is_file()
+            checkpoints.append(point)
+
+        await FFmpegAudioNormalizer(FFmpegStub(ProcessResult(b"", b"", 0))).normalize(
+            make_media(source),
+            workspace,
+            ExecutionContext(checkpoint_hook=checkpoint),
+        )
+        assert checkpoints == ["mid_execute"]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("result", "write_output"),
     [(ProcessResult(b"", b"failure", 1), False), (ProcessResult(b"", b"", 0), False)],

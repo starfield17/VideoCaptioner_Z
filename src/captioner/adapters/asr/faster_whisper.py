@@ -174,12 +174,12 @@ class FasterWhisperEngine:
         try:
             for segment_index, raw_segment in enumerate(raw_segments):
                 context.raise_if_cancelled()
-                if segment_index == 0:
-                    context.checkpoint("mid_execute")
                 segment = raw_segment
                 text = cast(object, getattr(segment, "text", None))
                 if not isinstance(text, str):
                     _raise_invalid_segment_output("segment_text")
+                if segment_index == 0:
+                    context.checkpoint("mid_execute")
                 raw_words = cast(object, getattr(segment, "words", None))
                 if not text.strip():
                     # Faster Whisper can emit an empty no-speech segment.  It

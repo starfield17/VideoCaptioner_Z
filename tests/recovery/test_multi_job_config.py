@@ -40,13 +40,11 @@ def test_model_change_updates_every_job_and_suffix_only(tmp_path: Path) -> None:
         ),
     )
     projection = asyncio.run(current.run(projection))
-    for job in projection.jobs:
-        projection = current.update_config(
-            projection,
-            job_id=job.job_id,
-            config=config(tmp_path, model="small"),
-            earliest_stage=StageName.TRANSCRIBE,
-        )
+    projection = current.update_config(
+        projection,
+        config=config(tmp_path, model="small"),
+        earliest_stage=StageName.TRANSCRIBE,
+    )
     result = asyncio.run(current.run(projection))
     for job in result.jobs:
         assert job.stage(StageName.NORMALIZE).attempt == 1

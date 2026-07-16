@@ -224,10 +224,13 @@ def test_resume_output_creates_directory_before_config_event(
 
     assert new_output.is_dir()
     assert observed_event_counts == [2]
-    assert sum(
-        event.type == "batch.config_updated"
-        for event in JsonlJournal(journal_path).read_snapshot().events
-    ) == 1
+    assert (
+        sum(
+            event.type == "batch.config_updated"
+            for event in JsonlJournal(journal_path).read_snapshot().events
+        )
+        == 1
+    )
 
 
 def test_resume_output_failure_leaves_journal_unchanged(tmp_path: Path) -> None:

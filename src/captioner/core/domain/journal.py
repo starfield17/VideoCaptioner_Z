@@ -165,6 +165,8 @@ def apply_event(
     if event.type == "batch.created":
         raise AppError("journal.transition_invalid", {"reason": "duplicate_batch"})
     updated = _apply_payload(projection, event)
+    if event.type in {"job.created", "job.config_updated", "batch.config_updated"}:
+        _validate_common_runtime(updated)
     return replace(
         updated,
         last_event_seq=event.seq,
@@ -359,6 +361,12 @@ def _find_job(projection: BatchProjection, job_id: str) -> tuple[int, JobProject
         if job.job_id == job_id:
             return index, job
     raise AppError("journal.transition_invalid", {"reason": "job_missing"})
+
+
+def _validate_common_runtime(projection: BatchProjection) -> None:
+    signatures = {job.config.runtime_signature for job in projection.jobs}
+    if len(signatures) > 1:
+        raise AppError("journal.transition_invalid", {"reason": "config_inconsistent"})
 
 
 def _required_str(payload: Mapping[str, FrozenJsonValue], key: str) -> str:

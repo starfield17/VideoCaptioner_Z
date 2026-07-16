@@ -5,6 +5,21 @@ strictly increasing `seq`. Events contain schema version, event ID, UTC timestam
 Batch ID, type, and bounded payload. Stage events identify Job, Stage, and attempt.
 Committed events contain only cache keys and `ArtifactRef` objects.
 
+`batch.config_updated` has one payload for the complete Batch:
+
+```json
+{
+  "config": {"schema_version": 1, "...": "the complete JobConfig"},
+  "earliest_stage": "transcribe"
+}
+```
+
+Replay applies that event to every Job in memory before the single event is
+appended. It replaces the common configuration and invalidates the affected
+Stage suffix while preserving attempt numbers. The CLI never emits a sequence
+of per-Job configuration events; legacy `job.config_updated` records remain
+readable only for older development Journals.
+
 Bytes after the final newline are truncated even if valid JSON. Any malformed,
 invalid UTF-8, schema-invalid, missing-sequence, or duplicate complete line is
 `journal.corrupt`. An uncertain append is reconciled by exact event ID, sequence,

@@ -170,3 +170,122 @@ def test_reversing_stage_commit_order_is_rejected() -> None:
 
     with pytest.raises(AppError):
         replay(events)
+
+
+def test_batch_config_updated_changes_every_job_at_one_replay_boundary() -> None:
+    root = (Path.cwd() / "captioner-property").resolve()
+    old_config = JobConfig(
+        "tiny",
+        "faster-whisper:tiny",
+        "cpu",
+        "int8",
+        "en",
+        True,
+        "ffmpeg",
+        "ffprobe",
+        {"sample_rate": 16000},
+        {"max_duration_ms": 7000},
+        str(root),
+        False,
+        {stage.value: "1" for stage in STAGE_PLAN},
+    )
+    new_config = JobConfig(
+        "small",
+        "faster-whisper:small",
+        "cpu",
+        "int8",
+        "en",
+        True,
+        "ffmpeg",
+        "ffprobe",
+        {"sample_rate": 16000},
+        {"max_duration_ms": 7000},
+        str(root),
+        False,
+        {stage.value: "1" for stage in STAGE_PLAN},
+    )
+    events = [
+        _event(1, "batch.created", {}),
+        _event(
+            2,
+            "job.created",
+            {
+                "job_id": "job-000001",
+                "input_path": str(root / "one.wav"),
+                "config": old_config.to_dict(),
+            },
+        ),
+        _event(
+            3,
+            "job.created",
+            {
+                "job_id": "job-000002",
+                "input_path": str(root / "two.wav"),
+                "config": old_config.to_dict(),
+            },
+        ),
+        _event(
+            4,
+            "batch.config_updated",
+            {"config": new_config.to_dict(), "earliest_stage": "transcribe"},
+        ),
+    ]
+
+    projection = replay(events)
+
+    assert {job.config.runtime_signature for job in projection.jobs} == {
+        new_config.runtime_signature
+    }
+    assert all(
+        job.stage(STAGE_PLAN[0]).state.value == "pending"
+        and job.stage(STAGE_PLAN[2]).state.value == "pending"
+        for job in projection.jobs
+    )
+    assert apply_event(replay(events[:-1]), events[-1]) == projection
+
+
+def test_interrupted_job_can_be_cancelled_without_rewriting_stage_history() -> None:
+    root = (Path.cwd() / "captioner-property").resolve()
+    config = JobConfig(
+        "tiny",
+        "faster-whisper:tiny",
+        "cpu",
+        "int8",
+        "en",
+        True,
+        "ffmpeg",
+        "ffprobe",
+        {"sample_rate": 16000},
+        {"max_duration_ms": 7000},
+        str(root),
+        False,
+        {stage.value: "1" for stage in STAGE_PLAN},
+    )
+    events = [
+        _event(1, "batch.created", {}),
+        _event(
+            2,
+            "job.created",
+            {
+                "job_id": "job-000001",
+                "input_path": str(root / "one.wav"),
+                "config": config.to_dict(),
+            },
+        ),
+        _event(
+            3,
+            "stage.started",
+            {"job_id": "job-000001", "stage_name": "inspect", "attempt": 1},
+        ),
+        _event(
+            4,
+            "stage.interrupted",
+            {"job_id": "job-000001", "stage_name": "inspect", "attempt": 1},
+        ),
+        _event(5, "job.cancelled", {"job_id": "job-000001"}),
+    ]
+
+    projection = replay(events)
+
+    assert projection.jobs[0].state.value == "cancelled"
+    assert projection.jobs[0].stage(STAGE_PLAN[0]).state.value == "interrupted"

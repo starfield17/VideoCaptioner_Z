@@ -101,11 +101,16 @@ def resume(
     lease = create_batch_lease(batch_dir)
     lease.acquire()
     try:
-        projection = _read_projection(batch_id, paths=paths, repair=True)
-        config = _common_config(projection)
+        # Preview the complete prefix without repair before creating an output
+        # override.  A directory failure must not truncate an incomplete tail
+        # or append any configuration event.
+        preview = _read_projection(batch_id, paths=paths, repair=False)
+        _common_config(preview)
         if overrides is not None and overrides.output_dir is not None:
             output_dir = _prepare_output_directory(overrides.output_dir)
             overrides = replace(overrides, output_dir=output_dir)
+        projection = _read_projection(batch_id, paths=paths, repair=True)
+        config = _common_config(projection)
         selected = config if overrides is None else _apply_overrides(config, overrides)
         bundle = _bundle(batch_id, selected, paths)
         if selected != config:
