@@ -1,0 +1,19 @@
+"""Content-addressed durable artifact boundary."""
+
+from pathlib import Path
+from typing import Protocol
+
+from captioner.core.domain.artifact import ArtifactRef
+
+
+class DurableArtifactStorePort(Protocol):
+    def put_bytes(
+        self, data: bytes, *, kind: str, media_type: str, logical_name: str
+    ) -> ArtifactRef: ...
+    def put_file(
+        self, source: Path, *, kind: str, media_type: str, logical_name: str
+    ) -> ArtifactRef: ...
+    def verify(self, ref: ArtifactRef) -> None: ...
+    def resolve(self, ref: ArtifactRef) -> Path: ...
+    def read_bytes(self, ref: ArtifactRef) -> bytes: ...
+    def materialize(self, ref: ArtifactRef, target: Path, *, overwrite: bool) -> Path: ...

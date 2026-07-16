@@ -27,6 +27,14 @@ class AppPaths:
     temp_dir: Path
 
     @property
+    def batches_dir(self) -> Path:
+        return self.data_dir / "batches"
+
+    @property
+    def artifacts_dir(self) -> Path:
+        return self.data_dir / "artifacts"
+
+    @property
     def writable_directories(self) -> tuple[Path, ...]:
         return (self.config_dir, self.data_dir, self.cache_dir, self.log_dir, self.temp_dir)
 
@@ -75,6 +83,9 @@ def ensure_runtime_layout(paths: AppPaths) -> None:
     """Create only writable directories; bundled resources remain untouched."""
     for directory in paths.writable_directories:
         directory.mkdir(parents=True, exist_ok=True)
+    paths.batches_dir.mkdir(parents=True, exist_ok=True)
+    (paths.artifacts_dir / ".incoming").mkdir(parents=True, exist_ok=True)
+    (paths.artifacts_dir / "sha256").mkdir(parents=True, exist_ok=True)
 
 
 def _normalize_platform(value: str) -> str:

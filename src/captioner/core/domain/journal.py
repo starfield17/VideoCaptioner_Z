@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import cast
+from typing import Never, cast
 
 from captioner.core.domain.artifact import ArtifactRef
 from captioner.core.domain.batch import BatchProjection
@@ -81,6 +81,63 @@ class JournalEvent:
             "type": self.type,
             "payload": thaw_json_value(self.payload),
         }
+
+    @classmethod
+    def from_dict(cls, value: object) -> JournalEvent:
+        if not isinstance(value, Mapping):
+            raise AppError("journal.corrupt", {"reason": "event_root"})
+        raw = cast(Mapping[object, object], value)
+        expected = {
+            "schema_version",
+            "seq",
+            "event_id",
+            "timestamp_utc",
+            "batch_id",
+            "type",
+            "payload",
+        }
+        if set(raw) != expected:
+            raise AppError("journal.corrupt", {"reason": "event_fields"})
+        try:
+            schema_version = raw["schema_version"]
+            seq = raw["seq"]
+            event_id = raw["event_id"]
+            timestamp_utc = raw["timestamp_utc"]
+            batch_id = raw["batch_id"]
+            event_type = raw["type"]
+            payload = raw["payload"]
+            valid_types = (
+                not isinstance(schema_version, int)
+                or isinstance(schema_version, bool)
+                or not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or not isinstance(event_id, str)
+                or not isinstance(timestamp_utc, str)
+                or not isinstance(batch_id, str)
+                or not isinstance(event_type, str)
+                or not isinstance(payload, Mapping)
+            )
+            if valid_types:
+                return _invalid_event_types()
+            payload_mapping = cast(Mapping[object, object], payload)
+            frozen = cast(Mapping[str, FrozenJsonValue], freeze_json_value(payload_mapping))
+            return cls(
+                cast(int, seq),
+                cast(str, event_id),
+                cast(str, timestamp_utc),
+                cast(str, batch_id),
+                cast(str, event_type),
+                frozen,
+                cast(int, schema_version),
+            )
+        except (TypeError, ValueError, AppError) as exc:
+            if isinstance(exc, AppError) and exc.code == "journal.corrupt":
+                raise
+            raise AppError("journal.corrupt", {"reason": "event_schema"}) from exc
+
+
+def _invalid_event_types() -> Never:
+    raise TypeError
 
 
 def replay(events: Iterable[JournalEvent]) -> BatchProjection:

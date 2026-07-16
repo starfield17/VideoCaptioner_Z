@@ -24,6 +24,9 @@ def test_source_override_and_writable_layout_are_separate(tmp_path: Path) -> Non
     assert paths.resource_root == resources.resolve()
     assert paths.i18n_resource_dir.is_dir()
     assert all(directory.is_dir() for directory in paths.writable_directories)
+    assert paths.batches_dir.is_dir()
+    assert (paths.artifacts_dir / ".incoming").is_dir()
+    assert (paths.artifacts_dir / "sha256").is_dir()
     assert all(resources not in directory.parents for directory in paths.writable_directories)
 
 
