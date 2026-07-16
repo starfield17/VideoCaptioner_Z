@@ -31,6 +31,9 @@ from captioner.adapters.pipeline.stages import (
     verify_publication,
 )
 from captioner.adapters.process.asyncio_subprocess import AsyncioSubprocessRunner
+from captioner.adapters.subtitles.ass import serialize_bytes as serialize_ass
+from captioner.adapters.subtitles.json_track import serialize as serialize_track_json
+from captioner.adapters.subtitles.webvtt import serialize_bytes as serialize_webvtt
 from captioner.adapters.testing.fault_injector import ScriptedFaultInjector
 from captioner.core.application.durable_pipeline import DurablePipelineService
 from captioner.core.application.run_single import RunSingleService
@@ -38,6 +41,7 @@ from captioner.core.application.stage_executor import EventFactory, StageExecuto
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.journal import replay
 from captioner.core.domain.stage import StageName
+from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig
 from captioner.infrastructure.app_paths import (
     AppPaths,
@@ -85,6 +89,9 @@ def build_run_service(
         transcript_serializer=serialize_transcript,
         subtitle_serializer=serialize_srt,
         temp_root=application_paths.temp_dir,
+        subtitle_json_serializer=serialize_track_json,
+        webvtt_serializer=serialize_webvtt,
+        ass_serializer=serialize_ass,
     )
 
 
@@ -116,10 +123,17 @@ def create_job_config(
         ffmpeg_bin,
         ffprobe_bin,
         {"codec": "pcm_s16le", "sample_rate": 16000, "channels": 1},
-        {"max_duration_ms": 7000, "max_text_units": 84, "hard_gap_ms": 700},
+        SimpleSegmentationConfig().to_policy_config().to_mapping(),
         str(output_dir.expanduser().resolve()),
         overwrite,
-        {stage.value: "1" for stage in StageName},
+        {
+            stage.value: {
+                StageName.SEGMENT.value: "segment-v2",
+                StageName.EXPORT.value: "export-v2",
+                StageName.PUBLISH.value: "publish-v2",
+            }.get(stage.value, "1")
+            for stage in StageName
+        },
     )
 
 
@@ -183,19 +197,17 @@ def build_durable_service(
     )
     engine_config = FasterWhisperConfig(model_ref, device, compute_type, language)
     engine = FasterWhisperEngine(engine_config)
+    policy = SegmentationPolicyConfig.from_mapping(
+        segmentation or SegmentationPolicyConfig().to_mapping()
+    )
     runners = {
         StageName.INSPECT: InspectStage(FFprobeMediaInspector(process, executable=ffprobe_bin)),
         StageName.NORMALIZE: NormalizeStage(
             FFmpegAudioNormalizer(process, executable=ffmpeg_bin), durable
         ),
         StageName.TRANSCRIBE: TranscribeStage(engine, durable),
-        StageName.SEGMENT: SegmentStage(
-            durable,
-            SimpleSegmentationConfig.from_mapping(
-                segmentation or {"max_duration_ms": 7000, "max_text_units": 84, "hard_gap_ms": 700}
-            ),
-        ),
-        StageName.EXPORT: ExportStage(durable),
+        StageName.SEGMENT: SegmentStage(durable, policy),
+        StageName.EXPORT: ExportStage(durable, policy),
         StageName.PUBLISH: PublishStage(durable),
     }
     journal = JsonlJournal(batch_dir / "journal.jsonl")
@@ -228,6 +240,7 @@ def build_durable_service(
             output_dir=Path(job.config.output_dir),
             input_path=Path(job.input_path),
             export_refs=export_refs,
+            publication_version=runners[stage.name].version,
         )
 
     executor.committed_verifier = verify_committed

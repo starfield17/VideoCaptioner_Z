@@ -28,11 +28,14 @@ from captioner.adapters.pipeline.stages import (
     TranscribeStage,
 )
 from captioner.core.domain.artifact import ArtifactRef
+from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.media import AudioArtifact, MediaAsset
 from captioner.core.domain.stage import STAGE_PLAN
+from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack, derive_subtitle_track_id
 from captioner.core.domain.transcript import Transcript
+from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig, segment_transcript
 from captioner.core.ports.asr import ASRCapabilities, TranscriptionRequest
 from captioner.core.ports.stage_runner import StageExecutionContext, StageExecutionRequest
@@ -154,6 +157,13 @@ def test_all_stage_runners_execute_with_durable_inputs(tmp_path: Path) -> None:
             _request(tmp_path, (transcript_ref, track_ref)), _context(tmp_path)
         )
     )
+    assert {item.logical_name for item in exported} == {
+        "final-transcript.json",
+        "final-subtitle.json",
+        "final-subtitle.srt",
+        "final-subtitle.vtt",
+        "final-subtitle.ass",
+    }
     final_refs = tuple(_put(store, item.data or b"", item.logical_name) for item in exported)
     published = asyncio.run(
         PublishStage(store).execute(_request(tmp_path, final_refs), _context(tmp_path))
@@ -208,6 +218,33 @@ def test_export_mid_execute_occurs_between_representations(
     assert order == ["mid_execute", "srt"]
 
 
+def test_export_stage_rejects_reordered_word_assignment(tmp_path: Path) -> None:
+    store = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    transcript = make_transcript(("one ", "two ", "three"))
+    config = SegmentationPolicyConfig()
+    cues = (
+        SubtitleCue("cue-000001", 0, 500, ("word-000002",), "two", None, ("two",)),
+        SubtitleCue("cue-000002", 600, 1_100, ("word-000001",), "one", None, ("one",)),
+        SubtitleCue("cue-000003", 1_200, 1_700, ("word-000003",), "three", None, ("three",)),
+    )
+    track = SubtitleTrack(
+        derive_subtitle_track_id(transcript.id, transcript.language, cues, config.to_mapping()),
+        transcript.id,
+        transcript.language,
+        cues,
+        0,
+        config.signature,
+    )
+    transcript_ref = _put(store, encode_transcript(transcript), "transcript.json")
+    track_ref = _put(store, encode_track(track), "subtitle-track.json")
+    with pytest.raises(AppError, match=r"subtitle\.validation_failed"):
+        asyncio.run(
+            ExportStage(store, config).execute(
+                _request(tmp_path, (transcript_ref, track_ref)), _context(tmp_path)
+            )
+        )
+
+
 def test_publish_mid_execute_occurs_after_first_target_commit(tmp_path: Path) -> None:
     store = ContentAddressedArtifactStore(tmp_path / "artifacts")
     output = tmp_path / "output"
@@ -218,7 +255,7 @@ def test_publish_mid_execute_occurs_after_first_target_commit(tmp_path: Path) ->
     )
     checkpoints: list[str] = []
     result = asyncio.run(
-        PublishStage(store).execute(
+        PublishStage(store, version="publish-v1").execute(
             _request(tmp_path, refs), _context(tmp_path, checkpoints.append)
         )
     )
@@ -226,9 +263,18 @@ def test_publish_mid_execute_occurs_after_first_target_commit(tmp_path: Path) ->
     assert checkpoints == ["mid_execute"]
 
 
-@pytest.mark.parametrize("target_name", ["input.transcript.json", "input.srt"])
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        "input.transcript.json",
+        "input.subtitle.json",
+        "input.srt",
+        "input.vtt",
+        "input.ass",
+    ],
+)
 @pytest.mark.parametrize("overwrite", [False, True])
-def test_publish_replace_then_interrupt_rolls_back_pair(
+def test_publish_replace_then_interrupt_rolls_back_five_targets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target_name: str,
@@ -239,9 +285,16 @@ def test_publish_replace_then_interrupt_rolls_back_pair(
     store = ContentAddressedArtifactStore(tmp_path / "artifacts")
     output = tmp_path / "output"
     output.mkdir()
+    old_bytes = {
+        "input.transcript.json": b"old transcript",
+        "input.subtitle.json": b"old subtitle",
+        "input.srt": b"old srt",
+        "input.vtt": b"old vtt",
+        "input.ass": b"old ass",
+    }
     if overwrite:
-        (output / "input.transcript.json").write_bytes(b"old transcript")
-        (output / "input.srt").write_bytes(b"old srt")
+        for name, data in old_bytes.items():
+            (output / name).write_bytes(data)
     current_config = replace(_config(tmp_path), overwrite=overwrite)
     request = StageExecutionRequest(
         "batch-a",
@@ -250,7 +303,10 @@ def test_publish_replace_then_interrupt_rolls_back_pair(
         current_config,
         (
             _put(store, b"new transcript", "final-transcript.json"),
+            _put(store, b"new subtitle", "final-subtitle.json"),
             _put(store, b"new srt", "final-subtitle.srt"),
+            _put(store, b"new vtt", "final-subtitle.vtt"),
+            _put(store, b"new ass", "final-subtitle.ass"),
         ),
     )
     real_replace = os.replace
@@ -269,10 +325,9 @@ def test_publish_replace_then_interrupt_rolls_back_pair(
     monkeypatch.setattr(os, "replace", replace_then_interrupt)
     with pytest.raises(KeyboardInterrupt):
         asyncio.run(PublishStage(store).execute(request, _context(tmp_path)))
-    if overwrite:
-        assert (output / "input.transcript.json").read_bytes() == b"old transcript"
-        assert (output / "input.srt").read_bytes() == b"old srt"
-    else:
-        assert not (output / "input.transcript.json").exists()
-        assert not (output / "input.srt").exists()
+    for name, data in old_bytes.items():
+        if overwrite:
+            assert (output / name).read_bytes() == data
+        else:
+            assert not (output / name).exists()
     assert not list(output.glob("*.tmp"))

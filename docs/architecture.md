@@ -1,6 +1,6 @@
 # Architecture
 
-Phase 2 preserves the following dependency direction:
+Phase 2 and Phase 3 preserve the following dependency direction:
 
 ```text
 GUI / CLI
@@ -17,10 +17,12 @@ Adapters / infrastructure
 The presentation layers select and render commands. `core.application.run_single`
 orchestrates one input without knowing concrete adapters. `core.domain` contains
 immutable, localization-neutral media, transcript, subtitle, execution and
-error values. `core.policies` contains deterministic segmentation. `core.ports`
-defines media, process, ASR, and artifact boundaries, while `adapters/*` owns
-FFprobe, FFmpeg, Faster Whisper, exporters and local persistence. GUI and CLI
-are not allowed to import each other, and Core cannot depend on adapters or SDKs.
+error values. `core.policies` contains Unicode metrics, reading-speed,
+protected-span, line-breaking, and deterministic segmentation policies.
+`core.ports` defines media, process, ASR, artifact, and subtitle-exporter
+boundaries, while `adapters/*` owns FFprobe, FFmpeg, Faster Whisper, subtitle
+format codecs and local persistence. GUI and CLI are not allowed to import
+each other, and Core cannot depend on adapters or SDKs.
 
 `bootstrap.py` is the explicit composition root. It creates one process runner,
 one FFprobe/FFmpeg pair, one Faster Whisper engine, one local artifact store per
@@ -33,12 +35,21 @@ The durable pipeline is:
 inspect → normalize → transcribe → segment → export → publish
 ```
 
-The application serializes both final artifacts before staging them in their
-target directories. It checks its `ExecutionContext` before the first commit,
-between commits, and before returning success. A failure or cancellation
+Segment decodes the Transcript, canonicalizes Words, solves cue boundaries,
+breaks lines, validates an immutable `SubtitleTrack`, and writes
+`subtitle-track.json`. Export validates the Track again and serializes the
+Transcript plus the Track as JSON, SRT, WebVTT, and ASS. Publish stages all
+five user-facing targets in deterministic logical-name order. It checks its
+`ExecutionContext` before the first commit, between commits, and before
+returning success. A failure or cancellation
 restores every output committed by the current invocation, including previous
 bytes in overwrite mode; this is an in-process transaction, not durable crash
 recovery.
+
+Subtitle processing is a pure deterministic function of the Transcript, the
+canonical policy configuration, and exporter versions. It uses grapheme-aware
+Unicode metrics and exact integer arithmetic; it does not use an LLM,
+translation, current time, locale formatting, or platform newline behavior.
 
 The Faster Whisper adapter keeps `model_ref` (the SDK loading reference)
 separate from `model_identity` (the stable public value). Named models use a
@@ -61,6 +72,6 @@ attempt events, CAS import and verification, the authoritative
 immutable. Recovery repairs a stale Manifest, records open attempts as
 interrupted, verifies artifacts, and invalidates only the affected suffix.
 
-Phase 2 has sequential Jobs and one ASR engine per active Batch. It has no GUI
+Phase 2/3 has sequential Jobs and one ASR engine per active Batch. It has no GUI
 workflow, parallel scheduler, LLM, translation, forced alignment, distributed
-locking, artifact GC, runtime installer, or release workflow.
+locking, artifact GC, runtime installer, muxing, or release workflow.

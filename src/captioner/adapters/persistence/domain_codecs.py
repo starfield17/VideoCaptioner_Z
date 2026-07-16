@@ -1,8 +1,9 @@
-"""Strict deterministic JSON codecs for Phase 2 Stage artifacts."""
+"""Strict deterministic JSON codecs for Phase 2/3 Stage artifacts."""
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import cast
 
@@ -11,10 +12,16 @@ from captioner.core.domain.errors import AppError
 from captioner.core.domain.media import AudioArtifact, MediaAsset
 from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
 from captioner.core.domain.result import JsonValue, thaw_json_value
-from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack
+from captioner.core.domain.subtitle import (
+    LEGACY_POLICY_SIGNATURE,
+    SubtitleCue,
+    SubtitleTrack,
+)
 from captioner.core.domain.transcript import Transcript, TranscriptSegment, WordToken
 
 SCHEMA_VERSION = 1
+TRACK_SCHEMA_VERSION = 2
+_POLICY_SIGNATURE = re.compile(r"^policy-[0-9a-f]{64}$")
 
 
 def encode_json(value: object) -> bytes:
@@ -23,17 +30,37 @@ def encode_json(value: object) -> bytes:
             value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
         )
         + "\n"
-    ).encode()
+    ).encode("utf-8")
 
 
 def decode_json(data: bytes) -> dict[str, object]:
     try:
-        value = cast(object, json.loads(data.decode("utf-8")))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = cast(
+            object,
+            json.loads(
+                data.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_json_constant,
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise AppError("artifact.codec_invalid", {"reason": "json"}) from exc
     if not isinstance(value, dict):
         raise AppError("artifact.codec_invalid", {"reason": "root"})
     return cast(dict[str, object], value)
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_json_key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non_finite_json_value:{value}")
 
 
 def encode_media(asset: MediaAsset) -> bytes:
@@ -156,14 +183,17 @@ def decode_transcript(data: bytes) -> Transcript:
 
 
 def encode_track(track: SubtitleTrack) -> bytes:
+    if _POLICY_SIGNATURE.fullmatch(track.policy_signature) is None:
+        raise AppError("artifact.codec_invalid", {"reason": "policy_signature"})
     return encode_json(
         {
-            "schema_version": 1,
+            "schema_version": TRACK_SCHEMA_VERSION,
             "subtitle_track": {
                 "id": track.id,
                 "source_transcript_id": track.source_transcript_id,
                 "language": track.language,
                 "revision": track.revision,
+                "policy_signature": track.policy_signature,
                 "cues": [
                     {
                         "id": cue.id,
@@ -183,8 +213,32 @@ def encode_track(track: SubtitleTrack) -> bytes:
 
 def decode_track(data: bytes) -> SubtitleTrack:
     root = decode_json(data)
-    raw = _object(root, "subtitle_track", {"schema_version", "subtitle_track"})
-    _fields(raw, {"id", "source_transcript_id", "language", "revision", "cues"})
+    _fields(root, {"schema_version", "subtitle_track"})
+    schema_version = root.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in {1, TRACK_SCHEMA_VERSION}
+        or not isinstance(root.get("subtitle_track"), dict)
+    ):
+        raise AppError("artifact.codec_invalid", {"reason": "subtitle_track"})
+    raw = cast(dict[str, object], root["subtitle_track"])
+    legacy_fields = {"id", "source_transcript_id", "language", "revision", "cues"}
+    current_fields = {*legacy_fields, "policy_signature"}
+    expected_fields = legacy_fields if schema_version == 1 else current_fields
+    _fields(raw, expected_fields)
+    cue_fields = {
+        "id",
+        "start_ms",
+        "end_ms",
+        "source_word_ids",
+        "source_text",
+        "translated_text",
+        "lines",
+    }
+    raw_cues = _objects(raw, "cues")
+    for cue in raw_cues:
+        _fields(cue, cue_fields)
     cues = tuple(
         SubtitleCue(
             _str(item, "id"),
@@ -195,14 +249,17 @@ def decode_track(data: bytes) -> SubtitleTrack:
             _str_or_none(item, "translated_text"),
             tuple(_strings(item, "lines")),
         )
-        for item in _objects(raw, "cues")
+        for item in raw_cues
     )
     return SubtitleTrack(
         _str(raw, "id"),
         _str(raw, "source_transcript_id"),
-        _str(raw, "language"),
+        _str_or_none(raw, "language"),
         cues,
         _int(raw, "revision"),
+        LEGACY_POLICY_SIGNATURE
+        if schema_version == 1
+        else _policy_signature(raw, "policy_signature"),
     )
 
 
@@ -262,6 +319,13 @@ def _fields(value: Mapping[str, object], expected: set[str]) -> None:
 def _str(value: Mapping[str, object], key: str) -> str:
     item = value.get(key)
     if not isinstance(item, str):
+        raise AppError("artifact.codec_invalid", {"reason": key})
+    return item
+
+
+def _policy_signature(value: Mapping[str, object], key: str) -> str:
+    item = value.get(key)
+    if not isinstance(item, str) or _POLICY_SIGNATURE.fullmatch(item) is None:
         raise AppError("artifact.codec_invalid", {"reason": key})
     return item
 

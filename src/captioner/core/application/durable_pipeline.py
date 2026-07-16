@@ -18,6 +18,7 @@ from captioner.core.domain.job import JobConfig, JobProjection, JobState
 from captioner.core.domain.journal import JournalEvent, apply_event, replay
 from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
 from captioner.core.domain.stage import STAGE_PLAN, StageName, StageState
+from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.ports.journal import JournalPort
 from captioner.core.ports.manifest import ManifestStatus, ManifestStorePort
 from captioner.core.ports.stage_runner import StageRunner
@@ -89,7 +90,13 @@ class DurablePipelineService:
             raise AppError("batch.config_inconsistent", {"reason": "runtime"})
         targets: set[str] = set()
         for _, input_path, config in jobs:
-            for suffix in (".transcript.json", ".srt"):
+            for suffix in (
+                ".transcript.json",
+                ".subtitle.json",
+                ".srt",
+                ".vtt",
+                ".ass",
+            ):
                 target = os.path.normcase(
                     str(Path(config.output_dir) / f"{input_path.stem}{suffix}")
                 )
@@ -588,9 +595,22 @@ def _cache_config(
             "compute_type": config.compute_type,
         }
     elif stage is StageName.SEGMENT:
-        values = {"segmentation": config.segmentation}
+        try:
+            segmentation = SegmentationPolicyConfig.from_mapping(config.segmentation).to_mapping()
+        except AppError:
+            # Test-only legacy runners use the historical opaque ``limit``
+            # mapping. Do not hide malformed production policy mappings.
+            if set(config.segmentation) != {"limit"}:
+                raise
+            segmentation = dict(config.segmentation)
+        values = {"policy_version": "segment-v2", "segmentation": segmentation}
     elif stage is StageName.EXPORT:
-        values = {"schema_version": 1}
+        values = {
+            "track_json": "track-json-v2",
+            "srt": "srt-v2",
+            "webvtt": "webvtt-v1",
+            "ass": "ass-v1",
+        }
     else:
         values = {"output_dir": config.output_dir, "overwrite": config.overwrite}
     return cast(Mapping[str, FrozenJsonValue], freeze_json_value(values))

@@ -1,0 +1,8 @@
+1
+00:00:00,000 --> 00:00:03,550
+This is a very long sentence without a convenient
+
+2
+00:00:03,600 --> 00:00:07,950
+sentence boundary so duration and
+reading speed must guide the cues

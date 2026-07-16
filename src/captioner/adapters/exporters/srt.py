@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import re
+
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.subtitle import SubtitleTrack
+from captioner.core.ports.subtitle_exporter import ParsedCue, ParsedSubtitle
+
+_TIMESTAMP = re.compile(r"^(\d{2,}):(\d{2}):(\d{2}),(\d{3})$")
 
 
 def _validate_integer_timestamp(value: object) -> None:
@@ -52,3 +57,52 @@ def serialize(track: SubtitleTrack) -> str:
 
 def serialize_bytes(track: SubtitleTrack) -> bytes:
     return serialize(track).encode("utf-8")
+
+
+def parse(data: bytes | str) -> ParsedSubtitle:
+    text = _decode(data)
+    if "\r" in text or not text.endswith("\n"):
+        raise AppError("export.srt_invalid", {"reason": "line_endings"})
+    body = text[:-1]
+    if not body:
+        return ParsedSubtitle(())
+    blocks = body.split("\n\n")
+    cues: list[ParsedCue] = []
+    previous_end = -1
+    for number, block in enumerate(blocks, start=1):
+        lines = block.split("\n")
+        if len(lines) < 3 or lines[0] != str(number) or " --> " not in lines[1]:
+            raise AppError("export.srt_invalid", {"reason": "cue"})
+        start, end = _parse_range(lines[1])
+        cue_lines = tuple(lines[2:])
+        if len(cue_lines) > 2 or any(not line.strip() for line in cue_lines):
+            raise AppError("export.srt_invalid", {"reason": "cue_text"})
+        if start < previous_end or end <= start:
+            raise AppError("export.srt_invalid", {"reason": "cue_order"})
+        cues.append(ParsedCue(start, end, cue_lines))
+        previous_end = end
+    return ParsedSubtitle(tuple(cues))
+
+
+def _decode(data: bytes | str) -> str:
+    if isinstance(data, bytes):
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise AppError("export.srt_invalid", {"reason": "utf8"}) from exc
+    return data
+
+
+def _parse_range(value: str) -> tuple[int, int]:
+    start_text, end_text = value.split(" --> ", maxsplit=1)
+    return _parse_timestamp(start_text), _parse_timestamp(end_text)
+
+
+def _parse_timestamp(value: str) -> int:
+    match = _TIMESTAMP.fullmatch(value)
+    if match is None:
+        raise AppError("export.srt_invalid", {"reason": "timestamp"})
+    hours, minutes, seconds, millis = (int(item) for item in match.groups())
+    if minutes >= 60 or seconds >= 60:
+        raise AppError("export.srt_invalid", {"reason": "timestamp"})
+    return ((hours * 60 + minutes) * 60 + seconds) * 1_000 + millis

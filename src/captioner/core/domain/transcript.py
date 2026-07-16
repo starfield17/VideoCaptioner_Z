@@ -32,7 +32,7 @@ def _integer_ms(value: object, field: str) -> None:
 def _time_range(start_ms: int, end_ms: int, field: str) -> None:
     _integer_ms(start_ms, f"{field}.start_ms")
     _integer_ms(end_ms, f"{field}.end_ms")
-    if start_ms < 0 or end_ms <= start_ms:
+    if start_ms < 0 or end_ms < start_ms:
         raise AppError(
             "transcript.invalid",
             {"field": field, "reason": "timestamp", "start_ms": start_ms, "end_ms": end_ms},
@@ -126,11 +126,6 @@ class Transcript:
             raise AppError("transcript.invalid", {"field": "words", "reason": "duplicate_ids"})
         if len(set(segment_ids)) != len(segment_ids):
             raise AppError("transcript.invalid", {"field": "segments", "reason": "duplicate_ids"})
-        for previous, current in pairwise(words):
-            if current.start_ms < previous.start_ms or current.start_ms < previous.end_ms:
-                raise AppError(
-                    "transcript.invalid", {"field": "words", "reason": "overlap_or_order"}
-                )
         for previous, current in pairwise(segments):
             if current.start_ms < previous.start_ms or current.start_ms < previous.end_ms:
                 raise AppError(

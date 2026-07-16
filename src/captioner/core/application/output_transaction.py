@@ -1,4 +1,4 @@
-"""Shared cancellation-safe transaction for a pair of user output files."""
+"""Shared cancellation-safe transaction for a deterministic output set."""
 
 from __future__ import annotations
 
@@ -11,13 +11,15 @@ from captioner.core.domain.execution import ExecutionContext
 from captioner.core.ports.artifact_store import ArtifactStorePort, StagedArtifact
 
 
-def commit_output_pair(
+def commit_output_set(
     store: ArtifactStorePort,
-    outputs: tuple[tuple[str, bytes], tuple[str, bytes]],
+    outputs: tuple[tuple[str, bytes], ...],
     *,
     overwrite: bool,
     context: ExecutionContext,
-) -> tuple[Path, Path]:
+) -> tuple[Path, ...]:
+    if not outputs or len({key for key, _ in outputs}) != len(outputs):
+        raise AppError("output.path_invalid", {"reason": "duplicate_output"})
     previous = {key: store.read_bytes(key) if store.exists(key) else None for key, _ in outputs}
     staged: list[StagedArtifact] = []
     committed: list[str] = []
@@ -34,7 +36,7 @@ def commit_output_pair(
         if cleanup_error is not None:
             _raise_cleanup_error(cleanup_error)
         context.raise_if_cancelled()
-        return paths[0], paths[1]
+        return tuple(paths)
     except BaseException as original:
         _record_committed(staged, committed)
         rollback_error = _rollback(store, committed, previous)
@@ -95,3 +97,15 @@ def _rollback(
     except BaseException as exc:
         return exc
     return None
+
+
+def commit_output_pair(
+    store: ArtifactStorePort,
+    outputs: tuple[tuple[str, bytes], tuple[str, bytes]],
+    *,
+    overwrite: bool,
+    context: ExecutionContext,
+) -> tuple[Path, Path]:
+    """Compatibility wrapper for the Phase 2 two-output API."""
+    paths = commit_output_set(store, outputs, overwrite=overwrite, context=context)
+    return paths[0], paths[1]

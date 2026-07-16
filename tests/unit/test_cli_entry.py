@@ -53,3 +53,12 @@ def test_default_command_and_invalid_locale(capsys: pytest.CaptureFixture[str]) 
     assert "Locale: en" in capsys.readouterr().out
     assert main(["--lang", "fr-FR", "doctor"]) == 2
     assert "locale_unsupported" in capsys.readouterr().err
+
+
+def test_subtitle_corpus_cli_runs_all_fixtures(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["subtitle-corpus", "tests/fixtures/transcripts", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["fixture_count"] == 14
+    assert payload["passed"] == 14
+    assert payload["failed"] == 0
+    assert payload["errors"] == []

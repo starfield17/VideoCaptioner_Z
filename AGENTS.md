@@ -16,8 +16,9 @@ This file is the repository-local contract for humans and coding agents.
   CLI help, GUI startup, Core, or the default Nuitka Core App.
 - Domain timestamps are integer milliseconds. SDK float seconds are converted
   once at the adapter boundary.
-- The final SRT is committed only after ASR, domain validation, segmentation,
-  and both exports succeed. Exporters do not mutate domain objects.
+- The final subtitle outputs are committed only after ASR, deterministic
+  segmentation, domain validation, and all five exports succeed. Exporters do
+  not mutate domain objects.
 - Output artifacts are staged and fsynced before commit; cancellation or failure
   must roll back every current-run commit and restore overwrite targets.
 - Domain JSON metadata is recursively frozen; exporters must thaw fresh mutable
@@ -32,7 +33,23 @@ This file is the repository-local contract for humans and coding agents.
 - Coding agents must not automatically batch-update golden files.
 - Every patch must report the tests run and known limitations.
 
-Phase 2 has a fixed sequential six-Stage durable pipeline. Journal is
-authoritative, Manifest is rebuildable, and Stage commit cannot precede durable
-artifact verification. It still has no GUI workflow, parallel execution, LLM,
-translation, alignment, distributed workers, runtime installation, or release behavior.
+Phase 2 has a fixed sequential six-Stage durable pipeline. Phase 3 adds only
+deterministic subtitle policies, validation, and SRT/WebVTT/ASS/JSON export.
+Journal is authoritative, Manifest is rebuildable, and Stage commit cannot
+precede durable artifact verification. The repository still has no GUI
+workflow, parallel execution, LLM, translation, alignment, distributed
+workers, runtime installation, muxing, or release behavior.
+
+Phase 3 subtitle processing is deterministic and has no legacy greedy runtime
+path: all supported segmentation configurations execute the same bounded DP
+solver. Current schema-2 SubtitleTracks require a policy signature bound to the
+active policy, a verified Track ID, canonical Word order, and contiguous Cue
+spans. ASS serialization quantizes the complete ordered track and rejects
+timings that cannot be represented within its 10 ms tolerance. The strict
+`publish-v2` receipt contains exactly the five transcript/subtitle targets.
+
+The `subtitle-corpus` command is a normal application command that performs
+the deterministic subtitle pipeline through source or Nuitka builds without
+ASR, FFmpeg, network or model access. Golden manifests are enforced by tests;
+golden updates require explicit human-review acknowledgement and must not be
+performed automatically by pytest or CI.

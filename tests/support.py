@@ -5,8 +5,10 @@ from pathlib import Path
 from captioner.core.domain.media import AudioArtifact, MediaAsset
 from captioner.core.domain.result import JsonValue
 from captioner.core.domain.transcript import Transcript, TranscriptSegment, WordToken
+from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 
 HASH = "a" * 64
+POLICY_SIGNATURE = SegmentationPolicyConfig().signature
 
 
 def make_media(path: Path, *, duration_ms: int = 2_000, audio_stream_index: int = 1) -> MediaAsset:

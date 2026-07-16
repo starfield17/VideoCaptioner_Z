@@ -17,18 +17,21 @@
   containers without exposing internal mappings or tuples.
 - Every Transcript word is assigned to exactly one TranscriptSegment, and every
   referenced word lies within its segment time range.
-- SRT is committed only after ASR, domain validation, segmentation and export
-  succeed. Both output files are staged before either is committed.
-- A cancelled one-shot run leaves no newly committed Transcript or SRT;
+- All five subtitle outputs are committed only after ASR, deterministic
+  segmentation, domain validation and export succeed. Every output is staged
+  before any output is committed.
+- A cancelled one-shot run leaves no newly committed Transcript or subtitle
+  output;
   overwrite rollback restores the previous bytes.
 - Public model identity is stable and never contains a machine-specific local
   model path.
 - Malformed non-empty Faster Whisper segments are never silently discarded;
   blank segments are ignored only when they contain no words.
 - Exporters never mutate Domain objects.
-- The same Transcript and segmentation configuration produce deterministic cue
-  IDs, JSON bytes and SRT bytes. Simple segmentation prefers punctuation or
-  silence only when a candidate must be split.
+- The same Transcript, canonical policy configuration and exporter versions
+  produce deterministic cue IDs, Track IDs and all exported bytes. Simple
+  segmentation is only a legacy compatibility facade; Phase 3 uses bounded
+  dynamic programming.
 - Phase 1 has no LLM; Faster Whisper is optional and loaded once per engine.
 - Journal is the durable source of truth; Manifest is only a rebuildable projection.
 - `stage.committed` is the linearization point and references only verified CAS artifacts.
@@ -56,6 +59,33 @@
   failure event.
 - A Batch uses one common runtime configuration and distinct publication targets.
 - Failed and cancelled Jobs require an explicit `job.retry_requested` before retry.
-- Publication receipts are strict and reverify both final target files.
+- Publication receipts are strict and reverify the exact five final target files.
 - Publication target verification performs one complete regular-file, size, and hash pass; target
   races and I/O failures are exposed as `output.publication_invalid`.
+
+Phase 3 subtitle invariants:
+
+- Every source Word is assigned to exactly one Cue.
+- Final Cue timing is ordered, positive and non-overlapping even when source
+  Word timestamps overlap.
+- Segmentation and export are pure deterministic functions of Transcript,
+  canonical policy configuration and exporter versions.
+- Exporter execution never modifies `SubtitleTrack`.
+- Golden files cannot be modified without an explicit human-review
+  acknowledgement.
+- No LLM participates in Phase 3 subtitle segmentation, validation, line
+  breaking or export.
+- All supported segmentation configuration forms execute the same current
+  deterministic dynamic-programming policy; no legacy greedy runtime path remains.
+- A schema-2 SubtitleTrack is valid only when its policy signature matches the
+  active canonical policy configuration.
+- Track identity and language are bound to the source Transcript and active policy.
+- Flattening Cue Word assignments yields the complete canonical Transcript Word
+  order exactly, and every Cue owns one contiguous canonical Word span.
+- ASS export never emits overlapping Dialogue events; unrepresentable timing
+  sequences fail with `export.ass_unrepresentable`.
+- The committed golden manifest is enforced, including its exact file set,
+  policy signature, exporter versions and SHA-256 values.
+- `publish-v2` receipts contain the exact five published target formats.
+- Source and packaged `subtitle-corpus` execution performs actual JSON, SRT,
+  WebVTT and ASS round trips without ASR, models or network access.

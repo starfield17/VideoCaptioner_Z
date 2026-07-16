@@ -1,9 +1,11 @@
 # Captioner
 
-Captioner is a durable batch subtitle-generation application. Phase 2 runs one
-or more inputs through inspect, normalize, transcribe, segment, export, and
-publish Stages. An fsynced Journal is the source of truth; a rebuildable
-Manifest and verified content-addressed artifacts support resume and retry.
+Captioner is a durable batch subtitle-generation application. The Phase 2
+pipeline runs one or more inputs through inspect, normalize, transcribe,
+segment, export, and publish Stages. Phase 3 makes segmentation, line breaking,
+validation, and subtitle export deterministic without an LLM. An fsynced
+Journal is the source of truth; a rebuildable Manifest and verified
+content-addressed artifacts support resume and retry.
 
 ## Local commands
 
@@ -34,6 +36,20 @@ captioner retry batch-... --job job-000001 --stage transcribe --json
 captioner cancel batch-... --job job-000001 --json
 ```
 
+Phase 3's deterministic fixture command runs without ASR, FFmpeg, models or
+network access. It performs DP segmentation, Track validation, canonical JSON
+decode/re-encode, and SRT/WebVTT/ASS round trips:
+
+```bash
+uv run captioner subtitle-corpus tests/fixtures/transcripts --json
+./dist/captioner/captioner --cli subtitle-corpus tests/fixtures/transcripts --json
+```
+
+The committed subtitle golden manifest is strict: it binds the complete fixture
+file set, policy signature, exporter versions and every file SHA-256. Goldens
+can be changed only after reviewing the updater's proposed semantic diff and
+passing `--accept PHASE3_GOLDENS_REVIEWED` explicitly.
+
 For Linux CUDA 12 systems, install the reproducible optional runtime and run
 the guarded manual diagnostic:
 
@@ -49,10 +65,20 @@ child `LD_LIBRARY_PATH`, reports Faster Whisper/CTranslate2 versions, runs
 `ldd` diagnostics, and refuses to claim CUDA success with unresolved libraries.
 CUDA libraries are not included in the default installation or Nuitka app.
 
-The run writes `<source-stem>.transcript.json` and `<source-stem>.srt` only
-after successful transcription, validation, and a staged atomic artifact
-transaction. Cancellation or failure rolls back outputs committed by the
-current run; `--overwrite` restores the previous bytes when rollback is needed.
+The durable Export and Publish Stages write these five deterministic targets:
+
+```text
+<source-stem>.transcript.json
+<source-stem>.subtitle.json
+<source-stem>.srt
+<source-stem>.vtt
+<source-stem>.ass
+```
+
+They are produced only after successful transcription, deterministic cue
+segmentation, Track validation, and a staged atomic artifact transaction.
+Cancellation or failure rolls back outputs committed by the current run;
+`--overwrite` restores the previous bytes when rollback is needed.
 Domain JSON metadata is recursively immutable, and public model identities do
 not contain machine-specific local model paths.
 
@@ -78,3 +104,29 @@ acquire the Batch writer lease before repair. At every complete Journal event
 boundary, all Jobs in a Batch share one runtime configuration signature; a
 Batch-wide override is one `batch.config_updated` event. Failed or cancelled
 Jobs require explicit `retry`, which appends `job.retry_requested`.
+
+## Deterministic subtitle processing
+
+The subtitle flow is:
+
+```text
+Transcript → canonical Word order → bounded dynamic programming
+→ display-width line breaking → SubtitleTrack validation
+→ canonical JSON, SRT, WebVTT and ASS
+```
+
+It uses NFC text normalization, Unicode grapheme clusters, `wcwidth` display
+columns, exact integer CPS arithmetic, protected numeric spans, punctuation and
+silence boundaries, and documented deterministic tie-breaks. It does not call
+an LLM, translation model, network service, clock, locale formatter, or
+filesystem iteration order.
+
+Reviewed corpus goldens are checked byte-for-byte. Updating them requires the
+explicit acknowledgement `PHASE3_GOLDENS_REVIEWED`; normal tests never rewrite
+goldens:
+
+```bash
+uv run python scripts/run_subtitle_corpus.py tests/fixtures/transcripts
+uv run python scripts/update_subtitle_goldens.py \
+  --accept PHASE3_GOLDENS_REVIEWED
+```

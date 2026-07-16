@@ -9,9 +9,10 @@ bad Stage and its downstream suffix, removes stale workspaces, and continues.
 incomplete final fragment, and inspects Manifest as `current`, `missing`,
 `stale`, `ahead`, `projection_mismatch`, or `invalid`. Only a writer holding
 the Batch lease may repair Journal tails or rewrite a Manifest. It separately
-verifies each committed CAS blob, then verifies the Publish receipt and both
-canonical target files (including target hash, size, regular-file and symlink
-checks). Journal state remains visible even when `integrity` is `invalid`.
+verifies each committed CAS blob, then verifies the Publish receipt and all
+five canonical target files (including target hash, size, regular-file and
+symlink checks). Journal state remains visible even when `integrity` is
+`invalid`.
 
 When recovery finds multiple bad Stage artifacts, it first records every bad
 `ArtifactRef` and removes/quarantines only those exact hash paths. A healthy

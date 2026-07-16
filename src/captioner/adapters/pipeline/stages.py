@@ -20,11 +20,16 @@ from captioner.adapters.persistence.domain_codecs import (
     encode_transcript,
 )
 from captioner.adapters.persistence.local_artifact_store import LocalArtifactStore
-from captioner.core.application.output_transaction import commit_output_pair
+from captioner.adapters.subtitles.ass import serialize_bytes as serialize_ass
+from captioner.adapters.subtitles.json_track import serialize as serialize_track_json
+from captioner.adapters.subtitles.webvtt import serialize_bytes as serialize_webvtt
+from captioner.core.application.output_transaction import commit_output_set
 from captioner.core.domain.artifact import ArtifactRef
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
 from captioner.core.domain.stage import StageName
+from captioner.core.domain.subtitle_validation import validate_subtitle_track
+from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig, segment_transcript
 from captioner.core.ports.asr import ASREngine, TranscriptionRequest
 from captioner.core.ports.durable_artifact_store import DurableArtifactStorePort
@@ -33,6 +38,14 @@ from captioner.core.ports.stage_runner import (
     ProducedArtifact,
     StageExecutionContext,
     StageExecutionRequest,
+)
+
+_PHASE3_EXPORT_NAMES = (
+    "final-transcript.json",
+    "final-subtitle.json",
+    "final-subtitle.srt",
+    "final-subtitle.vtt",
+    "final-subtitle.ass",
 )
 
 
@@ -110,9 +123,9 @@ class TranscribeStage:
 @dataclass(slots=True)
 class SegmentStage:
     artifacts: DurableArtifactStorePort
-    config: SimpleSegmentationConfig
+    config: SegmentationPolicyConfig | SimpleSegmentationConfig
     name: StageName = StageName.SEGMENT
-    version: str = "segment-v1"
+    version: str = "segment-v2"
 
     async def execute(
         self, request: StageExecutionRequest, context: StageExecutionContext
@@ -133,6 +146,10 @@ class SegmentStage:
             self.config,
             progress=midpoint,
         )
+        report = validate_subtitle_track(track, transcript, _policy_config(self.config))
+        if not report.is_valid:
+            first = next(issue for issue in report.issues if issue.severity.value == "error")
+            raise AppError("subtitle.validation_failed", {"reason": first.code})
         return (
             ProducedArtifact(
                 "subtitle-track-json",
@@ -146,17 +163,27 @@ class SegmentStage:
 @dataclass(slots=True)
 class ExportStage:
     artifacts: DurableArtifactStorePort
+    config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
     name: StageName = StageName.EXPORT
-    version: str = "export-v1"
+    version: str = "export-v2"
 
     async def execute(
         self, request: StageExecutionRequest, context: StageExecutionContext
     ) -> tuple[ProducedArtifact, ...]:
         context.execution.raise_if_cancelled()
-        transcript_bytes = self.artifacts.read_bytes(_ref(request, "transcript.json"))
+        transcript = decode_transcript(self.artifacts.read_bytes(_ref(request, "transcript.json")))
         track = decode_track(self.artifacts.read_bytes(_ref(request, "subtitle-track.json")))
+        config = _policy_config(self.config)
+        report = validate_subtitle_track(track, transcript, config)
+        if not report.is_valid:
+            first = next(issue for issue in report.issues if issue.severity.value == "error")
+            raise AppError("subtitle.validation_failed", {"reason": first.code})
+        transcript_bytes = encode_transcript(transcript)
         context.checkpoint("mid_execute")
+        track_json = serialize_track_json(track)
         subtitle_bytes = serialize_srt(track)
+        webvtt_bytes = serialize_webvtt(track)
+        ass_bytes = serialize_ass(track)
         return (
             ProducedArtifact(
                 "final-transcript-json",
@@ -165,10 +192,28 @@ class ExportStage:
                 data=transcript_bytes,
             ),
             ProducedArtifact(
+                "final-subtitle-json",
+                "application/json",
+                "final-subtitle.json",
+                data=track_json,
+            ),
+            ProducedArtifact(
                 "final-subtitle-srt",
                 "application/x-subrip",
                 "final-subtitle.srt",
                 data=subtitle_bytes,
+            ),
+            ProducedArtifact(
+                "final-subtitle-vtt",
+                "text/vtt",
+                "final-subtitle.vtt",
+                data=webvtt_bytes,
+            ),
+            ProducedArtifact(
+                "final-subtitle-ass",
+                "text/x-ass",
+                "final-subtitle.ass",
+                data=ass_bytes,
             ),
         )
 
@@ -177,26 +222,26 @@ class ExportStage:
 class PublishStage:
     artifacts: DurableArtifactStorePort
     name: StageName = StageName.PUBLISH
-    version: str = "publish-v1"
+    version: str = "publish-v2"
 
     async def execute(
         self, request: StageExecutionRequest, context: StageExecutionContext
     ) -> tuple[ProducedArtifact, ...]:
         context.execution.raise_if_cancelled()
-        transcript_ref = _ref(request, "final-transcript.json")
-        subtitle_ref = _ref(request, "final-subtitle.srt")
-        stem = request.input_path.stem
-        targets = ((f"{stem}.transcript.json", transcript_ref), (f"{stem}.srt", subtitle_ref))
+        export_refs = tuple(
+            ref for ref in request.input_artifacts if ref.logical_name.startswith("final-")
+        )
+        target_specs = _publication_specs(
+            request.input_path, export_refs, publication_version=self.version
+        )
+        targets = tuple((target_name, ref) for _, target_name, ref in target_specs)
         store = LocalArtifactStore(Path(request.config.output_dir))
         if not all(
             _published_matches(Path(request.config.output_dir) / key, ref) for key, ref in targets
         ):
-            commit_output_pair(
+            commit_output_set(
                 store,
-                (
-                    (targets[0][0], self.artifacts.read_bytes(targets[0][1])),
-                    (targets[1][0], self.artifacts.read_bytes(targets[1][1])),
-                ),
+                tuple((key, self.artifacts.read_bytes(ref)) for key, ref in targets),
                 overwrite=request.config.overwrite or request.recovery,
                 context=context.execution,
             )
@@ -207,7 +252,7 @@ class PublishStage:
             hashlib.sha256("".join(ref.sha256 for _, ref in targets).encode()).hexdigest(),
             tuple(
                 PublishedTarget(
-                    str((Path(request.config.output_dir) / key).resolve()),
+                    str(_target_path(Path(request.config.output_dir), key)),
                     ref.sha256,
                     ref.size_bytes,
                     key,
@@ -264,29 +309,25 @@ def verify_publication(
     output_dir: Path,
     input_path: Path,
     export_refs: tuple[ArtifactRef, ...],
+    publication_version: str = "publish-v2",
 ) -> None:
     receipt = decode_publication_receipt(receipt_bytes)
-    expected_names = ("final-transcript.json", "final-subtitle.srt")
-    export_by_name = {ref.logical_name: ref for ref in export_refs}
-    if len(export_by_name) != len(export_refs) or set(export_by_name) != set(expected_names):
-        raise AppError("output.publication_invalid", {"reason": "export_refs"})
+    target_specs = _publication_specs(
+        input_path, export_refs, publication_version=publication_version
+    )
     expected_generation = hashlib.sha256(
-        "".join(export_by_name[name].sha256 for name in expected_names).encode()
+        "".join(ref.sha256 for _, _, ref in target_specs).encode()
     ).hexdigest()
     expected_targets = {
-        str((output_dir / f"{input_path.stem}.transcript.json").resolve()): (
-            export_by_name["final-transcript.json"],
-            f"{input_path.stem}.transcript.json",
-        ),
-        str((output_dir / f"{input_path.stem}.srt").resolve()): (
-            export_by_name["final-subtitle.srt"],
-            f"{input_path.stem}.srt",
-        ),
+        str(_target_path(output_dir, target_name)): (ref, target_name)
+        for _, target_name, ref in target_specs
     }
     if (
         receipt.output_generation != expected_generation
         or len(receipt.targets) != len(expected_targets)
         or {target.path for target in receipt.targets} != set(expected_targets)
+        or tuple(target.logical_name for target in receipt.targets)
+        != tuple(target_name for _, target_name, _ in target_specs)
     ):
         raise AppError("output.publication_invalid", {"reason": "receipt"})
     for target in receipt.targets:
@@ -300,3 +341,53 @@ def verify_publication(
             raise AppError("output.publication_invalid", {"reason": "target_metadata"})
         path = Path(target.path)
         _verify_published_target(path, expected[0], target.logical_name)
+
+
+def _policy_config(
+    config: SegmentationPolicyConfig | SimpleSegmentationConfig | None,
+) -> SegmentationPolicyConfig:
+    if config is None:
+        return SegmentationPolicyConfig()
+    if isinstance(config, SimpleSegmentationConfig):
+        return config.to_policy_config()
+    return config
+
+
+def _publication_specs(
+    input_path: Path,
+    export_refs: tuple[ArtifactRef, ...],
+    *,
+    publication_version: str,
+) -> tuple[tuple[str, str, ArtifactRef], ...]:
+    if any(not ref.logical_name.startswith("final-") for ref in export_refs):
+        raise AppError("output.publication_invalid", {"reason": "export_refs"})
+    export_by_name = {ref.logical_name: ref for ref in export_refs}
+    if len(export_by_name) != len(export_refs):
+        raise AppError("output.publication_invalid", {"reason": "export_refs"})
+    if publication_version == "publish-v2" and set(export_by_name) == set(_PHASE3_EXPORT_NAMES):
+        names = (
+            ("final-transcript.json", f"{input_path.stem}.transcript.json"),
+            ("final-subtitle.json", f"{input_path.stem}.subtitle.json"),
+            ("final-subtitle.srt", f"{input_path.stem}.srt"),
+            ("final-subtitle.vtt", f"{input_path.stem}.vtt"),
+            ("final-subtitle.ass", f"{input_path.stem}.ass"),
+        )
+    elif publication_version == "publish-v1" and set(export_by_name) == {
+        "final-transcript.json",
+        "final-subtitle.srt",
+    }:
+        names = (
+            ("final-transcript.json", f"{input_path.stem}.transcript.json"),
+            ("final-subtitle.srt", f"{input_path.stem}.srt"),
+        )
+    else:
+        raise AppError("output.publication_invalid", {"reason": "export_refs"})
+    return tuple(
+        (logical_name, target_name, export_by_name[logical_name])
+        for logical_name, target_name in names
+    )
+
+
+def _target_path(output_dir: Path, target_name: str) -> Path:
+    """Resolve only the output root; keep the final target path lexical."""
+    return output_dir.expanduser().resolve() / target_name

@@ -14,6 +14,9 @@ from captioner.adapters.asr.fake import FakeASRAdapter
 from captioner.adapters.exporters.srt import serialize_bytes as serialize_srt
 from captioner.adapters.exporters.transcript_json import serialize_bytes as serialize_transcript
 from captioner.adapters.persistence.local_artifact_store import LocalArtifactStore
+from captioner.adapters.subtitles.ass import serialize_bytes as serialize_ass
+from captioner.adapters.subtitles.json_track import serialize as serialize_track_json
+from captioner.adapters.subtitles.webvtt import serialize_bytes as serialize_webvtt
 from captioner.core.application.run_single import (
     RunSingleRequest,
     RunSingleService,
@@ -194,6 +197,34 @@ def test_run_single_commits_transcript_then_srt(tmp_path: Path) -> None:
         assert result.word_count == 2
         assert result.subtitle_path.read_text(encoding="utf-8").endswith("\n")
         assert result.transcript_path.is_file()
+
+    asyncio.run(scenario())
+
+
+def test_run_single_can_publish_all_phase3_subtitle_formats(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        source = tmp_path / "media.wav"
+        source.write_bytes(b"input")
+        output = tmp_path / "output"
+        service = _service(
+            source,
+            output,
+            FakeASRAdapter(transcription_result=make_transcript()),
+        )
+        service.subtitle_json_serializer = serialize_track_json
+        service.webvtt_serializer = serialize_webvtt
+        service.ass_serializer = serialize_ass
+        result = await service.run(RunSingleRequest(source, output, "en", False))
+        assert result.subtitle_json_path is not None and result.subtitle_json_path.is_file()
+        assert result.vtt_path is not None and result.vtt_path.is_file()
+        assert result.ass_path is not None and result.ass_path.is_file()
+        assert sorted(path.name for path in output.iterdir()) == [
+            "media.ass",
+            "media.srt",
+            "media.subtitle.json",
+            "media.transcript.json",
+            "media.vtt",
+        ]
 
     asyncio.run(scenario())
 
