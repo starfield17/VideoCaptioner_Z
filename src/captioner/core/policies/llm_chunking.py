@@ -104,6 +104,19 @@ class ChunkPlanner:
         selected = self._config if config is None else config
         return plan_chunks(items, selected, self._token_counter)
 
+    def plan_range(
+        self,
+        items: Sequence[ChunkItem],
+        core_start: int,
+        core_end: int,
+        config: ChunkingConfig | None = None,
+        index: int = 0,
+    ) -> LLMChunk:
+        selected = self._config if config is None else config
+        return plan_chunk_range(
+            items, core_start, core_end, selected, self._token_counter, index=index
+        )
+
 
 def plan_chunks(
     items: Sequence[ChunkItem],
@@ -156,6 +169,55 @@ def plan_chunks(
         chunks.append(LLMChunk(len(chunks), core, context))
         start += len(core)
     return tuple(chunks)
+
+
+def plan_chunk_range(
+    items: Sequence[ChunkItem],
+    core_start: int,
+    core_end: int,
+    config: ChunkingConfig,
+    token_counter: TokenCounter,
+    *,
+    index: int = 0,
+) -> LLMChunk:
+    """Replan one contiguous core range with freshly computed context."""
+    ordered = tuple(items)
+    if core_start < 0 or core_end <= core_start or core_end > len(ordered) or index < 0:
+        raise AppError("llm.chunk_invalid", {"reason": "range"})
+    ids = tuple(item.id for item in ordered)
+    if len(set(ids)) != len(ids):
+        raise AppError("llm.chunk_items_invalid", {"reason": "duplicate_ids"})
+    token_counts = tuple(_count(token_counter, item.text, item.id) for item in ordered)
+    _validate_item_budgets(ordered, token_counts, config)
+    candidate = _fit_window(
+        ordered,
+        core_start=core_start,
+        core_end=core_end,
+        token_counts=token_counts,
+        config=config,
+    )
+    if candidate is None:
+        raise AppError("llm.item_too_large", {"item_id": ordered[core_start].id})
+    core, context = candidate
+    return LLMChunk(index, core, context)
+
+
+def _validate_item_budgets(
+    ordered: tuple[ChunkItem, ...],
+    token_counts: tuple[int, ...],
+    config: ChunkingConfig,
+) -> None:
+    for item, count in zip(ordered, token_counts, strict=True):
+        if count > config.max_input_tokens:
+            raise AppError("llm.item_too_large", {"item_id": item.id, "tokens": count})
+        if (
+            config.max_audio_context_duration_ms is not None
+            and item.duration_ms > config.max_audio_context_duration_ms
+        ):
+            raise AppError(
+                "llm.item_too_large",
+                {"item_id": item.id, "duration_ms": item.duration_ms},
+            )
 
 
 def _fit_window(

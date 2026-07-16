@@ -235,6 +235,91 @@ Review = ReviewResponse
 ReviewTranslationResponse = ReviewResponse
 
 
+@dataclass(frozen=True, slots=True)
+class StructuredResponseBatch:
+    """Strict array wrapper used when one request covers multiple Chunk items."""
+
+    responses: tuple[object, ...]
+
+    def __post_init__(self) -> None:
+        responses = tuple(self.responses)
+        if not responses:
+            raise AppError("llm.response_invalid", {"reason": "empty_batch"})
+        object.__setattr__(self, "responses", responses)
+
+    @classmethod
+    def from_mapping(cls, value: object) -> Self:
+        raise NotImplementedError
+
+    @classmethod
+    def from_json(cls, value: str | bytes) -> Self:
+        raise NotImplementedError
+
+    def to_dict(self) -> list[JsonValue]:
+        result: list[JsonValue] = []
+        for response in self.responses:
+            to_dict = getattr(response, "to_dict", None)
+            if not callable(to_dict):
+                raise AppError("llm.response_invalid", {"reason": "batch_item"})
+            value = to_dict()
+            if not isinstance(value, dict):
+                raise AppError("llm.response_invalid", {"reason": "batch_item"})
+            result.append(cast(dict[str, JsonValue], value))
+        return result
+
+
+def response_batch_schema[T](item_schema: type[T]) -> type[StructuredResponseBatch]:
+    """Create a schema class for a non-empty array of one strict item schema."""
+
+    class BatchResponse(StructuredResponseBatch):
+        @classmethod
+        def from_mapping(cls, value: object) -> StructuredResponseBatch:
+            if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+                raise AppError("llm.response_invalid", {"reason": "batch_array"})
+            responses: list[object] = []
+            for item in cast(Sequence[object], value):
+                parser = getattr(item_schema, "from_mapping", None)
+                if not callable(parser):
+                    raise AppError("llm.schema_invalid", {"reason": "batch_item_schema"})
+                responses.append(parser(item))
+            return cls(tuple(responses))
+
+        @classmethod
+        def from_json(cls, value: str | bytes) -> StructuredResponseBatch:
+            try:
+                parsed = json.loads(
+                    value,
+                    object_pairs_hook=_reject_duplicate_keys,
+                    parse_constant=_reject_json_constant,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise AppError("llm.response_invalid", {"reason": "json"}) from exc
+            return cls.from_mapping(parsed)
+
+        @classmethod
+        def json_schema(cls) -> dict[str, JsonValue]:
+            return {
+                "type": "array",
+                "minItems": 1,
+                "items": response_schema_for(cast(type[object], item_schema)),
+            }
+
+        @classmethod
+        def model_json_schema(cls) -> dict[str, JsonValue]:
+            return cls.json_schema()
+
+        @classmethod
+        def schema(cls) -> dict[str, JsonValue]:
+            return cls.json_schema()
+
+    BatchResponse.__name__ = f"{item_schema.__name__}BatchResponse"
+    return BatchResponse
+
+
+batch_response_schema = response_batch_schema
+make_batch_response_schema = response_batch_schema
+
+
 def response_schema_for(response_schema: type[object]) -> dict[str, JsonValue]:
     """Return a schema and fail closed if a response adds a timing field."""
     schema_method = getattr(response_schema, "json_schema", None)
