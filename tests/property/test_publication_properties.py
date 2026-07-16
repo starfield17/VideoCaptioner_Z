@@ -57,6 +57,7 @@ def test_publication_target_corruption_is_detected(data: bytes) -> None:
             output_dir=tmp_path,
             input_path=tmp_path / "sample.wav",
             export_refs=(transcript_ref, ref),
+            publication_version="publish-v1",
         )
         target.write_bytes(data + b"x")
         with pytest.raises(AppError, match=r"output\.publication_invalid"):
@@ -65,4 +66,5 @@ def test_publication_target_corruption_is_detected(data: bytes) -> None:
                 output_dir=tmp_path,
                 input_path=tmp_path / "sample.wav",
                 export_refs=(transcript_ref, ref),
+                publication_version="publish-v1",
             )

@@ -207,6 +207,12 @@ def _evaluate_candidate(
     protected = (
         protected_break_cost(full_text, boundary, protected_spans) if end < len(words) else 0
     )
+    equal_timestamp_break = int(
+        end < len(words)
+        and words[end - 1].start_ms == words[end].start_ms
+        and words[end - 1].end_ms == words[end].end_ms
+        and metrics.display_columns <= config.max_cue_width
+    )
     boundary_quality = 0
     silence_quality = 0
     if end < len(words):
@@ -226,6 +232,7 @@ def _evaluate_candidate(
     cost = (
         0,
         width_over * config.overflow_penalty + duration_over * config.overflow_penalty,
+        equal_timestamp_break,
         protected * config.protected_break_penalty,
         cps_over,
         duration_over,
@@ -284,7 +291,7 @@ def _canonical_text_and_boundaries(
 
 
 def _zero_cost() -> _Cost:
-    return (0,) * 11
+    return (0,) * 12
 
 
 def _add_cost(left: _Cost, right: _Cost) -> _Cost:

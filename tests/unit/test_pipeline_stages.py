@@ -225,7 +225,7 @@ def test_publish_mid_execute_occurs_after_first_target_commit(tmp_path: Path) ->
     )
     checkpoints: list[str] = []
     result = asyncio.run(
-        PublishStage(store).execute(
+        PublishStage(store, version="publish-v1").execute(
             _request(tmp_path, refs), _context(tmp_path, checkpoints.append)
         )
     )
@@ -233,9 +233,18 @@ def test_publish_mid_execute_occurs_after_first_target_commit(tmp_path: Path) ->
     assert checkpoints == ["mid_execute"]
 
 
-@pytest.mark.parametrize("target_name", ["input.transcript.json", "input.srt"])
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        "input.transcript.json",
+        "input.subtitle.json",
+        "input.srt",
+        "input.vtt",
+        "input.ass",
+    ],
+)
 @pytest.mark.parametrize("overwrite", [False, True])
-def test_publish_replace_then_interrupt_rolls_back_pair(
+def test_publish_replace_then_interrupt_rolls_back_five_targets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target_name: str,
@@ -246,9 +255,16 @@ def test_publish_replace_then_interrupt_rolls_back_pair(
     store = ContentAddressedArtifactStore(tmp_path / "artifacts")
     output = tmp_path / "output"
     output.mkdir()
+    old_bytes = {
+        "input.transcript.json": b"old transcript",
+        "input.subtitle.json": b"old subtitle",
+        "input.srt": b"old srt",
+        "input.vtt": b"old vtt",
+        "input.ass": b"old ass",
+    }
     if overwrite:
-        (output / "input.transcript.json").write_bytes(b"old transcript")
-        (output / "input.srt").write_bytes(b"old srt")
+        for name, data in old_bytes.items():
+            (output / name).write_bytes(data)
     current_config = replace(_config(tmp_path), overwrite=overwrite)
     request = StageExecutionRequest(
         "batch-a",
@@ -257,7 +273,10 @@ def test_publish_replace_then_interrupt_rolls_back_pair(
         current_config,
         (
             _put(store, b"new transcript", "final-transcript.json"),
+            _put(store, b"new subtitle", "final-subtitle.json"),
             _put(store, b"new srt", "final-subtitle.srt"),
+            _put(store, b"new vtt", "final-subtitle.vtt"),
+            _put(store, b"new ass", "final-subtitle.ass"),
         ),
     )
     real_replace = os.replace
@@ -276,10 +295,9 @@ def test_publish_replace_then_interrupt_rolls_back_pair(
     monkeypatch.setattr(os, "replace", replace_then_interrupt)
     with pytest.raises(KeyboardInterrupt):
         asyncio.run(PublishStage(store).execute(request, _context(tmp_path)))
-    if overwrite:
-        assert (output / "input.transcript.json").read_bytes() == b"old transcript"
-        assert (output / "input.srt").read_bytes() == b"old srt"
-    else:
-        assert not (output / "input.transcript.json").exists()
-        assert not (output / "input.srt").exists()
+    for name, data in old_bytes.items():
+        if overwrite:
+            assert (output / name).read_bytes() == data
+        else:
+            assert not (output / name).exists()
     assert not list(output.glob("*.tmp"))

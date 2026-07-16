@@ -40,6 +40,14 @@ from captioner.core.ports.stage_runner import (
     StageExecutionRequest,
 )
 
+_PHASE3_EXPORT_NAMES = (
+    "final-transcript.json",
+    "final-subtitle.json",
+    "final-subtitle.srt",
+    "final-subtitle.vtt",
+    "final-subtitle.ass",
+)
+
 
 @dataclass(slots=True)
 class InspectStage:
@@ -220,7 +228,12 @@ class PublishStage:
         self, request: StageExecutionRequest, context: StageExecutionContext
     ) -> tuple[ProducedArtifact, ...]:
         context.execution.raise_if_cancelled()
-        target_specs = _publication_specs(request.input_path, request.input_artifacts)
+        export_refs = tuple(
+            ref for ref in request.input_artifacts if ref.logical_name.startswith("final-")
+        )
+        target_specs = _publication_specs(
+            request.input_path, export_refs, publication_version=self.version
+        )
         targets = tuple((target_name, ref) for _, target_name, ref in target_specs)
         store = LocalArtifactStore(Path(request.config.output_dir))
         if not all(
@@ -296,9 +309,12 @@ def verify_publication(
     output_dir: Path,
     input_path: Path,
     export_refs: tuple[ArtifactRef, ...],
+    publication_version: str = "publish-v2",
 ) -> None:
     receipt = decode_publication_receipt(receipt_bytes)
-    target_specs = _publication_specs(input_path, export_refs)
+    target_specs = _publication_specs(
+        input_path, export_refs, publication_version=publication_version
+    )
     expected_generation = hashlib.sha256(
         "".join(ref.sha256 for _, _, ref in target_specs).encode()
     ).hexdigest()
@@ -338,19 +354,17 @@ def _policy_config(
 
 
 def _publication_specs(
-    input_path: Path, export_refs: tuple[ArtifactRef, ...]
+    input_path: Path,
+    export_refs: tuple[ArtifactRef, ...],
+    *,
+    publication_version: str,
 ) -> tuple[tuple[str, str, ArtifactRef], ...]:
-    export_refs = tuple(ref for ref in export_refs if ref.logical_name.startswith("final-"))
+    if any(not ref.logical_name.startswith("final-") for ref in export_refs):
+        raise AppError("output.publication_invalid", {"reason": "export_refs"})
     export_by_name = {ref.logical_name: ref for ref in export_refs}
     if len(export_by_name) != len(export_refs):
         raise AppError("output.publication_invalid", {"reason": "export_refs"})
-    if set(export_by_name) == {
-        "final-transcript.json",
-        "final-subtitle.json",
-        "final-subtitle.srt",
-        "final-subtitle.vtt",
-        "final-subtitle.ass",
-    }:
+    if publication_version == "publish-v2" and set(export_by_name) == set(_PHASE3_EXPORT_NAMES):
         names = (
             ("final-transcript.json", f"{input_path.stem}.transcript.json"),
             ("final-subtitle.json", f"{input_path.stem}.subtitle.json"),
@@ -358,7 +372,10 @@ def _publication_specs(
             ("final-subtitle.vtt", f"{input_path.stem}.vtt"),
             ("final-subtitle.ass", f"{input_path.stem}.ass"),
         )
-    elif set(export_by_name) == {"final-transcript.json", "final-subtitle.srt"}:
+    elif publication_version == "publish-v1" and set(export_by_name) == {
+        "final-transcript.json",
+        "final-subtitle.srt",
+    }:
         names = (
             ("final-transcript.json", f"{input_path.stem}.transcript.json"),
             ("final-subtitle.srt", f"{input_path.stem}.srt"),

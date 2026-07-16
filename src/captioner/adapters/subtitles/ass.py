@@ -33,20 +33,27 @@ def format_timestamp(milliseconds: int) -> str:
 
 
 def serialize(track: SubtitleTrack) -> str:
-    previous_end = -1
+    previous_end_centiseconds = 0
     rows: list[str] = []
     for cue in track.cues:
-        if cue.start_ms < previous_end or cue.end_ms <= cue.start_ms:
+        if cue.start_ms < 0 or cue.end_ms <= cue.start_ms:
             raise AppError("export.ass_invalid", {"reason": "cue_order", "cue_id": cue.id})
-        start_centiseconds = _rounded_centiseconds(cue.start_ms)
-        end_centiseconds = max(start_centiseconds + 1, _rounded_centiseconds(cue.end_ms))
+        natural_start = _rounded_centiseconds(cue.start_ms)
+        natural_end = _rounded_centiseconds(cue.end_ms)
+        start_centiseconds = max(natural_start, previous_end_centiseconds)
+        end_centiseconds = max(natural_end, start_centiseconds + 1)
+        if (
+            abs(start_centiseconds * 10 - cue.start_ms) > 10
+            or abs(end_centiseconds * 10 - cue.end_ms) > 10
+        ):
+            raise AppError("export.ass_unrepresentable", {"cue_id": cue.id})
         text = r"\N".join(_escape(line) for line in cue.lines)
         rows.append(
             "Dialogue: 0,"
             f"{_format_centiseconds(start_centiseconds)},{_format_centiseconds(end_centiseconds)},"
             f"Default,,0,0,0,,{text}"
         )
-        previous_end = cue.end_ms
+        previous_end_centiseconds = end_centiseconds
     return _HEADER + "\n".join(rows) + "\n"
 
 
@@ -60,6 +67,7 @@ def parse(data: bytes | str) -> ParsedSubtitle:
         raise AppError("export.ass_invalid", {"reason": "header"})
     rows = [line for line in text[len(_HEADER) : -1].split("\n") if line]
     cues: list[ParsedCue] = []
+    previous_end = -1
     for row in rows:
         if not row.startswith("Dialogue: "):
             raise AppError("export.ass_invalid", {"reason": "event"})
@@ -69,9 +77,10 @@ def parse(data: bytes | str) -> ParsedSubtitle:
         start = _parse_timestamp(fields[1])
         end = _parse_timestamp(fields[2])
         lines = _split_ass_lines(fields[9])
-        if end <= start or not lines or len(lines) > 2:
+        if start < previous_end or end <= start or not lines or len(lines) > 2:
             raise AppError("export.ass_invalid", {"reason": "cue_order"})
         cues.append(ParsedCue(start, end, lines))
+        previous_end = end
     return ParsedSubtitle(tuple(cues))
 
 

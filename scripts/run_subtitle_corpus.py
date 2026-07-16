@@ -8,7 +8,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from captioner.adapters.exporters import srt
-from captioner.adapters.persistence.domain_codecs import decode_transcript, encode_track
+from captioner.adapters.persistence.domain_codecs import (
+    decode_track,
+    decode_transcript,
+    encode_track,
+)
 from captioner.adapters.subtitles import ass, webvtt
 from captioner.core.domain.subtitle import SubtitleTrack
 from captioner.core.domain.subtitle_validation import validate_subtitle_track
@@ -62,7 +66,10 @@ def _run_fixture(path: Path, config: SegmentationPolicyConfig) -> tuple[int, int
     if not report.is_valid:
         raise CorpusError
     json_bytes = encode_track(track)
-    if encode_track(track) != json_bytes:
+    decoded = decode_track(json_bytes)
+    if decoded != track:
+        raise CorpusError
+    if encode_track(decoded) != json_bytes:
         raise CorpusError
     _assert_parsed(track, srt.parse(srt.serialize_bytes(track)))
     _assert_parsed(track, webvtt.parse(webvtt.serialize_bytes(track)))

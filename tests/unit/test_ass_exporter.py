@@ -62,3 +62,57 @@ def test_ass_parser_rejects_unescaped_override_tags() -> None:
     data = ass.serialize(track).replace("x\n", "{\\i1}x\n").encode("utf-8")
     with pytest.raises(AppError, match=r"export\.ass_invalid"):
         ass.parse(data)
+
+
+def test_ass_quantization_preserves_adjacent_representable_cue_order() -> None:
+    track = SubtitleTrack(
+        "track-1",
+        "transcript-1",
+        "en",
+        (
+            SubtitleCue("cue-000001", 0, 10, ("word-1",), "one", None, ("one",)),
+            SubtitleCue("cue-000002", 10, 20, ("word-2",), "two", None, ("two",)),
+        ),
+        0,
+        POLICY_SIGNATURE,
+    )
+    parsed = ass.parse(ass.serialize_bytes(track))
+    assert [(cue.start_ms, cue.end_ms) for cue in parsed.cues] == [(0, 10), (10, 20)]
+
+
+def test_ass_rejects_unrepresentable_adjacent_one_millisecond_cues() -> None:
+    track = SubtitleTrack(
+        "track-1",
+        "transcript-1",
+        "en",
+        (
+            SubtitleCue("cue-000001", 0, 1, ("word-1",), "one", None, ("one",)),
+            SubtitleCue("cue-000002", 1, 2, ("word-2",), "two", None, ("two",)),
+        ),
+        0,
+        POLICY_SIGNATURE,
+    )
+    with pytest.raises(AppError, match=r"export\.ass_unrepresentable"):
+        ass.serialize_bytes(track)
+
+
+def test_ass_parser_rejects_overlapping_and_out_of_order_dialogue_rows() -> None:
+    valid = ass.serialize(
+        SubtitleTrack(
+            "track-1",
+            "transcript-1",
+            "en",
+            (
+                SubtitleCue("cue-000001", 0, 1_000, ("word-1",), "one", None, ("one",)),
+                SubtitleCue("cue-000002", 1_000, 2_000, ("word-2",), "two", None, ("two",)),
+            ),
+            0,
+            POLICY_SIGNATURE,
+        )
+    )
+    first, second = valid.rstrip("\n").split("\n")[-2:]
+    overlap = valid.replace("0:00:01.00,0:00:02.00", "0:00:00.50,0:00:01.50")
+    out_of_order = "\n".join((*valid.rstrip("\n").split("\n")[:-2], second, first, ""))
+    for data in (overlap, out_of_order):
+        with pytest.raises(AppError, match=r"export\.ass_invalid"):
+            ass.parse(data)
