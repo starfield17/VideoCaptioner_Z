@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import NoReturn
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
@@ -130,7 +131,6 @@ def _commit_outputs(
     committed: list[str] = []
     transcript_path = store.root / transcript_key
     subtitle_path = store.root / subtitle_key
-    staging_cleaned = False
     try:
         staged.append(store.stage_bytes(transcript_key, transcript_bytes))
         staged.append(store.stage_bytes(subtitle_key, srt_bytes))
@@ -148,18 +148,22 @@ def _commit_outputs(
             word_count=len(transcript.words),
             cue_count=len(track.cues),
         )
-        for artifact in reversed(staged):
-            artifact.discard()
-        staging_cleaned = True
+        cleanup_error = _discard_all(staged)
+        if cleanup_error is not None:
+            _raise_cleanup_failed(cleanup_error)
         context.raise_if_cancelled()
-    except BaseException as exc:
+    except BaseException as original:
         _record_committed_stages(staged, committed)
-        _rollback(store, committed, previous, exc)
+        rollback_error = _rollback(store, committed, previous)
+        cleanup_error = _discard_all(staged)
+        if rollback_error is not None or cleanup_error is not None:
+            reason = (
+                "output.cleanup_failed"
+                if cleanup_error is not None
+                else _rollback_failure_reason(rollback_error)
+            )
+            raise AppError("output.rollback_failed", {"reason": reason}) from original
         raise
-    finally:
-        if not staging_cleaned:
-            for artifact in reversed(staged):
-                artifact.discard()
     return result
 
 
@@ -180,12 +184,29 @@ def _record_committed_stages(staged: list[StagedArtifact], committed: list[str])
             committed.append(artifact.key)
 
 
+def _discard_all(staged: list[StagedArtifact]) -> AppError | None:
+    first_error: AppError | None = None
+    for artifact in reversed(staged):
+        try:
+            artifact.discard()
+        except AppError as exc:
+            if first_error is None:
+                first_error = exc
+    return first_error
+
+
+def _raise_cleanup_failed(cleanup_error: AppError) -> NoReturn:
+    raise AppError(
+        "output.cleanup_failed",
+        {"reason": cleanup_error.code},
+    ) from cleanup_error
+
+
 def _rollback(
     store: ArtifactStorePort,
     committed: list[str],
     previous: dict[str, bytes | None],
-    original: BaseException,
-) -> None:
+) -> BaseException | None:
     try:
         for key in reversed(committed):
             old_value = previous[key]
@@ -194,9 +215,11 @@ def _rollback(
             else:
                 store.write_bytes(key, old_value, overwrite=True)
     except BaseException as rollback_error:
-        reason = (
-            rollback_error.code
-            if isinstance(rollback_error, AppError)
-            else type(rollback_error).__name__
-        )
-        raise AppError("output.rollback_failed", {"reason": reason}) from original
+        return rollback_error
+    return None
+
+
+def _rollback_failure_reason(rollback_error: BaseException | None) -> str:
+    if isinstance(rollback_error, AppError):
+        return rollback_error.code
+    return "output.rollback_failed"

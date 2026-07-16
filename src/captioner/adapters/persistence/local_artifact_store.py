@@ -10,6 +10,11 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from captioner.core.domain.errors import AppError
 from captioner.core.ports.artifact_store import StagedArtifact
 
+_STAGE_STAGED = "staged"
+_STAGE_COMMITTING = "committing"
+_STAGE_COMMITTED = "committed"
+_STAGE_DISCARDED = "discarded"
+
 
 @dataclass(slots=True)
 class LocalStagedArtifact:
@@ -19,7 +24,7 @@ class LocalStagedArtifact:
     _key: str
     _target: Path
     _temporary: Path | None
-    _state: str = "staged"
+    _state: str = _STAGE_STAGED
 
     @property
     def key(self) -> str:
@@ -31,33 +36,54 @@ class LocalStagedArtifact:
 
     @property
     def committed(self) -> bool:
-        return self._state == "committed"
+        return self._state == _STAGE_COMMITTED
 
     def commit(self, *, overwrite: bool) -> Path:
-        if self._state == "committed":
-            raise AppError("output.stage_invalid", {"key": self._key, "reason": "committed"})
-        if self._state == "discarded":
-            raise AppError("output.stage_invalid", {"key": self._key, "reason": "discarded"})
+        if self._state != _STAGE_STAGED:
+            raise AppError(
+                "output.stage_invalid",
+                {"key": self._key, "reason": self._state},
+            )
         if self._temporary is None:
             raise AppError("output.stage_invalid", {"key": self._key, "reason": "missing"})
         if (self._target.exists() or self._target.is_symlink()) and not overwrite:
             raise AppError("output.exists", {"path": str(self._target)})
+        temporary = self._temporary
+        self._state = _STAGE_COMMITTING
         try:
-            os.replace(self._temporary, self._target)
+            os.replace(temporary, self._target)
         except OSError as exc:
-            raise AppError("output.write_failed", {"path": str(self._target)}) from exc
-        self._temporary = None
-        self._state = "committed"
-        return self._target
+            if temporary.exists():
+                self._state = _STAGE_STAGED
+                raise AppError("output.write_failed", {"path": str(self._target)}) from exc
+            self._temporary = None
+            self._state = _STAGE_COMMITTED
+            raise
+        except BaseException:
+            if temporary.exists():
+                self._state = _STAGE_STAGED
+            else:
+                self._temporary = None
+                self._state = _STAGE_COMMITTED
+            raise
+        else:
+            self._temporary = None
+            self._state = _STAGE_COMMITTED
+            return self._target
 
     def discard(self) -> None:
-        if self._state != "staged":
+        if self._state in {_STAGE_COMMITTED, _STAGE_DISCARDED}:
             return
+        if self._state == _STAGE_COMMITTING:
+            raise AppError(
+                "output.stage_invalid",
+                {"key": self._key, "reason": _STAGE_COMMITTING},
+            )
         temporary = self._temporary
-        self._temporary = None
-        self._state = "discarded"
         if temporary is not None:
             _remove_temporary(temporary)
+        self._temporary = None
+        self._state = _STAGE_DISCARDED
 
 
 @dataclass(frozen=True, slots=True)
