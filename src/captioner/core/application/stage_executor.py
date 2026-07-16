@@ -12,9 +12,10 @@ from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.cache_key import derive_stage_cache_key
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
+from captioner.core.domain.job import JobProjection
 from captioner.core.domain.journal import JournalEvent, apply_event
 from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
-from captioner.core.domain.stage import StageName, StageState
+from captioner.core.domain.stage import StageName, StageProjection, StageState
 from captioner.core.ports.durable_artifact_store import DurableArtifactStorePort
 from captioner.core.ports.fault_injector import FaultInjector, NoOpFaultInjector
 from captioner.core.ports.journal import JournalPort
@@ -56,6 +57,13 @@ class StageExecutor:
     event_factory: EventFactory
     work_root: Path
     fault_injector: FaultInjector = field(default_factory=NoOpFaultInjector)
+    committed_verifier: Callable[[JobProjection, StageProjection], None] | None = None
+
+    def verify_committed(self, job: JobProjection, stage: StageProjection) -> None:
+        for artifact in stage.artifacts:
+            self.artifact_store.verify(artifact)
+        if self.committed_verifier is not None:
+            self.committed_verifier(job, stage)
 
     async def execute(
         self,
@@ -80,8 +88,7 @@ class StageExecutor:
             and current.cache_key == cache_key
             and current.artifacts
         ):
-            for artifact in current.artifacts:
-                self.artifact_store.verify(artifact)
+            self.verify_committed(job, current)
             return projection
         if current.state is StageState.COMMITTED:
             projection = self._append(
@@ -94,6 +101,7 @@ class StageExecutor:
         workspace = self.work_root / job_id / runner.name.value / f"attempt-{attempt}"
         workspace.mkdir(parents=True, exist_ok=False)
         committed = False
+        post_commit_reason = "recovery"
         try:
             projection = self._append(
                 projection,
@@ -131,16 +139,27 @@ class StageExecutor:
                 },
             )
             committed = True
+            post_commit_reason = "after_commit_hook"
             self._hit(projection.batch_id, job_id, runner.name, attempt, "after_journal_commit")
+            post_commit_reason = "artifact_verification"
             for ref in refs:
                 self.artifact_store.verify(ref)
             self._hit(
                 projection.batch_id, job_id, runner.name, attempt, "before_manifest_projection"
             )
+            post_commit_reason = "manifest_projection"
             self.manifest.write(projection)
         except AppError as exc:
             if committed:
-                raise
+                raise AppError(
+                    "stage.post_commit_failed",
+                    {
+                        "job_id": job_id,
+                        "stage_name": runner.name.value,
+                        "attempt": attempt,
+                        "reason": post_commit_reason,
+                    },
+                ) from exc
             event_type = "stage.cancelled" if exc.code == "operation.cancelled" else "stage.failed"
             projection = self._append(
                 projection,
@@ -163,7 +182,22 @@ class StageExecutor:
         else:
             return projection
         finally:
-            shutil.rmtree(workspace, ignore_errors=True)
+            try:
+                shutil.rmtree(workspace)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if committed:
+                    raise AppError(
+                        "stage.post_commit_failed",
+                        {
+                            "job_id": job_id,
+                            "stage_name": runner.name.value,
+                            "attempt": attempt,
+                            "reason": "workspace_cleanup",
+                        },
+                    ) from exc
+                raise AppError("stage.workspace_cleanup_failed") from exc
 
     def _append(
         self,

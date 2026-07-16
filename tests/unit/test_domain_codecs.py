@@ -10,15 +10,18 @@ from captioner.adapters.persistence.domain_codecs import (
     decode_audio,
     decode_json,
     decode_media,
+    decode_publication_receipt,
     decode_track,
     decode_transcript,
     encode_audio,
     encode_json,
     encode_media,
+    encode_publication_receipt,
     encode_track,
     encode_transcript,
 )
 from captioner.core.domain.errors import AppError
+from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
 from captioner.core.policies.simple_segmentation import segment_transcript
 
 
@@ -32,6 +35,22 @@ def test_all_domain_codecs_round_trip(tmp_path: Path) -> None:
     assert decode_transcript(encode_transcript(transcript)) == transcript
     assert decode_track(encode_track(track)) == track
     assert encode_json({"b": 2, "a": 1}) == b'{"a":1,"b":2}\n'
+    receipt = PublicationReceipt(
+        "generation",
+        (PublishedTarget(str((tmp_path / "output.srt").resolve()), "a" * 64, 12, "output.srt"),),
+    )
+    assert decode_publication_receipt(encode_publication_receipt(receipt)) == receipt
+
+
+def test_publication_receipt_codec_rejects_unknown_fields(tmp_path: Path) -> None:
+    receipt = PublicationReceipt(
+        "generation",
+        (PublishedTarget(str((tmp_path / "output.srt").resolve()), "a" * 64, 12, "output.srt"),),
+    )
+    document = json.loads(encode_publication_receipt(receipt))
+    document["unknown"] = True
+    with pytest.raises(AppError, match=r"artifact\.codec_invalid"):
+        decode_publication_receipt(encode_json(document))
 
 
 @pytest.mark.parametrize("data", [b"[]", b"not-json", b"\xff"])

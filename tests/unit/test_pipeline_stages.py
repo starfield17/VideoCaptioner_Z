@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 from tests.support import make_audio, make_media, make_transcript
 
 from captioner.adapters.persistence.content_addressed_artifact_store import (
@@ -160,3 +162,55 @@ def test_all_stage_runners_execute_with_durable_inputs(tmp_path: Path) -> None:
         PublishStage(store).execute(_request(tmp_path, final_refs), _context(tmp_path))
     )
     assert repeated[0].data == published[0].data
+
+
+@pytest.mark.parametrize("target_name", ["input.transcript.json", "input.srt"])
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_publish_replace_then_interrupt_rolls_back_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+    overwrite: bool,
+) -> None:
+    from dataclasses import replace
+
+    store = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    output = tmp_path / "output"
+    output.mkdir()
+    if overwrite:
+        (output / "input.transcript.json").write_bytes(b"old transcript")
+        (output / "input.srt").write_bytes(b"old srt")
+    current_config = replace(_config(tmp_path), overwrite=overwrite)
+    request = StageExecutionRequest(
+        "batch-a",
+        "job-000001",
+        (tmp_path / "input.wav").resolve(),
+        current_config,
+        (
+            _put(store, b"new transcript", "final-transcript.json"),
+            _put(store, b"new srt", "final-subtitle.srt"),
+        ),
+    )
+    real_replace = os.replace
+    interrupted = False
+
+    def replace_then_interrupt(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
+        nonlocal interrupted
+        real_replace(source, target)
+        if not interrupted and Path(os.fsdecode(target)).name == target_name:
+            interrupted = True
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "replace", replace_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(PublishStage(store).execute(request, _context(tmp_path)))
+    if overwrite:
+        assert (output / "input.transcript.json").read_bytes() == b"old transcript"
+        assert (output / "input.srt").read_bytes() == b"old srt"
+    else:
+        assert not (output / "input.transcript.json").exists()
+        assert not (output / "input.srt").exists()
+    assert not list(output.glob("*.tmp"))

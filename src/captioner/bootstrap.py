@@ -27,6 +27,7 @@ from captioner.adapters.pipeline.stages import (
     PublishStage,
     SegmentStage,
     TranscribeStage,
+    verify_publication,
 )
 from captioner.adapters.process.asyncio_subprocess import AsyncioSubprocessRunner
 from captioner.adapters.testing.fault_injector import ScriptedFaultInjector
@@ -193,6 +194,32 @@ def build_durable_service(
         lambda: datetime.now(UTC).isoformat(),
     )
     executor = StageExecutor(journal, manifest, durable, event_factory, batch_dir / "work")
+
+    def verify_committed(job: object, stage: object) -> None:
+        from captioner.core.domain.job import JobProjection
+        from captioner.core.domain.stage import StageProjection
+
+        if not isinstance(job, JobProjection) or not isinstance(stage, StageProjection):
+            raise TypeError
+        if stage.name is not StageName.PUBLISH:
+            return
+        receipt_ref = next(
+            (ref for ref in stage.artifacts if ref.logical_name == "publication-receipt.json"),
+            None,
+        )
+        if receipt_ref is None:
+            from captioner.core.domain.errors import AppError
+
+            raise AppError("output.publication_invalid", {"reason": "receipt_missing"})
+        export_refs = job.stage(StageName.EXPORT).artifacts
+        verify_publication(
+            durable.read_bytes(receipt_ref),
+            output_dir=Path(job.config.output_dir),
+            input_path=Path(job.input_path),
+            export_refs=export_refs,
+        )
+
+    executor.committed_verifier = verify_committed
     fault_spec = os.environ.get("CAPTIONER_FAULT_POINT")
     if fault_spec is not None:
         if os.environ.get("CAPTIONER_ENABLE_FAULT_INJECTION") != "1":

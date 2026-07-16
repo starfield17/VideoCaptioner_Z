@@ -9,6 +9,7 @@ from typing import cast
 from captioner.adapters.exporters.transcript_json import transcript_to_dict
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.media import AudioArtifact, MediaAsset
+from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
 from captioner.core.domain.result import JsonValue, thaw_json_value
 from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack
 from captioner.core.domain.transcript import Transcript, TranscriptSegment, WordToken
@@ -202,6 +203,47 @@ def decode_track(data: bytes) -> SubtitleTrack:
         _str(raw, "language"),
         cues,
         _int(raw, "revision"),
+    )
+
+
+def encode_publication_receipt(receipt: PublicationReceipt) -> bytes:
+    return encode_json(
+        {
+            "schema_version": receipt.schema_version,
+            "output_generation": receipt.output_generation,
+            "targets": [
+                {
+                    "path": target.path,
+                    "sha256": target.sha256,
+                    "size_bytes": target.size_bytes,
+                    "logical_name": target.logical_name,
+                }
+                for target in receipt.targets
+            ],
+        }
+    )
+
+
+def decode_publication_receipt(data: bytes) -> PublicationReceipt:
+    root = decode_json(data)
+    _fields(root, {"schema_version", "output_generation", "targets"})
+    if root.get("schema_version") != SCHEMA_VERSION:
+        raise AppError("output.publication_invalid", {"reason": "schema"})
+    targets = _objects(root, "targets")
+    for target in targets:
+        _fields(target, {"path", "sha256", "size_bytes", "logical_name"})
+    return PublicationReceipt(
+        _str(root, "output_generation"),
+        tuple(
+            PublishedTarget(
+                _str(target, "path"),
+                _str(target, "sha256"),
+                _int(target, "size_bytes"),
+                _str(target, "logical_name"),
+            )
+            for target in targets
+        ),
+        _int(root, "schema_version"),
     )
 
 

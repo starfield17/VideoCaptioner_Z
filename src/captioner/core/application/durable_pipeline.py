@@ -95,6 +95,10 @@ class DurablePipelineService:
         if not events:
             raise AppError("batch.not_found")
         projection = replay(events)
+        for job in projection.jobs:
+            for stage in job.stages:
+                if stage.state is StageState.COMMITTED:
+                    self.executor.verify_committed(job, stage)
         return projection
 
     def update_config(
@@ -179,7 +183,7 @@ class DurablePipelineService:
                 self.manifest.write(current)
                 self._clear_markers(job_id)
             elif (
-                exc.code != "operation.cancelled"
+                exc.code not in {"operation.cancelled", "stage.post_commit_failed"}
                 and current.job(job_id).state is not JobState.FAILED
             ):
                 current = self._append(current, "job.failed", {"job_id": job_id})
@@ -217,7 +221,8 @@ class DurablePipelineService:
                     continue
                 for artifact in stage.artifacts:
                     try:
-                        self.executor.artifact_store.verify(artifact)
+                        self.executor.verify_committed(job, stage)
+                        break
                     except AppError:
                         self.executor.artifact_store.resolve(artifact).unlink(missing_ok=True)
                         projection = self._append(

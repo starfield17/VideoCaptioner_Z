@@ -10,17 +10,20 @@ from captioner.adapters.exporters.srt import serialize_bytes as serialize_srt
 from captioner.adapters.persistence.domain_codecs import (
     decode_audio,
     decode_media,
+    decode_publication_receipt,
     decode_track,
     decode_transcript,
     encode_audio,
-    encode_json,
     encode_media,
+    encode_publication_receipt,
     encode_track,
     encode_transcript,
 )
 from captioner.adapters.persistence.local_artifact_store import LocalArtifactStore
+from captioner.core.application.output_transaction import commit_output_pair
 from captioner.core.domain.artifact import ArtifactRef
 from captioner.core.domain.errors import AppError
+from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
 from captioner.core.domain.stage import StageName
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig, segment_transcript
 from captioner.core.ports.asr import ASREngine, TranscriptionRequest
@@ -169,55 +172,40 @@ class PublishStage:
         stem = request.input_path.stem
         targets = ((f"{stem}.transcript.json", transcript_ref), (f"{stem}.srt", subtitle_ref))
         store = LocalArtifactStore(Path(request.config.output_dir))
-        pending = tuple(
-            (key, ref)
-            for key, ref in targets
-            if not _published_matches(Path(request.config.output_dir) / key, ref)
-        )
-        previous = {key: store.read_bytes(key) if store.exists(key) else None for key, _ in pending}
-        staged = [store.stage_bytes(key, self.artifacts.read_bytes(ref)) for key, ref in pending]
-        committed: list[str] = []
-        try:
-            context.execution.raise_if_cancelled()
-            for artifact in staged:
-                artifact.commit(overwrite=request.config.overwrite)
-                committed.append(artifact.key)
-                context.execution.raise_if_cancelled()
-        except BaseException:
-            for key in reversed(committed):
-                old = previous[key]
-                if old is None:
-                    store.delete(key)
-                else:
-                    store.write_bytes(key, old, overwrite=True)
-            raise
-        finally:
-            for artifact in reversed(staged):
-                artifact.discard()
+        if not all(
+            _published_matches(Path(request.config.output_dir) / key, ref) for key, ref in targets
+        ):
+            commit_output_pair(
+                store,
+                (
+                    (targets[0][0], self.artifacts.read_bytes(targets[0][1])),
+                    (targets[1][0], self.artifacts.read_bytes(targets[1][1])),
+                ),
+                overwrite=request.config.overwrite,
+                context=context.execution,
+            )
         for key, ref in targets:
             published = Path(request.config.output_dir) / key
             if published.stat().st_size != ref.size_bytes or _sha256(published) != ref.sha256:
                 raise AppError("output.publication_invalid", {"logical_name": key})
-        receipt = {
-            "schema_version": 1,
-            "targets": [
-                {
-                    "path": str((Path(request.config.output_dir) / key).resolve()),
-                    "sha256": ref.sha256,
-                    "size_bytes": ref.size_bytes,
-                }
+        receipt = PublicationReceipt(
+            hashlib.sha256("".join(ref.sha256 for _, ref in targets).encode()).hexdigest(),
+            tuple(
+                PublishedTarget(
+                    str((Path(request.config.output_dir) / key).resolve()),
+                    ref.sha256,
+                    ref.size_bytes,
+                    key,
+                )
                 for key, ref in targets
-            ],
-            "output_generation": hashlib.sha256(
-                "".join(ref.sha256 for _, ref in targets).encode()
-            ).hexdigest(),
-        }
+            ),
+        )
         return (
             ProducedArtifact(
                 "publication-receipt-json",
                 "application/json",
                 "publication-receipt.json",
-                data=encode_json(receipt),
+                data=encode_publication_receipt(receipt),
             ),
         )
 
@@ -238,4 +226,42 @@ def _sha256(path: Path) -> str:
 
 
 def _published_matches(path: Path, ref: ArtifactRef) -> bool:
-    return path.is_file() and path.stat().st_size == ref.size_bytes and _sha256(path) == ref.sha256
+    return (
+        not path.is_symlink()
+        and path.is_file()
+        and path.stat().st_size == ref.size_bytes
+        and _sha256(path) == ref.sha256
+    )
+
+
+def verify_publication(
+    receipt_bytes: bytes,
+    *,
+    output_dir: Path,
+    input_path: Path,
+    export_refs: tuple[ArtifactRef, ...],
+) -> None:
+    receipt = decode_publication_receipt(receipt_bytes)
+    expected_refs = tuple(
+        ref
+        for ref in export_refs
+        if ref.logical_name in {"final-transcript.json", "final-subtitle.srt"}
+    )
+    expected_generation = hashlib.sha256(
+        "".join(ref.sha256 for ref in expected_refs).encode()
+    ).hexdigest()
+    expected_paths = {
+        str((output_dir / f"{input_path.stem}.transcript.json").resolve()),
+        str((output_dir / f"{input_path.stem}.srt").resolve()),
+    }
+    if (
+        receipt.output_generation != expected_generation
+        or {target.path for target in receipt.targets} != expected_paths
+    ):
+        raise AppError("output.publication_invalid", {"reason": "receipt"})
+    for target in receipt.targets:
+        path = Path(target.path)
+        if path.is_symlink() or not path.is_file():
+            raise AppError("output.publication_invalid", {"reason": "target_missing"})
+        if path.stat().st_size != target.size_bytes or _sha256(path) != target.sha256:
+            raise AppError("output.publication_invalid", {"reason": "target_hash"})
