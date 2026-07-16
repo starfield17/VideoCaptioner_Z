@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -21,7 +23,7 @@ def _event(seq: int, event_type: str, payload: dict[str, object]) -> JournalEven
 
 @given(job_count=st.integers(min_value=1, max_value=20))
 def test_sequential_application_matches_complete_replay(job_count: int) -> None:
-    root = "/tmp/captioner-property"
+    root = (Path.cwd() / "captioner-property").resolve()
     config = JobConfig(
         "tiny",
         "faster-whisper:tiny",
@@ -33,7 +35,7 @@ def test_sequential_application_matches_complete_replay(job_count: int) -> None:
         "ffprobe",
         {"sample_rate": 16000},
         {"max_duration_ms": 7000},
-        root,
+        str(root),
         False,
         {stage.value: "1" for stage in STAGE_PLAN},
     )
@@ -45,7 +47,7 @@ def test_sequential_application_matches_complete_replay(job_count: int) -> None:
                 "job.created",
                 {
                     "job_id": f"job-{number:06d}",
-                    "input_path": f"{root}/{number}.wav",
+                    "input_path": str(root / f"{number}.wav"),
                     "config": config.to_dict(),
                 },
             )

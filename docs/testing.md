@@ -2,11 +2,12 @@
 
 `python scripts/check.py --quick` runs formatting, Ruff, Pyright, and unit plus
 contract tests. `python scripts/check.py --full` additionally verifies the lock
-file, import contracts, i18n catalogs, forbidden patterns, all Phase 0 tests,
-and branch coverage with an 85% minimum.
+file, import contracts, i18n catalogs, forbidden patterns, recovery/property/
+packaging tests, and branch coverage with an 85% minimum.
 
-Tests are grouped into `unit`, `property`, `contract`, `integration`, and
-`packaging`. Property tests use Hypothesis for locale, domain and segmentation
+Tests are grouped into `unit`, `property`, `contract`, `recovery`, `integration`,
+and `packaging`. Recovery covers all six Stages at all six fault points.
+Property tests use Hypothesis for locale, domain and segmentation
 invariants. Unit tests use fake processes, fake ASR models and local artifact
 stores; they do not execute FFmpeg or download models. Output-transaction unit
 tests exercise every cancellation/interrupt boundary, overwrite restoration,
@@ -37,3 +38,15 @@ uv sync --frozen --extra asr-faster-whisper
 uv run --extra asr-faster-whisper pytest \
   tests/integration/test_faster_whisper_smoke.py -q -m slow
 ```
+
+The manual Small/CUDA media run is intentionally outside CI:
+
+```bash
+export CAPTIONER_REAL_MEDIA_URL=https://example.invalid/direct-public-domain-media
+export CAPTIONER_FASTER_WHISPER_CACHE="$PWD/build/model-cache"
+uv run --extra asr-faster-whisper python scripts/run_phase2_real_gpu_smoke.py
+```
+
+Record the source page, direct URL, license, downloaded SHA-256, duration, GPU,
+CUDA evidence, runtime, Batch/Job IDs, and clean/recovered comparisons. Do not
+claim CUDA success from model selection alone.

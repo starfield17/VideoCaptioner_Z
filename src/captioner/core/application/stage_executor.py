@@ -83,6 +83,13 @@ class StageExecutor:
             for artifact in current.artifacts:
                 self.artifact_store.verify(artifact)
             return projection
+        if current.state is StageState.COMMITTED:
+            projection = self._append(
+                projection,
+                "stage.invalidated",
+                _stage_payload(job_id, runner.name, current.attempt),
+            )
+            current = projection.job(job_id).stage(runner.name)
         attempt = current.attempt + 1
         workspace = self.work_root / job_id / runner.name.value / f"attempt-{attempt}"
         workspace.mkdir(parents=True, exist_ok=False)

@@ -70,6 +70,8 @@ class ContentAddressedArtifactStore:
     def verify(self, ref: ArtifactRef) -> None:
         path = self.resolve(ref)
         try:
+            if not path.exists():
+                raise AppError("artifact.missing", {"sha256": ref.sha256})
             if not path.is_file() or path.is_symlink() or path.stat().st_size != ref.size_bytes:
                 raise AppError("artifact.corrupt", {"sha256": ref.sha256, "reason": "size"})
             digest, size = _hash_file(path)

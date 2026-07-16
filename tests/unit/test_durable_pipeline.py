@@ -47,6 +47,36 @@ class FakeStage:
         )
 
 
+@dataclass(slots=True)
+class FailingStage:
+    name: StageName
+    error: AppError
+    version: str = "fake-v1"
+
+    async def execute(
+        self, request: StageExecutionRequest, context: StageExecutionContext
+    ) -> tuple[ProducedArtifact, ...]:
+        del request, context
+        raise self.error
+
+
+@dataclass(slots=True)
+class FileStage:
+    name: StageName
+    empty: bool = False
+    version: str = "fake-v1"
+
+    async def execute(
+        self, request: StageExecutionRequest, context: StageExecutionContext
+    ) -> tuple[ProducedArtifact, ...]:
+        del request
+        if self.empty:
+            return ()
+        source = context.workspace / "result.bin"
+        source.write_bytes(b"from-file")
+        return (ProducedArtifact("file", "application/octet-stream", "result.bin", source),)
+
+
 def _config(tmp_path: Path) -> JobConfig:
     return JobConfig(
         "tiny",
@@ -68,6 +98,7 @@ def _config(tmp_path: Path) -> JobConfig:
 def _service(
     tmp_path: Path, counts: dict[StageName, int], fault: ScriptedFaultInjector | None = None
 ) -> DurablePipelineService:
+    (tmp_path / "input.wav").write_bytes(b"source")
     batch_dir = tmp_path / "batch"
     journal = JsonlJournal(batch_dir / "journal.jsonl")
     manifest = JsonManifestStore(batch_dir / "manifest.json")
@@ -157,3 +188,53 @@ def test_cancel_marker_produces_cancelled_not_failed(tmp_path: Path) -> None:
     assert status.job("job-000001").state is JobState.CANCELLED
     assert all(stage.state is StageState.PENDING for stage in status.job("job-000001").stages)
     assert all(event.type not in {"stage.failed", "job.failed"} for event in service.journal.read())
+
+
+@pytest.mark.parametrize(
+    ("error", "stage_state", "job_state"),
+    [
+        (AppError("operation.cancelled"), StageState.CANCELLED, JobState.CANCELLED),
+        (AppError("stage.test_failed"), StageState.FAILED, JobState.FAILED),
+    ],
+)
+def test_stage_error_is_projected_before_it_is_reraised(
+    tmp_path: Path, error: AppError, stage_state: StageState, job_state: JobState
+) -> None:
+    counts: dict[StageName, int] = {}
+    service = _service(tmp_path, counts)
+    service.runners = {
+        **service.runners,
+        StageName.INSPECT: FailingStage(StageName.INSPECT, error),
+    }
+    projection = service.create(
+        "batch-a", (("job-000001", tmp_path / "input.wav", _config(tmp_path)),)
+    )
+
+    with pytest.raises(AppError, match=error.code):
+        asyncio.run(service.run(projection))
+
+    status = service.status()
+    assert status.job("job-000001").state is job_state
+    assert status.job("job-000001").stage(StageName.INSPECT).state is stage_state
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_stage_file_output_and_empty_output_validation(tmp_path: Path, empty: bool) -> None:
+    counts: dict[StageName, int] = {}
+    service = _service(tmp_path, counts)
+    service.runners = {
+        **service.runners,
+        StageName.INSPECT: FileStage(StageName.INSPECT, empty),
+    }
+    projection = service.create(
+        "batch-a", (("job-000001", tmp_path / "input.wav", _config(tmp_path)),)
+    )
+
+    if empty:
+        with pytest.raises(AppError, match=r"stage\.output_invalid"):
+            asyncio.run(service.run(projection))
+        return
+
+    projection = asyncio.run(service.run(projection))
+    ref = projection.job("job-000001").stage(StageName.INSPECT).artifacts[0]
+    assert service.executor.artifact_store.read_bytes(ref) == b"from-file"

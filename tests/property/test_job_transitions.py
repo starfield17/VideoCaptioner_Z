@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -15,7 +16,7 @@ from captioner.core.domain.stage import STAGE_PLAN
 
 @given(attempt=st.integers(min_value=1, max_value=100))
 def test_attempts_must_strictly_increase(attempt: int) -> None:
-    root = "/tmp/captioner-property"
+    root = (Path.cwd() / "captioner-property").resolve()
     config = JobConfig(
         "tiny",
         "faster-whisper:tiny",
@@ -27,7 +28,7 @@ def test_attempts_must_strictly_increase(attempt: int) -> None:
         "ffprobe",
         {"rate": 16000},
         {"limit": 84},
-        root,
+        str(root),
         False,
         {stage.value: "1" for stage in STAGE_PLAN},
     )
@@ -44,7 +45,7 @@ def test_attempts_must_strictly_increase(attempt: int) -> None:
                 freeze_json_value(
                     {
                         "job_id": "job-000001",
-                        "input_path": f"{root}/a.wav",
+                        "input_path": str(root / "a.wav"),
                         "config": config.to_dict(),
                     }
                 ),

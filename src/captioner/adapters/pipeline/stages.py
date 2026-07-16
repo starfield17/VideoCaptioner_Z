@@ -169,8 +169,13 @@ class PublishStage:
         stem = request.input_path.stem
         targets = ((f"{stem}.transcript.json", transcript_ref), (f"{stem}.srt", subtitle_ref))
         store = LocalArtifactStore(Path(request.config.output_dir))
-        previous = {key: store.read_bytes(key) if store.exists(key) else None for key, _ in targets}
-        staged = [store.stage_bytes(key, self.artifacts.read_bytes(ref)) for key, ref in targets]
+        pending = tuple(
+            (key, ref)
+            for key, ref in targets
+            if not _published_matches(Path(request.config.output_dir) / key, ref)
+        )
+        previous = {key: store.read_bytes(key) if store.exists(key) else None for key, _ in pending}
+        staged = [store.stage_bytes(key, self.artifacts.read_bytes(ref)) for key, ref in pending]
         committed: list[str] = []
         try:
             context.execution.raise_if_cancelled()
@@ -230,3 +235,7 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _published_matches(path: Path, ref: ArtifactRef) -> bool:
+    return path.is_file() and path.stat().st_size == ref.size_bytes and _sha256(path) == ref.sha256

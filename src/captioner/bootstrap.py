@@ -29,6 +29,7 @@ from captioner.adapters.pipeline.stages import (
     TranscribeStage,
 )
 from captioner.adapters.process.asyncio_subprocess import AsyncioSubprocessRunner
+from captioner.adapters.testing.fault_injector import ScriptedFaultInjector
 from captioner.core.application.durable_pipeline import DurablePipelineService
 from captioner.core.application.run_single import RunSingleService
 from captioner.core.application.stage_executor import EventFactory, StageExecutor
@@ -186,9 +187,36 @@ def build_durable_service(
         lambda: datetime.now(UTC).isoformat(),
     )
     executor = StageExecutor(journal, manifest, durable, event_factory, batch_dir / "work")
+    fault_spec = os.environ.get("CAPTIONER_FAULT_POINT")
+    if fault_spec is not None:
+        if os.environ.get("CAPTIONER_ENABLE_FAULT_INJECTION") != "1":
+            from captioner.core.domain.errors import AppError
+
+            raise AppError("fault_injection.disabled")
+        try:
+            stage_name, point = fault_spec.split(":", maxsplit=1)
+            StageName(stage_name)
+            _validate_fault_point(point)
+        except ValueError as exc:
+            from captioner.core.domain.errors import AppError
+
+            raise AppError("fault_injection.invalid") from exc
+        executor.fault_injector = ScriptedFaultInjector(stage_name, point)
     return DurableServiceBundle(
         DurablePipelineService(
             journal, manifest, executor, event_factory, runners, batch_dir / "control"
         ),
         batch_dir,
     )
+
+
+def _validate_fault_point(point: str) -> None:
+    if point not in {
+        "before_execute",
+        "mid_execute",
+        "after_artifact_write",
+        "before_journal_commit",
+        "after_journal_commit",
+        "before_manifest_projection",
+    }:
+        raise ValueError

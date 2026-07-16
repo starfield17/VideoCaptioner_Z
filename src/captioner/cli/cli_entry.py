@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument("batch_id")
         command_parser.add_argument("--json", action="store_true")
+        if command == "resume":
+            command_parser.add_argument("--model")
+            command_parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
+            command_parser.add_argument("--compute-type")
+            command_parser.add_argument("--language")
+            command_parser.add_argument("--output", type=Path)
     retry_parser = subparsers.add_parser("retry")
     retry_parser.add_argument("batch_id")
     retry_parser.add_argument("--job", required=True)
@@ -111,7 +117,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = cast(
                 dict[str, JsonValue],
                 batch_command.projection_payload(
-                    batch_command.resume(namespace.batch_id, paths=paths), paths=paths
+                    batch_command.resume(
+                        namespace.batch_id,
+                        paths=paths,
+                        overrides=batch_command.ResumeOverrides(
+                            namespace.model,
+                            namespace.device,
+                            namespace.compute_type,
+                            namespace.language,
+                            namespace.output,
+                        ),
+                    ),
+                    paths=paths,
                 ),
             )
             labels = None

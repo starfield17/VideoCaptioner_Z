@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,7 +73,7 @@ class DurablePipelineService:
 
     async def run(self, projection: BatchProjection) -> BatchProjection:
         for job in projection.jobs:
-            if job.state in {JobState.SUCCEEDED, JobState.CANCELLED}:
+            if job.state is JobState.CANCELLED:
                 continue
             projection = await self._run_job(projection, job.job_id)
         return projection
@@ -94,6 +95,41 @@ class DurablePipelineService:
             raise AppError("batch.not_found")
         projection = replay(events)
         self.manifest.reconcile(projection)
+        for job in projection.jobs:
+            for stage in job.stages:
+                if stage.state is StageState.COMMITTED:
+                    for artifact in stage.artifacts:
+                        self.executor.artifact_store.verify(artifact)
+        return projection
+
+    def update_config(
+        self,
+        projection: BatchProjection,
+        *,
+        job_id: str,
+        config: JobConfig,
+        earliest_stage: StageName,
+    ) -> BatchProjection:
+        projection = self._append(
+            projection,
+            "job.config_updated",
+            cast(
+                Mapping[str, FrozenJsonValue],
+                freeze_json_value({"job_id": job_id, "config": config.to_dict()}),
+            ),
+        )
+        current = projection.job(job_id).stage(earliest_stage)
+        if current.state is StageState.COMMITTED:
+            projection = self._append(
+                projection,
+                "stage.invalidated",
+                {
+                    "job_id": job_id,
+                    "stage_name": earliest_stage.value,
+                    "attempt": current.attempt,
+                },
+            )
+        self.manifest.write(projection)
         return projection
 
     async def retry(self, job_id: str, stage: StageName) -> BatchProjection:
@@ -124,9 +160,6 @@ class DurablePipelineService:
             for name in STAGE_PLAN:
                 context.raise_if_cancelled()
                 job = projection.job(job_id)
-                stage = job.stage(name)
-                if stage.state is StageState.COMMITTED:
-                    continue
                 inputs = tuple(
                     artifact
                     for prior in job.stages[: STAGE_PLAN.index(name)]
@@ -138,7 +171,7 @@ class DurablePipelineService:
                     job_id=job_id,
                     runner=self.runners[name],
                     input_artifacts=inputs,
-                    cache_config=_cache_config(job.config, name),
+                    cache_config=_cache_config(job.config, name, Path(job.input_path)),
                     context=context,
                 )
         except AppError as exc:
@@ -150,7 +183,15 @@ class DurablePipelineService:
                 current = self._append(current, "job.cancelled", {"job_id": job_id})
                 self.manifest.write(current)
                 self._clear_markers(job_id)
+            elif (
+                exc.code != "operation.cancelled"
+                and current.job(job_id).state is not JobState.FAILED
+            ):
+                current = self._append(current, "job.failed", {"job_id": job_id})
+                self.manifest.write(current)
             raise
+        if projection.job(job_id).state is JobState.SUCCEEDED:
+            return projection
         projection = self._append(projection, "job.succeeded", {"job_id": job_id})
         self.manifest.write(projection)
         self._clear_markers(job_id)
@@ -179,20 +220,21 @@ class DurablePipelineService:
             for stage in job.stages:
                 if stage.state is not StageState.COMMITTED:
                     continue
-                try:
-                    for artifact in stage.artifacts:
+                for artifact in stage.artifacts:
+                    try:
                         self.executor.artifact_store.verify(artifact)
-                except AppError:
-                    projection = self._append(
-                        projection,
-                        "stage.invalidated",
-                        {
-                            "job_id": job.job_id,
-                            "stage_name": stage.name.value,
-                            "attempt": stage.attempt,
-                        },
-                    )
-                    break
+                    except AppError:
+                        self.executor.artifact_store.resolve(artifact).unlink(missing_ok=True)
+                        projection = self._append(
+                            projection,
+                            "stage.invalidated",
+                            {
+                                "job_id": job.job_id,
+                                "stage_name": stage.name.value,
+                                "attempt": stage.attempt,
+                            },
+                        )
+                        break
         self.manifest.write(projection)
         return projection
 
@@ -224,10 +266,15 @@ def write_cancel_marker(control_dir: Path, *, job_id: str | None) -> Path:
     return target
 
 
-def _cache_config(config: JobConfig, stage: StageName) -> Mapping[str, FrozenJsonValue]:
+def _cache_config(
+    config: JobConfig, stage: StageName, input_path: Path
+) -> Mapping[str, FrozenJsonValue]:
     values: dict[str, object]
     if stage is StageName.INSPECT:
-        values = {"ffprobe_bin": config.ffprobe_bin}
+        values = {
+            "source_sha256": _source_sha256(input_path),
+            "ffprobe_bin": config.ffprobe_bin,
+        }
     elif stage is StageName.NORMALIZE:
         values = {"ffmpeg_bin": config.ffmpeg_bin, "normalization": config.normalization}
     elif stage is StageName.TRANSCRIBE:
@@ -245,3 +292,16 @@ def _cache_config(config: JobConfig, stage: StageName) -> Mapping[str, FrozenJso
     else:
         values = {"output_dir": config.output_dir, "overwrite": config.overwrite}
     return cast(Mapping[str, FrozenJsonValue], freeze_json_value(values))
+
+
+def _source_sha256(path: Path) -> str:
+    if not path.is_file():
+        raise AppError("media.input_missing", {"path": str(path)})
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise AppError("media.input_read_failed", {"path": str(path)}) from exc
+    return digest.hexdigest()

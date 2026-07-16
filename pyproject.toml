@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "captioner"
 version = "0.0.0"
-description = "Single-input subtitle generation with an extensible core"
+description = "Durable batch subtitle generation with resumable verified artifacts"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [

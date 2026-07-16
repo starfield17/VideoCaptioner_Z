@@ -1,12 +1,9 @@
 # Captioner
 
-Captioner is a subtitle-generation application with an extensible core. Phase 1
-provides a single-input vertical slice: FFprobe inspection, FFmpeg normalization to
-16 kHz mono PCM WAV, optional Faster Whisper transcription, deterministic
-Transcript JSON, and SRT export.
-
-The application still has no GUI workflow, batch jobs, LLM, translation,
-alignment, muxing, runtime installer, or model manager.
+Captioner is a durable batch subtitle-generation application. Phase 2 runs one
+or more inputs through inspect, normalize, transcribe, segment, export, and
+publish Stages. An fsynced Journal is the source of truth; a rebuildable
+Manifest and verified content-addressed artifacts support resume and retry.
 
 ## Local commands
 
@@ -28,9 +25,13 @@ is optional and is installed separately:
 
 ```bash
 uv sync --frozen --extra asr-faster-whisper
-captioner run input.mp4 --output build/output \
+captioner run input.mp4 second.wav --output build/output \
   --model tiny --device cpu --compute-type int8 --language en --json
 python scripts/validate_subtitle.py build/output/input.srt
+captioner status batch-... --json
+captioner resume batch-... --json
+captioner retry batch-... --job job-000001 --stage transcribe --json
+captioner cancel batch-... --job job-000001 --json
 ```
 
 The run writes `<source-stem>.transcript.json` and `<source-stem>.srt` only
@@ -45,6 +46,8 @@ media/FFmpeg, `4` ASR/runtime/model, `5` output/export, and `130` cancellation.
 Phase 1 loads one Faster Whisper model per adapter instance and keeps active
 ASR concurrency at one. Unit tests and default CI never download models.
 
-Built-in resources are read from `resources/`. User-writable paths are owned
+Durable state lives under the platformdirs data directory in `batches/` and
+`artifacts/`; workspaces are attempt-scoped and disposable. Built-in resources
+are read from `resources/`. User-writable paths are owned
 by the operating system's standard application directories through
 `platformdirs`.

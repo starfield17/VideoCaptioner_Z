@@ -30,3 +30,12 @@
   IDs, JSON bytes and SRT bytes. Simple segmentation prefers punctuation or
   silence only when a candidate must be split.
 - Phase 1 has no LLM; Faster Whisper is optional and loaded once per engine.
+- Journal is the durable source of truth; Manifest is only a rebuildable projection.
+- `stage.committed` is the linearization point and references only verified CAS artifacts.
+- Manifest projection never precedes the corresponding Journal commit.
+- Abrupt interruption is `interrupted`; cooperative cancellation is `cancelled`, never failed.
+- Retry invalidates only the selected Stage and its downstream suffix.
+- Replaying identical Journal bytes always yields an identical immutable projection.
+- Content-addressed artifact paths derive only from lowercase SHA-256; orphan bytes are allowed.
+- Abrupt interruption may leave incomplete workspace or output projection state, but replay and
+  Artifact verification either repair it or fail explicitly.
