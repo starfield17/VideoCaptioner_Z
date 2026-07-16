@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 from collections.abc import Mapping
@@ -12,6 +13,8 @@ from pathlib import Path
 from captioner.adapters.asr.faster_whisper import FasterWhisperConfig, FasterWhisperEngine
 from captioner.adapters.exporters.srt import serialize_bytes as serialize_srt
 from captioner.adapters.exporters.transcript_json import serialize_bytes as serialize_transcript
+from captioner.adapters.llm.http_transport import HTTPTransport
+from captioner.adapters.llm.openai_compatible import OpenAICompatibleClient
 from captioner.adapters.media.ffmpeg_audio import FFmpegAudioNormalizer
 from captioner.adapters.media.ffprobe import FFprobeMediaInspector
 from captioner.adapters.persistence.batch_lease import BatchLease
@@ -38,6 +41,7 @@ from captioner.adapters.testing.fault_injector import ScriptedFaultInjector
 from captioner.core.application.durable_pipeline import DurablePipelineService
 from captioner.core.application.run_single import RunSingleService
 from captioner.core.application.stage_executor import EventFactory, StageExecutor
+from captioner.core.application.structured_llm_service import Sleep, StructuredLLMService
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.journal import replay
@@ -51,6 +55,7 @@ from captioner.infrastructure.app_paths import (
     resolve_app_paths,
     resolve_safe_child,
 )
+from captioner.infrastructure.config import OpenAICompatibleProvider, load_provider_config
 from captioner.infrastructure.ids import new_id
 
 
@@ -101,6 +106,46 @@ def build_run_service(
 class DurableServiceBundle:
     service: DurablePipelineService
     batch_dir: Path
+
+
+@dataclass(slots=True)
+class LLMRuntime:
+    """One application-wide provider client, semaphore, and retry service."""
+
+    provider: OpenAICompatibleProvider
+    semaphore: asyncio.Semaphore
+    client: OpenAICompatibleClient
+    service: StructuredLLMService
+
+    async def close(self) -> None:
+        await self.client.close()
+
+
+def build_llm_runtime(
+    *,
+    provider_profile: str = "default",
+    paths: AppPaths | None = None,
+    transport: HTTPTransport | None = None,
+    sleep: Sleep | None = None,
+    max_response_bytes: int = 2 * 1024 * 1024,
+) -> LLMRuntime:
+    """Create the single shared LLM runtime at the composition root."""
+    application_paths = resolve_app_paths() if paths is None else paths
+    ensure_runtime_layout(application_paths)
+    provider = load_provider_config(application_paths.config_dir, provider_profile)
+    semaphore = asyncio.Semaphore(provider.max_concurrency)
+    client = OpenAICompatibleClient(
+        provider,
+        transport=transport,
+        semaphore=semaphore,
+        max_response_bytes=max_response_bytes,
+    )
+    service = StructuredLLMService(
+        client,
+        max_retries=provider.max_retries,
+        sleep=asyncio.sleep if sleep is None else sleep,
+    )
+    return LLMRuntime(provider, semaphore, client, service)
 
 
 def create_job_config(

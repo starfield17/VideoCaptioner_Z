@@ -37,6 +37,7 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "filelock" },
+    { name = "httpx" },
     { name = "platformdirs" },
     { name = "pyside6" },
     { name = "regex" },
@@ -74,6 +75,7 @@ requires-dist = [
     { name = "faster-whisper", marker = "extra == 'asr-faster-whisper'", specifier = "==1.2.1" },
     { name = "faster-whisper", marker = "extra == 'asr-faster-whisper-cuda12'", specifier = "==1.2.1" },
     { name = "filelock", specifier = ">=3.18,<4" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "nvidia-cublas-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'asr-faster-whisper-cuda12'", specifier = ">=12,<13" },
     { name = "nvidia-cudnn-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'asr-faster-whisper-cuda12'", specifier = ">=9,<10" },
     { name = "platformdirs", specifier = ">=4.3,<5" },
