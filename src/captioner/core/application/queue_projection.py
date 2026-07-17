@@ -191,6 +191,10 @@ def _item_for_job(
 ) -> JobQueueItem:
     state = _projected_job_state(job.state, entry.lease_state)
     active_stage, active_stage_state, active_stage_attempt = _active_stage(job)
+    # Stale/missing/invalid leases project RUNNING Jobs as INTERRUPTED. The
+    # active Stage must match so Queue rows never show "Interrupted / Running".
+    if state is JobState.INTERRUPTED and active_stage_state is StageState.RUNNING:
+        active_stage_state = StageState.INTERRUPTED
     cancel_requested = entry.batch_cancel_requested or job.job_id in entry.job_cancel_requests
     return JobQueueItem(
         batch_id=entry.batch_id,

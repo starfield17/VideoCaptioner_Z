@@ -246,23 +246,25 @@ def test_zero_terminal_limit_keeps_only_active(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("lease_state", "expected"),
+    ("lease_state", "expected_job", "expected_stage"),
     [
-        ("stale", JobState.INTERRUPTED),
-        ("missing", JobState.INTERRUPTED),
-        ("invalid", JobState.INTERRUPTED),
-        ("active_local", JobState.RUNNING),
-        ("active_remote", JobState.RUNNING),
+        ("stale", JobState.INTERRUPTED, StageState.INTERRUPTED),
+        ("missing", JobState.INTERRUPTED, StageState.INTERRUPTED),
+        ("invalid", JobState.INTERRUPTED, StageState.INTERRUPTED),
+        ("active_local", JobState.RUNNING, StageState.RUNNING),
+        ("active_remote", JobState.RUNNING, StageState.RUNNING),
     ],
 )
 def test_stale_running_projection(
     tmp_path: Path,
     lease_state: LeaseExecutionState,
-    expected: JobState,
+    expected_job: JobState,
+    expected_stage: StageState,
 ) -> None:
+    stages = _stages((StageName.TRANSCRIBE, StageState.RUNNING, 1))
     entry = _entry(
         "batch-a",
-        (_job(tmp_path, "job-000001", state=JobState.RUNNING),),
+        (_job(tmp_path, "job-000001", state=JobState.RUNNING, stages=stages),),
         lease_state=lease_state,
     )
     item = (
@@ -270,7 +272,31 @@ def test_stale_running_projection(
         .refresh_queue()
         .items[0]
     )
-    assert item.state is expected
+    assert item.state is expected_job
+    assert item.active_stage is StageName.TRANSCRIBE
+    assert item.active_stage_state is expected_stage
+    assert item.active_stage_attempt == 1
+
+
+def test_interrupted_job_does_not_rewrite_non_running_stage(tmp_path: Path) -> None:
+    """Only a RUNNING active Stage is projected as INTERRUPTED with the Job."""
+    stages = _stages(
+        (StageName.INSPECT, StageState.COMMITTED, 1),
+        (StageName.NORMALIZE, StageState.FAILED, 1),
+    )
+    entry = _entry(
+        "batch-a",
+        (_job(tmp_path, "job-000001", state=JobState.RUNNING, stages=stages),),
+        lease_state="stale",
+    )
+    item = (
+        QueueProjectionService(FakeCatalog(BatchCatalogSnapshot((entry,), ())))
+        .refresh_queue()
+        .items[0]
+    )
+    assert item.state is JobState.INTERRUPTED
+    assert item.active_stage is StageName.NORMALIZE
+    assert item.active_stage_state is StageState.FAILED
 
 
 def test_current_stage_selection(tmp_path: Path) -> None:

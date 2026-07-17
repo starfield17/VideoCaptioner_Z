@@ -70,6 +70,10 @@ def test_inspect_batch_lease_classifies_states_without_mutation(tmp_path: Path) 
     missing = tmp_path / "missing.json"
     assert inspect_batch_lease(missing, hostname="host-a") == "missing"
 
+    non_file = tmp_path / "lease-as-dir"
+    non_file.mkdir()
+    assert inspect_batch_lease(non_file, hostname="host-a") == "invalid"
+
     local = tmp_path / "local.json"
     local_bytes = _write_owner(local, pid=10, hostname="host-a")
     assert (

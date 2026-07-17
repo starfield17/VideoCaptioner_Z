@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -9,32 +10,39 @@ from captioner.gui.application_boundary import GuiApplicationBoundary
 from captioner.gui_bootstrap import build_gui_application_boundary
 from captioner.infrastructure.app_paths import resolve_app_paths
 
-_PROHIBITED_MODULES = (
+_ISOLATED_IMPORT_CHECK = """
+import sys
+
+import captioner.gui.application_boundary
+import captioner.gui_bootstrap
+
+prohibited = {
     "PySide6",
     "faster_whisper",
     "ctranslate2",
     "torch",
     "transformers",
     "openai",
-)
+}
+loaded = {name.split(".", 1)[0] for name in sys.modules}
+assert not prohibited & loaded, sorted(prohibited & loaded)
+assert captioner.gui.application_boundary.GuiApplicationBoundary is not None
+assert captioner.gui_bootstrap.build_gui_application_boundary is not None
+"""
 
 
 def test_lightweight_import_does_not_load_heavy_sdks() -> None:
-    before = {name for name in sys.modules if name.split(".", 1)[0] in _PROHIBITED_MODULES}
-    module_names = (
-        "captioner.gui.application_boundary",
-        "captioner.gui_bootstrap",
+    """Import boundary modules in a clean subprocess so dependency chains re-run."""
+    result = subprocess.run(
+        [sys.executable, "-c", _ISOLATED_IMPORT_CHECK],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=None,
     )
-    for name in module_names:
-        sys.modules.pop(name, None)
-    import captioner.gui.application_boundary as application_boundary
-    import captioner.gui_bootstrap as gui_bootstrap
-
-    assert application_boundary.GuiApplicationBoundary is not None
-    assert gui_bootstrap.build_gui_application_boundary is not None
-    after = {name for name in sys.modules if name.split(".", 1)[0] in _PROHIBITED_MODULES}
-    newly_loaded = after - before
-    assert newly_loaded == set()
+    assert result.returncode == 0, (
+        f"isolated import check failed\\nstdout:\\n{result.stdout}\\nstderr:\\n{result.stderr}"
+    )
 
 
 def test_structural_boundary_and_empty_snapshot(tmp_path: Path) -> None:

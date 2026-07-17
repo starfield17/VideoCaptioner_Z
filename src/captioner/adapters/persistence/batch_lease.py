@@ -132,8 +132,10 @@ def inspect_batch_lease(
     pid_is_alive: Callable[[int], bool] | None = None,
 ) -> LeaseExecutionState:
     """Classify a lease without acquiring, reclaiming, or rewriting it."""
-    if not path.is_file():
+    if not path.exists():
         return "missing"
+    if not path.is_file():
+        return "invalid"
     probe = BatchLease(
         path,
         token="inspect",
