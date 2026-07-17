@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import cast
 
@@ -18,9 +19,12 @@ from captioner.core.application.source_correction import (
     build_corrected_transcript,
     build_terminology_units,
     merge_terminology,
+    validate_terminology_chunk,
 )
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.llm import (
+    LLMRepairContext,
+    LLMRepairDiagnostic,
     ReviewResponse,
     SourceCorrectionResponse,
     TerminologyResponse,
@@ -142,6 +146,77 @@ def test_terminology_rejects_numeric_loss_and_malformed_artifacts() -> None:
                 ),
             ),
         )
+
+
+@pytest.mark.parametrize(
+    ("source_term", "target_term", "reason", "expected_kind", "actual_kind"),
+    [
+        ("100 dollars", "100 euros", "protected_fact_marker_changed", "currency", "currency"),
+        ("10 percent", "10", "protected_fact_kind_changed", "percentage", "number"),
+        ("100", "100 kilograms", "protected_fact_kind_changed", "number", "unit"),
+    ],
+)
+def test_terminology_protected_diagnostic_is_structured_and_redacted(
+    source_term: str,
+    target_term: str,
+    reason: str,
+    expected_kind: str,
+    actual_kind: str,
+) -> None:
+    transcript = make_transcript((source_term,))
+    units = build_terminology_units(transcript)
+    response = TerminologyResponse(
+        units[0].id,
+        ({"source_term": source_term, "target_term": target_term},),
+    )
+
+    for validate in (
+        lambda: merge_terminology(transcript, "en", "zh-CN", (response,), units),
+        lambda: validate_terminology_chunk({units[0].id: units[0]}, None, (response,)),
+    ):
+        with pytest.raises(AppError) as raised:
+            validate()
+        error = raised.value
+        assert error.code == "llm.protected_token_lost"
+        assert error.params["id"] == units[0].id
+        assert error.params["field"] == "target_term"
+        assert error.params["reason"] == reason
+        assert error.params["expected_kind"] == expected_kind
+        assert error.params["actual_kind"] == actual_kind
+        assert source_term not in str(error)
+        assert target_term not in str(error)
+        assert source_term not in json.dumps(error.to_dict(), ensure_ascii=False)
+        assert target_term not in json.dumps(error.to_dict(), ensure_ascii=False)
+
+        diagnostic = LLMRepairDiagnostic(
+            code=error.code,
+            item_id=cast(str, error.params["id"]),
+            field=cast(str, error.params["field"]),
+            reason=cast(str, error.params["reason"]),
+            expected_kind=cast(str, error.params["expected_kind"]),
+            actual_kind=cast(str, error.params["actual_kind"]),
+            position=cast(int, error.params["position"]),
+        )
+        serialized = diagnostic.to_dict()
+        assert serialized["item_id"] == units[0].id
+        assert serialized["field"] == "target_term"
+        assert serialized["code"] == "llm.protected_token_lost"
+        assert serialized["position"] == 0
+        assert serialized["expected_kind"] == expected_kind
+        assert serialized["actual_kind"] == actual_kind
+        serialized_json = json.dumps(serialized, ensure_ascii=False)
+        assert source_term not in serialized_json
+        assert target_term not in serialized_json
+        repair_json = LLMRepairContext("terminology", "{}", (diagnostic,)).diagnostics_json()
+        for marker in (
+            units[0].id,
+            "field",
+            reason,
+            "position",
+            "expected_kind",
+            "actual_kind",
+        ):
+            assert marker in repair_json
 
 
 def test_sparse_terminology_allows_non_terms_and_uses_token_boundaries() -> None:

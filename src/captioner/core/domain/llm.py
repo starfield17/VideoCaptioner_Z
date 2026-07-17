@@ -59,12 +59,14 @@ class LLMRepairDiagnostic:
     expected_kind: str | None = None
     actual_kind: str | None = None
     position: int | None = None
+    reason: str | None = None
 
     def __post_init__(self) -> None:
         _canonical_nonempty(self.code, "code")
         for value, field_name in (
             (self.item_id, "item_id"),
             (self.field, "field"),
+            (self.reason, "reason"),
             (self.expected_kind, "expected_kind"),
             (self.actual_kind, "actual_kind"),
         ):
@@ -78,6 +80,7 @@ class LLMRepairDiagnostic:
         optional = {
             "item_id": self.item_id,
             "field": self.field,
+            "reason": self.reason,
             "expected_kind": self.expected_kind,
             "actual_kind": self.actual_kind,
             "position": self.position,

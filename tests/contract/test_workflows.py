@@ -132,6 +132,14 @@ def test_release_full_gate_yaml_and_scope() -> None:
     assert "dist\\captioner-windows.zip" in windows_archive
     assert "Expand-Archive" in windows_extract
     assert "Test-Path $Extracted" in windows_post
+    assert 'Join-Path $env:CAPTIONER_EXTRACT_ROOT "captioner"' in windows_post
+    assert 'Join-Path $ExtractedRoot "THIRD_PARTY_NOTICES.md"' in windows_post
+    assert (
+        'Join-Path $ExtractedRoot "resources\\tokenizers\\tokenizer-manifest.json"' in windows_post
+    )
+    assert 'Join-Path $ExtractedRoot "resources\\tokenizers\\cl100k_base.tiktoken"' in windows_post
+    assert 'Join-Path $ExtractedRoot "resources\\tokenizers\\o200k_base.tiktoken"' in windows_post
+    assert 'Join-Path $env:CAPTIONER_EXTRACT_ROOT "THIRD_PARTY_NOTICES.md"' not in windows_post
     assert windows_upload["with"]["path"] == "dist/captioner-windows.zip"
 
     macos_pre = _run(_step(macos, "Pre-archive macOS compiled smoke"))

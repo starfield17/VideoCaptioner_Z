@@ -210,15 +210,17 @@ _UNIT_COMPACT_MARKERS = _alternation(tuple(_UNIT_COMPACT_ALIASES))
 _UNIT_WORD_MARKERS = _alternation(tuple(_UNIT_WORD_ALIASES))
 _NUMBER = r"\d[\d,\.\u066B\u066C]*"
 _SIGN = r"[+\-\u2212\uff0d]\s*"
+_FACT_MARKER_END = r"(?![\w/])"
+_NUMBER_FALLBACK_END = r"(?!\s*(?:[A-Za-z%°$€£¥₹元円ドル]+(?:\s+[A-Za-z%°]+)?)?\s*/)"
 
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "currency",
         re.compile(
-            rf"(?:{_SIGN})?(?:{_CURRENCY_SYMBOL_MARKERS})\s?{_NUMBER}"
-            rf"|(?:{_SIGN})?{_NUMBER}\s?(?:{_CURRENCY_SYMBOL_MARKERS})(?!\w)"
-            rf"|(?:{_SIGN})?(?:{_CURRENCY_WORD_MARKERS})(?!\w)\s+{_NUMBER}"
-            rf"|(?:{_SIGN})?{_NUMBER}\s+(?:{_CURRENCY_WORD_MARKERS})(?!\w)",
+            rf"(?:{_SIGN})?(?:{_CURRENCY_SYMBOL_MARKERS})\s?{_NUMBER}{_FACT_MARKER_END}"
+            rf"|(?:{_SIGN})?{_NUMBER}\s?(?:{_CURRENCY_SYMBOL_MARKERS}){_FACT_MARKER_END}"
+            rf"|(?:{_SIGN})?(?:{_CURRENCY_WORD_MARKERS}){_FACT_MARKER_END}\s+{_NUMBER}{_FACT_MARKER_END}"
+            rf"|(?:{_SIGN})?{_NUMBER}\s+(?:{_CURRENCY_WORD_MARKERS}){_FACT_MARKER_END}",
             re.IGNORECASE,
         ),
     ),
@@ -244,23 +246,23 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "percentage",
         re.compile(
-            rf"(?:{_SIGN})?{_NUMBER}\s?%"
-            rf"|(?:{_SIGN})?{_NUMBER}\s+(?:{_PERCENTAGE_WORD_MARKERS})(?!\w)",
+            rf"(?:{_SIGN})?{_NUMBER}\s?%{_FACT_MARKER_END}"
+            rf"|(?:{_SIGN})?{_NUMBER}\s+(?:{_PERCENTAGE_WORD_MARKERS}){_FACT_MARKER_END}",
             re.IGNORECASE,
         ),
     ),
     (
         "unit",
         re.compile(
-            rf"(?:{_SIGN})?{_NUMBER}\s?(?:{_UNIT_COMPACT_MARKERS})(?!\w)"
-            rf"|(?:{_SIGN})?{_NUMBER}\s+(?:{_UNIT_WORD_MARKERS})(?!\w)"
-            rf"|(?:{_SIGN})?{_NUMBER}\s?\u00d7\s?{_NUMBER}",
+            rf"(?:{_SIGN})?{_NUMBER}\s?(?:{_UNIT_COMPACT_MARKERS}){_FACT_MARKER_END}"
+            rf"|(?:{_SIGN})?{_NUMBER}\s+(?:{_UNIT_WORD_MARKERS}){_FACT_MARKER_END}"
+            rf"|(?:{_SIGN})?{_NUMBER}\s?\u00d7\s?{_NUMBER}{_FACT_MARKER_END}",
             re.IGNORECASE,
         ),
     ),
     (
         "number",
-        re.compile(rf"(?:{_SIGN})?{_NUMBER}(?:[:/]{_NUMBER})?"),
+        re.compile(rf"(?:{_SIGN})?{_NUMBER}(?:[:/]{_NUMBER})?{_NUMBER_FALLBACK_END}"),
     ),
     (
         "abbreviation",

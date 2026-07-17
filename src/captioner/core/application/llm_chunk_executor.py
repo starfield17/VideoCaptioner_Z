@@ -626,6 +626,7 @@ def _repair_diagnostic(error: AppError) -> LLMRepairDiagnostic:
     params = error.params
     item_id = _safe_string(params.get("id")) or _safe_string(params.get("item_id"))
     field = _safe_string(params.get("field"))
+    reason = _safe_string(params.get("reason"))
     expected_kind = _safe_string(params.get("expected_kind"))
     actual_kind = _safe_string(params.get("actual_kind"))
     raw_position = params.get("position")
@@ -634,6 +635,7 @@ def _repair_diagnostic(error: AppError) -> LLMRepairDiagnostic:
         code=error.code,
         item_id=item_id,
         field=field,
+        reason=reason,
         expected_kind=expected_kind,
         actual_kind=actual_kind,
         position=position,

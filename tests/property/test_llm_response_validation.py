@@ -136,6 +136,19 @@ def test_protected_spans_preserve_numeric_semantics(
         ("1 gigabyte", "1 GB", True),
         ("100 dollars", "100 euros", False),
         ("10 kg", "10 g", False),
+        ("100 m", "100 m/s", False),
+        ("100 kg", "100 kg/m", False),
+        ("10 percent", "10 percent/year", False),
+        ("100 dollars", "100 dollars/kg", False),
+        ("100 meters", "100 meters/second", False),
+        ("100 euros", "100 euros/hour", False),
+        ("100", "100 m/s", False),
+        ("10", "10 percent/year", False),
+        ("100", "100 dollars/kg", False),
+        ("100 m", "100 m.", True),
+        ("10 percent", "10 percent,", True),
+        ("100 dollars", "100 dollars!", True),
+        ("10 km/h", "10 km/h", True),
     ],
 )
 def test_protected_token_exact_sequence_and_semantic_facts(
@@ -265,7 +278,8 @@ def test_recognized_textual_unit_cannot_be_added_to_a_bare_number(marker: str) -
 
 
 @pytest.mark.parametrize(
-    "text", ["grammar", "moment", "itemization", "percentagewise", "dollarette"]
+    "text",
+    ["grammar", "moment", "itemization", "percentagewise", "dollarette", "metersomething"],
 )
 def test_unrelated_words_are_not_textual_markers(text: str) -> None:
     assert protected_numeric_tokens(text) == ()

@@ -266,6 +266,10 @@ def test_validation_failure_gets_one_repair_before_cache_write(tmp_path: Path) -
     assert repair.repair_context.diagnostics[0].code == "llm.protected_token_lost"
     assert repair.repair_context.diagnostics[0].item_id == "item-0"
     assert repair.repair_context.diagnostics[0].field == "corrected_source"
+    assert repair.repair_context.diagnostics[0].reason == "protected_fact_removed"
+    assert repair.repair_context.diagnostics[0].position == 0
+    assert repair.repair_context.diagnostics[0].expected_kind == "number"
+    assert repair.repair_context.diagnostics[0].actual_kind is None
     wire = json.loads(
         encode_llm_request(
             repair, "unit-model", 0.1, response_batch_schema(SourceCorrectionResponse)

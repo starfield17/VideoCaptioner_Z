@@ -10,7 +10,7 @@ from captioner.core.domain.errors import AppError
 from captioner.core.domain.llm import SourceCorrectionResponse, TerminologyResponse
 from captioner.core.domain.terminology import Terminology, TerminologyEntry, normalize_term
 from captioner.core.domain.transcript import CorrectedSpan, CorrectedTranscript, Transcript
-from captioner.core.policies.protected_spans import protected_tokens_preserved
+from captioner.core.policies.protected_spans import protected_token_differences
 from captioner.core.policies.segmentation import canonical_words
 from captioner.core.policies.unicode_metrics import join_token_texts
 
@@ -39,7 +39,7 @@ def build_corrected_transcript(
     for word in words:
         response = response_by_id[word.id]
         corrected_text = response.corrected_source
-        _ensure_protected_numbers(word.text, corrected_text, word.id)
+        _ensure_protected_facts(word.text, corrected_text, word.id, "corrected_source")
         spans.append(CorrectedSpan((word.id,), corrected_text))
     return CorrectedTranscript(transcript.id, tuple(spans), expected_ids)
 
@@ -68,7 +68,7 @@ def merge_terminology(
             matched_ids = _match_term_to_word_ids(term.source_term, unit)
             if not matched_ids:
                 raise AppError("llm.terminology_invalid", {"reason": "term_not_in_unit"})
-            _ensure_protected_numbers(term.source_term, term.target_term, unit.id)
+            _ensure_protected_facts(term.source_term, term.target_term, unit.id, "target_term")
             normalized_source = normalize_term(term.source_term)
             existing = entries_by_source.get(normalized_source)
             if existing is None:
@@ -200,7 +200,7 @@ def validate_terminology_chunk(
             matched = _match_term_to_word_ids(term.source_term, unit)
             if not matched:
                 raise AppError("llm.terminology_invalid", {"reason": "term_not_in_unit"})
-            _ensure_protected_numbers(term.source_term, term.target_term, unit.id)
+            _ensure_protected_facts(term.source_term, term.target_term, unit.id, "target_term")
     return ordered
 
 
@@ -228,6 +228,19 @@ def validate_terminology_aggregate(
     return tuple(responses)
 
 
-def _ensure_protected_numbers(source: str, output: str, word_id: str) -> None:
-    if not protected_tokens_preserved(source, output):
-        raise AppError("llm.protected_token_lost", {"id": word_id, "token": "protected"})
+def _ensure_protected_facts(source: str, output: str, item_id: str, field: str) -> None:
+    differences = protected_token_differences(source, output)
+    if not differences:
+        return
+    difference = differences[0]
+    raise AppError(
+        "llm.protected_token_lost",
+        {
+            "id": item_id,
+            "field": field,
+            "reason": difference.code,
+            "position": difference.position,
+            "expected_kind": difference.expected_kind,
+            "actual_kind": difference.actual_kind,
+        },
+    )

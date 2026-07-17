@@ -192,9 +192,13 @@ jobs:
       - name: Post-extraction Windows compiled smoke
         shell: pwsh
         run: |
-          $Extracted = Join-Path $env:CAPTIONER_EXTRACT_ROOT "captioner\captioner.exe"
+          $ExtractedRoot = Join-Path $env:CAPTIONER_EXTRACT_ROOT "captioner"
+          $Extracted = Join-Path $ExtractedRoot "captioner.exe"
           if (-not (Test-Path $Extracted)) { throw "missing extracted executable" }
-          if (-not (Test-Path (Join-Path $env:CAPTIONER_EXTRACT_ROOT "THIRD_PARTY_NOTICES.md"))) { throw "missing extracted notices" }
+          if (-not (Test-Path (Join-Path $ExtractedRoot "THIRD_PARTY_NOTICES.md"))) { throw "missing extracted notices" }
+          if (-not (Test-Path (Join-Path $ExtractedRoot "resources\tokenizers\tokenizer-manifest.json"))) { throw "missing extracted tokenizer manifest" }
+          if (-not (Test-Path (Join-Path $ExtractedRoot "resources\tokenizers\cl100k_base.tiktoken"))) { throw "missing extracted cl100k_base" }
+          if (-not (Test-Path (Join-Path $ExtractedRoot "resources\tokenizers\o200k_base.tiktoken"))) { throw "missing extracted o200k_base" }
           $SmokeRoot = Join-Path $env:RUNNER_TEMP ("captioner-postarchive-" + [guid]::NewGuid())
           New-Item -ItemType Directory -Force -Path $SmokeRoot | Out-Null
           Set-Location $SmokeRoot
