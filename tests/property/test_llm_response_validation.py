@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from itertools import pairwise
+
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -16,7 +18,11 @@ from captioner.core.policies.llm_validation import (
     protected_numeric_tokens,
     validate_responses,
 )
-from captioner.core.policies.protected_spans import protected_tokens_preserved
+from captioner.core.policies.protected_spans import (
+    find_protected_spans,
+    protected_tokens,
+    protected_tokens_preserved,
+)
 
 
 @given(st.text(alphabet=st.characters(blacklist_categories=("Cs",)), min_size=1, max_size=30))
@@ -283,3 +289,36 @@ def test_recognized_textual_unit_cannot_be_added_to_a_bare_number(marker: str) -
 )
 def test_unrelated_words_are_not_textual_markers(text: str) -> None:
     assert protected_numeric_tokens(text) == ()
+
+
+@given(st.integers(min_value=10, max_value=999_999))
+def test_quantity_scanner_preserves_maximal_numbers_in_unsupported_compounds(
+    number: int,
+) -> None:
+    value = str(number)
+    for suffix in ("kg/m", "percent/year", "dollars/kg"):
+        tokens = protected_tokens(f"{value} {suffix}")
+        assert len(tokens) == 1
+        assert tokens[0].numeric_value == value
+        assert tokens[0].kind == "unsupported-compound"
+    for prefix_length in range(1, len(value)):
+        prefix = value[:prefix_length]
+        assert protected_tokens_preserved(prefix, f"{value} kg/m") is False
+
+
+@given(
+    left=st.sampled_from(("", " ", "\t")),
+    right=st.sampled_from(("", " ", "\t")),
+)
+def test_quantity_scanner_normalizes_inline_slash_spacing(left: str, right: str) -> None:
+    token = protected_tokens(f"100 kg{left}/{right}m")[0]
+    assert token.kind == "unsupported-compound"
+    assert token.numeric_value == "100"
+    assert token.marker == "unsupported:unit:kg/m"
+
+
+@given(st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=80))
+def test_quantity_scanner_spans_are_progressing_and_non_overlapping(text: str) -> None:
+    spans = find_protected_spans(text)
+    assert all(span.end > span.start for span in spans)
+    assert all(left.end <= right.start for left, right in pairwise(spans))
