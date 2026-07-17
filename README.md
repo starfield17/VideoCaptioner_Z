@@ -23,6 +23,14 @@ QT_QPA_PLATFORM=offscreen uv run python main.py --gui --smoke-test
 uv run python scripts/build_nuitka.py --clean --version 0.0.0
 ```
 
+Compiled smoke tests must run from a temporary working directory outside the
+repository so a broken resource resolver cannot use `resources/` from the
+source tree. The Release Full Gate archives and then extracts the exact tested
+outputs: Linux `captioner-linux.tar.gz`, Windows `captioner-windows.zip`, and
+macOS `Captioner-macos.zip` containing `Captioner.app`. These are portable
+artifacts; the project does not sign or notarize them, create an installer, or
+publish a GitHub Release automatically.
+
 FFmpeg and FFprobe must be available on `PATH` for a real run. Faster Whisper
 is optional and is installed separately:
 

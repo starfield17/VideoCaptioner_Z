@@ -35,6 +35,11 @@ loads the current credential from the same provider profile while retaining the
 redacted result-affecting Job snapshot. Public provider identity includes
 `tokenizer`; only the API key may differ on Resume.
 
+The configured source-language option is separate from the language detected by
+ASR. On `run`, `--language auto` stores no configured language. On `resume`, an
+omitted option means no override, while `--language auto` explicitly clears the
+configured language and invalidates from transcription.
+
 ## Profiles and schemas
 
 - `deterministic`: the Phase 3 six-Stage pipeline; no LLM runtime is initialized.
@@ -49,8 +54,11 @@ unknown fields, empty/noncanonical text, missing/extra/duplicate IDs, context
 IDs, obvious language mismatch when applicable, and protected numeric loss.
 Protected facts use exact ordered semantic token sequences: adding, deleting, or
 reordering numbers, signs, currency/unit markers, date components, or AM/PM is
-rejected. Response schemas never contain timestamps, durations, Cue boundaries,
-or Word IDs. Application code copies those values from validated domain inputs.
+rejected. Explicit textual markers such as `100 dollars`, `10 percent`, and
+`100 kilograms` are protected with the same strict kind identity as their
+symbolic forms; only declared aliases such as `kilogram`/`kg` normalize.
+Response schemas never contain timestamps, durations, Cue boundaries, or Word
+IDs. Application code copies those values from validated domain inputs.
 
 Provider `json_schema.name` values are stable task-based identities such as
 `captioner_translate_fast_batch_v2`. They never derive from Python class
