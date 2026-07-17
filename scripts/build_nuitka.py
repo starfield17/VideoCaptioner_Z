@@ -196,12 +196,15 @@ def find_unique_artifact(work_root: Path, suffix: str) -> Path:
 
 
 def stage_artifact(layout: BuildLayout, artifact: Path) -> None:
-    """Copy one Nuitka artifact into the standardized final location."""
+    """Stage one Nuitka artifact into the standardized final location.
+
+    Prefer a same-filesystem move over a full tree copy so standalone builds do
+    not pay a second multi-hundred-megabyte directory walk. Cross-device failures
+    fall back to ``shutil.move``'s copy-and-remove path.
+    """
     safe_remove_owned(layout.final_root, (layout.work_root, layout.final_root))
-    if layout.platform_name == "macos":
-        shutil.copytree(artifact, layout.final_root)
-    else:
-        shutil.copytree(artifact, layout.final_root)
+    layout.final_root.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(artifact), str(layout.final_root))
     verify_layout(layout)
 
 

@@ -16,3 +16,5 @@ def test_staged_linux_layout_contains_executable_resources_and_readme(tmp_path: 
     verify_layout(layout)
     assert layout.executable_path.is_file()
     assert (layout.resource_root / "i18n" / "en.json").is_file()
+    # Staging prefers move over copytree, so the work-tree artifact is consumed.
+    assert not artifact.exists()

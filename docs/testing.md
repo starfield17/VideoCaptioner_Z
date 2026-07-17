@@ -95,9 +95,11 @@ or incorrect acknowledgement exits nonzero without modifying any file.
 The corpus runner is shared by the script and CLI. It decodes each Transcript,
 runs the complete deterministic DP/validation pipeline, decodes the canonical
 Track JSON back into a Domain object, re-serializes it byte-for-byte, and parses
-SRT, WebVTT and ASS. The Ubuntu Fast Gate also builds the Nuitka binary and
-executes the same corpus through `--cli subtitle-corpus`; this smoke path does
-not initialize ASR, FFmpeg, CUDA, models or network clients.
+SRT, WebVTT and ASS. The Ubuntu Fast Gate builds the Nuitka standalone binary
+(with a restored Nuitka/ccache directory when available), then runs the same
+corpus through the compiled CLI and a compiled GUI smoke. Source-tree CLI/GUI
+smokes still run on every platform. Compiled smoke paths do not initialize ASR,
+FFmpeg, CUDA, models or network clients.
 
 The golden manifest is not advisory. Tests require schema version, current
 policy signature, current exporter versions, exact fixture/format membership,
