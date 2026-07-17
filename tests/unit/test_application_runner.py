@@ -37,6 +37,10 @@ class FakeBoundary:
     refresh_error: BaseException | None = None
     block_get: threading.Event | None = None
     release_get: threading.Event | None = None
+    operation_thread_ids: list[int] | None = None
+    preview_error: BaseException | None = None
+    config_error: BaseException | None = None
+    provider_test_error: BaseException | None = None
 
     def get_queue_snapshot(self) -> QueueSnapshot:
         self.get_calls.append(threading.get_ident())
@@ -64,6 +68,51 @@ class FakeBoundary:
             return None
 
         return unsubscribe
+
+    def _record_op(self) -> None:
+        if self.operation_thread_ids is not None:
+            self.operation_thread_ids.append(threading.get_ident())
+
+    def preview_inputs(self, request: object) -> Any:
+        self._record_op()
+        if self.preview_error is not None:
+            raise self.preview_error
+        from captioner.core.application.input_selection import InputPreview
+
+        return InputPreview(accepted_paths=(), rejected=())
+
+    def load_configuration(self) -> Any:
+        self._record_op()
+        if self.config_error is not None:
+            raise self.config_error
+        from captioner.core.application.configuration import default_configuration_snapshot
+
+        return default_configuration_snapshot()
+
+    def save_global_settings(self, settings: object) -> Any:
+        return self.load_configuration()
+
+    def save_provider_settings(self, update: object) -> Any:
+        self._record_op()
+        if self.config_error is not None:
+            raise self.config_error
+        from captioner.core.application.configuration import default_configuration_snapshot
+
+        return default_configuration_snapshot()
+
+    def save_user_preset(self, preset: object) -> Any:
+        return self.load_configuration()
+
+    def delete_user_preset(self, name: str) -> Any:
+        return self.load_configuration()
+
+    def test_provider_connection(self, update: object) -> Any:
+        self._record_op()
+        if self.provider_test_error is not None:
+            raise self.provider_test_error
+        from captioner.core.application.configuration import ProviderConnectionResult
+
+        return ProviderConnectionResult(True, "llm.connection_ok")
 
 
 def _wait_until(predicate: Callable[[], bool], timeout_ms: int = 2000) -> bool:
@@ -101,7 +150,7 @@ def test_factory_and_refresh_run_on_worker_thread() -> None:
         boundary_holder.append(boundary)
         return boundary
 
-    bridge = ApplicationRunnerBridge(factory)
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
     snapshots: list[object] = []
     bridge.snapshot_ready.connect(snapshots.append)
     try:
@@ -134,7 +183,7 @@ def test_initial_snapshot_and_started() -> None:
             snapshots=[_empty_snapshot(1)],
         )
 
-    bridge = ApplicationRunnerBridge(factory)
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
     started_spy = QSignalSpy(bridge.started)
     snapshots: list[QueueSnapshot] = []
     bridge.snapshot_ready.connect(snapshots.append)
@@ -160,7 +209,7 @@ def test_manual_refresh_emits_new_snapshot() -> None:
             snapshots=[_empty_snapshot(1), _empty_snapshot(2)],
         )
 
-    bridge = ApplicationRunnerBridge(factory)
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
     snapshots: list[QueueSnapshot] = []
     bridge.snapshot_ready.connect(snapshots.append)
     try:
@@ -185,7 +234,7 @@ def test_structured_app_error() -> None:
             get_error=AppError("queue.test_failure", retryable=True),
         )
 
-    bridge = ApplicationRunnerBridge(factory)
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
     failures: list[RunnerFailure] = []
     bridge.failure.connect(failures.append)
     try:
@@ -212,7 +261,7 @@ def test_unexpected_exception_is_sanitized() -> None:
             get_error=RuntimeError("secret raw text"),
         )
 
-    bridge = ApplicationRunnerBridge(factory)
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
     failures: list[RunnerFailure] = []
     bridge.failure.connect(failures.append)
     try:
@@ -243,7 +292,7 @@ def test_ui_thread_remains_responsive_while_worker_blocks() -> None:
             release_get=release,
         )
 
-    bridge = ApplicationRunnerBridge(factory)
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
     loop = QEventLoop()
     main_timer_fired: list[bool] = []
     snapshots: list[object] = []
@@ -274,7 +323,7 @@ def test_stop_is_idempotent_and_clears_running_thread() -> None:
             snapshots=[_empty_snapshot(1)],
         )
 
-    bridge = ApplicationRunnerBridge(factory)
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
     stopped_spy = QSignalSpy(bridge.stopped)
     snapshots: list[object] = []
     bridge.snapshot_ready.connect(snapshots.append)
@@ -287,3 +336,116 @@ def test_stop_is_idempotent_and_clears_running_thread() -> None:
         assert stopped_spy.count() == 1
     finally:
         bridge.stop()
+
+
+def test_input_config_and_provider_ops_run_on_worker_thread() -> None:
+    from captioner.core.application.configuration import (
+        ExecutionPreset,
+        GlobalSettings,
+        ProviderSettingsUpdate,
+    )
+    from captioner.core.application.input_selection import InputSelectionRequest
+    from captioner.core.domain.stage import PipelineProfile
+
+    main_id = threading.get_ident()
+    op_ids: list[int] = []
+
+    def factory() -> FakeBoundary:
+        return FakeBoundary(
+            main_thread_id=main_id,
+            factory_thread_ids=[],
+            refresh_thread_ids=[],
+            get_calls=[],
+            refresh_calls=[],
+            snapshots=[_empty_snapshot(1)],
+            operation_thread_ids=op_ids,
+        )
+
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
+    previews: list[object] = []
+    configs: list[object] = []
+    tests: list[object] = []
+    queue_failures: list[object] = []
+    config_failures: list[object] = []
+    bridge.input_preview_ready.connect(previews.append)
+    bridge.configuration_ready.connect(configs.append)
+    bridge.provider_test_ready.connect(tests.append)
+    bridge.failure.connect(queue_failures.append)
+    bridge.configuration_failure.connect(config_failures.append)
+    try:
+        bridge.start()
+        assert _wait_until(lambda: True)
+        bridge.request_input_preview(InputSelectionRequest(entries=("/a.wav",)))
+        bridge.request_configuration_load()
+        bridge.request_global_save(GlobalSettings())
+        bridge.request_provider_save(
+            ProviderSettingsUpdate(
+                profile_name="default",
+                base_url="https://example.com/v1",
+                model="m",
+                api_key="secret-key",
+            )
+        )
+        bridge.request_preset_save(
+            ExecutionPreset(
+                name="custom",
+                display_name="Custom",
+                built_in=False,
+                pipeline_profile=PipelineProfile.FAST,
+                model_ref="tiny",
+                device="auto",
+                compute_type="default",
+                source_language=None,
+                target_language="zh-CN",
+                provider_profile="default",
+            )
+        )
+        bridge.request_preset_delete("custom")
+        bridge.request_provider_test(
+            ProviderSettingsUpdate(
+                profile_name="default",
+                base_url="https://example.com/v1",
+                model="m",
+                api_key="secret-key",
+            )
+        )
+        assert _wait_until(lambda: len(previews) >= 1 and len(configs) >= 1 and len(tests) >= 1)
+        assert op_ids
+        assert all(thread_id != main_id for thread_id in op_ids)
+        assert queue_failures == []
+        assert "secret-key" not in repr(previews)
+        assert "secret-key" not in repr(configs)
+        assert "secret-key" not in repr(tests)
+        # Exactly one QThread remains (the bridge worker).
+        assert bridge.running is True
+    finally:
+        assert bridge.stop()
+
+
+def test_configuration_failure_is_operation_specific() -> None:
+    def factory() -> FakeBoundary:
+        return FakeBoundary(
+            main_thread_id=threading.get_ident(),
+            factory_thread_ids=[],
+            refresh_thread_ids=[],
+            get_calls=[],
+            refresh_calls=[],
+            snapshots=[_empty_snapshot(1)],
+            config_error=AppError("config.write_failed"),
+        )
+
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
+    queue_failures: list[object] = []
+    config_failures: list[object] = []
+    bridge.failure.connect(queue_failures.append)
+    bridge.configuration_failure.connect(config_failures.append)
+    try:
+        bridge.start()
+        bridge.request_configuration_load()
+        assert _wait_until(lambda: len(config_failures) >= 1)
+        assert queue_failures == []
+        failure = config_failures[0]
+        assert isinstance(failure, RunnerFailure)
+        assert failure.code == "config.write_failed"
+    finally:
+        assert bridge.stop()

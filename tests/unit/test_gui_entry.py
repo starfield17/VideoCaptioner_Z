@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -13,10 +14,15 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QPushButton, QStackedWidget
 
 from captioner.gui.batch_controller import BatchController
+from captioner.gui.composition import GuiControllers
+from captioner.gui.create_controller import CreateController
 from captioner.gui.gui_entry import main
 from captioner.gui.main_window import MainWindow
 from captioner.gui.queue_table_model import QueueTableModel
+from captioner.gui.settings_controller import SettingsController
+from captioner.gui_bootstrap import load_startup_locale
 from captioner.i18n.service import I18nService
+from captioner.infrastructure.app_paths import resolve_app_paths
 
 _app = QApplication.instance() or QApplication(["test-gui-entry"])
 
@@ -26,11 +32,18 @@ class FakeRunner(QObject):
     failure = Signal(object)
     started = Signal()
     stopped = Signal()
+    input_preview_ready = Signal(object)
+    configuration_ready = Signal(object)
+    provider_test_ready = Signal(object)
+    input_failure = Signal(object)
+    configuration_failure = Signal(object)
+    provider_test_failure = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
         self.start_calls = 0
         self.stop_calls = 0
+        self.load_calls = 0
         self._running = False
 
     @property
@@ -45,6 +58,12 @@ class FakeRunner(QObject):
     def request_refresh(self) -> None:
         return None
 
+    def request_configuration_load(self) -> None:
+        self.load_calls += 1
+
+    def request_input_preview(self, request: object) -> None:
+        return None
+
     def stop(self, timeout_ms: int = 5000) -> bool:
         del timeout_ms
         self.stop_calls += 1
@@ -53,17 +72,20 @@ class FakeRunner(QObject):
         return True
 
 
-def _window(locale: str = "en") -> tuple[MainWindow, BatchController, FakeRunner]:
+def _window(locale: str = "en") -> tuple[MainWindow, GuiControllers, FakeRunner]:
     service = I18nService(locale)
     model = QueueTableModel(service)
     runner = FakeRunner()
-    controller = BatchController(model, runner, refresh_interval_ms=1000)  # type: ignore[arg-type]
-    window = MainWindow(service, controller)
-    return window, controller, runner
+    queue = BatchController(model, runner, refresh_interval_ms=1000)  # type: ignore[arg-type]
+    create = CreateController(runner)  # type: ignore[arg-type]
+    settings = SettingsController(runner)  # type: ignore[arg-type]
+    controllers = GuiControllers(queue=queue, create=create, settings=settings)
+    window = MainWindow(service, controllers)
+    return window, controllers, runner
 
 
-def test_navigation_shell_defaults_to_queue() -> None:
-    window, controller, _runner = _window("en")
+def test_navigation_shell_defaults_to_create() -> None:
+    window, controllers, _runner = _window("en")
     assert window.windowTitle() == "Captioner"
     for name in (
         "navCreateButton",
@@ -83,17 +105,17 @@ def test_navigation_shell_defaults_to_queue() -> None:
         "diagnosticsPage",
     ):
         assert window.findChild(QObject, name) is not None
-    queue_button = window.findChild(QPushButton, "navQueueButton")
-    assert queue_button is not None
-    assert queue_button.isChecked()
-    queue_page = window.findChild(QObject, "queuePage")
-    assert stack.currentWidget() is queue_page
-    controller.stop()
+    create_button = window.findChild(QPushButton, "navCreateButton")
+    assert create_button is not None
+    assert create_button.isChecked()
+    create_page = window.findChild(QObject, "createPage")
+    assert stack.currentWidget() is create_page
+    controllers.queue.stop()
     window.close()
 
 
 def test_chinese_navigation_labels() -> None:
-    window, controller, _runner = _window("zh-CN")
+    window, controllers, _runner = _window("zh-CN")
     labels = {
         "navCreateButton": "创建",
         "navQueueButton": "队列",
@@ -105,12 +127,12 @@ def test_chinese_navigation_labels() -> None:
         button = window.findChild(QPushButton, name)
         assert button is not None
         assert button.text() == text
-    controller.stop()
+    controllers.queue.stop()
     window.close()
 
 
 def test_navigation_switches_pages() -> None:
-    window, controller, _runner = _window()
+    window, controllers, _runner = _window()
     stack = window.findChild(QStackedWidget, "mainPageStack")
     assert stack is not None
     mapping = {
@@ -126,15 +148,16 @@ def test_navigation_switches_pages() -> None:
         assert button is not None and page is not None
         QTest.mouseClick(button, Qt.MouseButton.LeftButton)
         assert stack.currentWidget() is page
-    controller.stop()
+    controllers.queue.stop()
     window.close()
 
 
-def test_window_lifecycle_starts_and_stops_controller() -> None:
-    window, _controller, runner = _window()
+def test_window_lifecycle_starts_queue_and_settings() -> None:
+    window, _controllers, runner = _window()
     window.start()
     window.start()
     assert runner.start_calls == 1
+    assert runner.load_calls == 1
     window.close()
     assert runner.stop_calls == 1
     assert not runner.running
@@ -148,14 +171,48 @@ def test_gui_smoke_test_returns_zero_english() -> None:
     assert main(["--lang", "en", "--smoke-test"]) == 0
 
 
+def test_startup_locale_from_settings(tmp_path: Path) -> None:
+    paths = resolve_app_paths(base_dir=tmp_path / "runtime")
+    paths.config_dir.mkdir(parents=True, exist_ok=True)
+    (paths.config_dir / "settings.toml").write_text(
+        'schema_version = 1\n[global]\nlocale = "zh-CN"\n'
+        'default_output_root = ""\nrecursive_input = true\n'
+        'default_preset_name = "deterministic"\n'
+        'collision_policy = "unique_subdir"\n',
+        encoding="utf-8",
+    )
+    locale, issue = load_startup_locale(paths=paths, explicit_locale=None)
+    assert locale == "zh-CN"
+    assert issue is None
+    locale, issue = load_startup_locale(paths=paths, explicit_locale="en")
+    assert locale == "en"
+    assert issue is None
+
+
+def test_invalid_settings_fallback_to_english(tmp_path: Path) -> None:
+    paths = resolve_app_paths(base_dir=tmp_path / "runtime")
+    paths.config_dir.mkdir(parents=True, exist_ok=True)
+    (paths.config_dir / "settings.toml").write_text("not = [valid", encoding="utf-8")
+    locale, issue = load_startup_locale(paths=paths, explicit_locale=None)
+    assert locale == "en"
+    assert issue == "config.settings_invalid"
+    assert (paths.config_dir / "settings.toml").read_text(encoding="utf-8") == "not = [valid"
+
+
 def test_gui_modules_do_not_import_heavy_sdks() -> None:
     script = """
 import sys
 modules = [
+    "captioner.core.application.input_selection",
+    "captioner.core.application.configuration",
     "captioner.gui.queue_table_model",
     "captioner.gui.application_runner",
     "captioner.gui.batch_controller",
+    "captioner.gui.create_controller",
+    "captioner.gui.settings_controller",
     "captioner.gui.pages.queue_page",
+    "captioner.gui.pages.create_page",
+    "captioner.gui.pages.settings_page",
     "captioner.gui.composition",
 ]
 for name in modules:

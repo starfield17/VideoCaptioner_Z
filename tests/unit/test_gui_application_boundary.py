@@ -72,3 +72,34 @@ def test_boundary_requires_no_qapplication(tmp_path: Path) -> None:
     snapshot = boundary.refresh_queue()
     assert snapshot.revision == 1
     assert snapshot.items == ()
+
+
+def test_boundary_supports_input_preview_and_configuration(tmp_path: Path) -> None:
+    from captioner.core.application.input_selection import InputSelectionRequest
+
+    paths = resolve_app_paths(base_dir=tmp_path / "runtime")
+    media = tmp_path / "clip.wav"
+    media.write_bytes(b"")
+    boundary: GuiApplicationBoundary = build_gui_application_boundary(paths=paths)
+    preview = boundary.preview_inputs(
+        InputSelectionRequest(entries=(str(media), str(media)), recursive=True)
+    )
+    assert preview.accepted_count == 2
+    configuration = boundary.load_configuration()
+    assert configuration.global_settings.locale == "en"
+    assert [preset.name for preset in configuration.presets[:3]] == [
+        "deterministic",
+        "fast",
+        "quality",
+    ]
+
+
+def test_boundary_import_still_excludes_heavy_sdks() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", _ISOLATED_IMPORT_CHECK],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=None,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

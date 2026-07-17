@@ -14,7 +14,11 @@ from captioner.infrastructure.app_paths import CompiledRuntime, resolve_app_path
 def build_parser() -> argparse.ArgumentParser:
     """Build the minimal GUI parser without importing Qt."""
     parser = argparse.ArgumentParser(prog="captioner-gui")
-    parser.add_argument("--lang", default="en", help="Locale, for example zh-CN")
+    parser.add_argument(
+        "--lang",
+        default=None,
+        help="Locale override, for example zh-CN (default: settings.toml or en)",
+    )
     parser.add_argument("--smoke-test", action="store_true", help="Open and close automatically")
     return parser
 
@@ -29,8 +33,15 @@ def main(
         arguments = list(sys.argv[1:] if argv is None else argv)
         namespace = build_parser().parse_args(arguments)
         paths = resolve_app_paths(compiled_runtime=compiled_runtime)
+
+        from captioner.gui_bootstrap import load_startup_locale
+
+        locale, startup_issue = load_startup_locale(
+            paths=paths,
+            explicit_locale=namespace.lang,
+        )
         service = I18nService(
-            locale=namespace.lang,
+            locale=locale,
             resource_dir=paths.i18n_resource_dir,
             strict=True,
         )
@@ -38,14 +49,18 @@ def main(
         from PySide6.QtCore import QTimer
         from PySide6.QtWidgets import QApplication
 
-        from captioner.gui.composition import build_batch_controller
+        from captioner.gui.composition import build_gui_controllers
         from captioner.gui.main_window import MainWindow
 
         app = QApplication.instance()
         if app is None:
             app = QApplication(["captioner-gui", *arguments])
-        controller = build_batch_controller(service, paths=paths)
-        window = MainWindow(service, controller)
+        controllers = build_gui_controllers(
+            service,
+            paths=paths,
+            startup_issue=startup_issue,
+        )
+        window = MainWindow(service, controllers)
         window.show()
         window.start()
         if namespace.smoke_test:

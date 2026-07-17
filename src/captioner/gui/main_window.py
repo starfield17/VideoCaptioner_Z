@@ -1,4 +1,4 @@
-"""Phase 5 desktop shell with sidebar navigation and Queue page."""
+"""Phase 5 desktop shell with sidebar navigation and functional pages."""
 
 from __future__ import annotations
 
@@ -14,9 +14,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from captioner.gui.batch_controller import BatchController
+from captioner.gui.composition import GuiControllers
+from captioner.gui.pages.create_page import CreatePage
 from captioner.gui.pages.placeholder_page import PlaceholderPage
 from captioner.gui.pages.queue_page import QueuePage
+from captioner.gui.pages.settings_page import SettingsPage
 from captioner.i18n.service import I18nService
 
 
@@ -26,10 +28,11 @@ class MainWindow(QMainWindow):
     def __init__(
         self,
         service: I18nService,
-        controller: BatchController,
+        controllers: GuiControllers,
     ) -> None:
         super().__init__()
-        self._controller = controller
+        self._controllers = controllers
+        self._started = False
         self.setWindowTitle(service.translate("gui.window.title"))
         self.resize(1100, 700)
 
@@ -78,14 +81,8 @@ class MainWindow(QMainWindow):
         nav_panel.setLayout(nav_layout)
         nav_panel.setFixedWidth(160)
 
-        create_page = PlaceholderPage(
-            service.translate("gui.nav.create"),
-            service.translate(
-                "gui.placeholder.message", {"page": service.translate("gui.nav.create")}
-            ),
-            "createPage",
-        )
-        queue_page = QueuePage(service, controller)
+        create_page = CreatePage(service, controllers.create)
+        queue_page = QueuePage(service, controllers.queue)
         history_page = PlaceholderPage(
             service.translate("gui.nav.history"),
             service.translate(
@@ -94,14 +91,7 @@ class MainWindow(QMainWindow):
             ),
             "historyPage",
         )
-        settings_page = PlaceholderPage(
-            service.translate("gui.nav.settings"),
-            service.translate(
-                "gui.placeholder.message",
-                {"page": service.translate("gui.nav.settings")},
-            ),
-            "settingsPage",
-        )
+        settings_page = SettingsPage(service, controllers.settings)
         diagnostics_page = PlaceholderPage(
             service.translate("gui.nav.diagnostics"),
             service.translate(
@@ -134,14 +124,19 @@ class MainWindow(QMainWindow):
         central.setLayout(body)
         self.setCentralWidget(central)
 
-        queue_button.setChecked(True)
-        self._page_stack.setCurrentWidget(queue_page)
+        create_button.setChecked(True)
+        self._page_stack.setCurrentWidget(create_page)
 
     def start(self) -> None:
-        self._controller.start()
+        if self._started:
+            return
+        self._started = True
+        self._controllers.queue.start()
+        self._controllers.settings.load()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._controller.stop():
+        # Queue controller owns the shared runner lifecycle.
+        if self._controllers.queue.stop():
             event.accept()
             return
         event.ignore()
