@@ -63,7 +63,7 @@ def validate_responses(
         response_id = _response_id(response)
         source = source_map.get(response_id)
         if source is not None:
-            _validate_protected_numbers(source, " ".join(_protected_output_texts(response)))
+            _validate_protected_fields(source, response)
         if target_language is not None:
             for text in _language_texts(response):
                 if is_obvious_wrong_language(text, target_language):
@@ -249,42 +249,46 @@ def _language_texts(response: object) -> tuple[str, ...]:
 
 
 def _protected_output_texts(response: object) -> tuple[str, ...]:
+    """Return every model-controlled text that must preserve protected facts.
+
+    Fast responses yield both corrected_source and translated_text so each field
+    is checked against the source independently.
+    """
     if isinstance(response, Mapping):
         raw = cast(Mapping[str, object], response)
-        translated = raw.get("translated_text")
-        if isinstance(translated, str):
-            return (translated,)
-        corrected = raw.get("corrected_source")
-        if isinstance(corrected, str):
-            return (corrected,)
-        source_term = raw.get("source_term")
+        texts: list[str] = []
+        for key in ("corrected_source", "translated_text"):
+            value = raw.get(key)
+            if isinstance(value, str):
+                texts.append(value)
         terms = raw.get("terms")
         if isinstance(terms, Sequence) and not isinstance(terms, (str, bytes, bytearray)):
-            return tuple(
-                value
-                for term in cast(Sequence[object], terms)
-                if isinstance(term, Mapping)
-                for value in (cast(Mapping[str, object], term).get("target_term"),)
-                if isinstance(value, str)
-            )
+            for term in cast(Sequence[object], terms):
+                if not isinstance(term, Mapping):
+                    continue
+                target = cast(Mapping[str, object], term).get("target_term")
+                if isinstance(target, str):
+                    texts.append(target)
+        if texts:
+            return tuple(texts)
+        source_term = raw.get("source_term")
         return (source_term,) if isinstance(source_term, str) else ()
-    translated = getattr(response, "translated_text", None)
-    if isinstance(translated, str):
-        return (translated,)
-    corrected = getattr(response, "corrected_source", None)
-    if isinstance(corrected, str):
-        return (corrected,)
-    source_term = getattr(response, "source_term", None)
-    if isinstance(source_term, str) and source_term:
-        return (source_term,)
+    if isinstance(response, FastTranslationResponse):
+        return (response.corrected_source, response.translated_text)
+    texts_obj: list[str] = []
+    for attr in ("corrected_source", "translated_text"):
+        value = getattr(response, attr, None)
+        if isinstance(value, str):
+            texts_obj.append(value)
     terms = getattr(response, "terms", ())
     if isinstance(terms, Sequence):
-        return tuple(
-            term.target_term
-            for term in cast(Sequence[object], terms)
-            if isinstance(term, TerminologyTerm)
-        )
-    return ()
+        for term in cast(Sequence[object], terms):
+            if isinstance(term, TerminologyTerm):
+                texts_obj.append(term.target_term)
+    if texts_obj:
+        return tuple(texts_obj)
+    source_term = getattr(response, "source_term", None)
+    return (source_term,) if isinstance(source_term, str) and source_term else ()
 
 
 def _validate_text(text: str) -> None:
@@ -296,6 +300,36 @@ def _validate_text(text: str) -> None:
         raise AppError("llm.non_canonical_text", {"reason": "control"}) from exc
     if canonical != text:
         raise AppError("llm.non_canonical_text")
+
+
+def _validate_protected_fields(source: str, response: object) -> None:
+    """Apply protected-token checks with the right field pairing policy.
+
+    Fast responses must validate corrected_source and translated_text separately
+    against the source so one field cannot mask loss in the other. Terminology
+    pairs each term's source with its target (handled by the stage semantic
+    validator); generic validation only checks term targets as a group when the
+    response is not Fast.
+    """
+    if isinstance(response, FastTranslationResponse):
+        for output_text in _protected_output_texts(response):
+            _validate_protected_numbers(source, output_text)
+        return
+    if isinstance(response, Mapping):
+        raw = cast(Mapping[str, object], response)
+        if "corrected_source" in raw and "translated_text" in raw:
+            for output_text in _protected_output_texts(raw):
+                _validate_protected_numbers(source, output_text)
+            return
+        if "terms" in raw:
+            return
+    if isinstance(response, TerminologyResponse):
+        # Term-local protected checks run in the terminology semantic validator.
+        return
+    outputs = _protected_output_texts(cast(object, response))
+    if not outputs:
+        return
+    _validate_protected_numbers(source, " ".join(outputs))
 
 
 def _validate_protected_numbers(source: str, output: str) -> None:

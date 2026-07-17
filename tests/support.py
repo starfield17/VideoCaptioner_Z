@@ -49,6 +49,7 @@ def llm_snapshot(
         "request_timeout_sec": 30.0,
         "max_retries": 2,
         "temperature": 0.1,
+        "tokenizer": "cl100k_base",
         "profile": profile.value,
         "source_language": source_language,
         "target_language": target_language,

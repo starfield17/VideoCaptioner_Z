@@ -31,7 +31,9 @@ PUBLIC_PROVIDER_FIELDS = (
     "request_timeout_sec",
     "max_retries",
     "temperature",
+    "tokenizer",
 )
+_SUPPORTED_TOKENIZERS = frozenset({"cl100k_base", "o200k_base", "auto"})
 
 _FAST_PROMPTS = ("translate_fast", "repair_structured")
 _QUALITY_PROMPTS = (
@@ -72,6 +74,7 @@ class ProviderPublicSnapshot:
     request_timeout_sec: float
     max_retries: int
     temperature: float
+    tokenizer: str = "cl100k_base"
 
     def __post_init__(self) -> None:
         for value, field_name in (
@@ -89,12 +92,15 @@ class ProviderPublicSnapshot:
             raise AppError("llm.config_invalid", {"field": "request_timeout_sec"})
         if not _finite_nonnegative(self.temperature):
             raise AppError("llm.config_invalid", {"field": "temperature"})
+        if self.tokenizer.strip() not in _SUPPORTED_TOKENIZERS:
+            raise AppError("llm.config_invalid", {"field": "tokenizer"})
         object.__setattr__(self, "kind", self.kind.strip())
         object.__setattr__(self, "provider_profile", self.provider_profile.strip())
         object.__setattr__(self, "base_url", self.base_url.strip())
         object.__setattr__(self, "model", self.model.strip())
         object.__setattr__(self, "request_timeout_sec", float(self.request_timeout_sec))
         object.__setattr__(self, "temperature", float(self.temperature))
+        object.__setattr__(self, "tokenizer", self.tokenizer.strip())
 
     @classmethod
     def from_mapping(cls, value: object) -> ProviderPublicSnapshot:
@@ -111,7 +117,18 @@ class ProviderPublicSnapshot:
         timeout = _required_number(raw, "request_timeout_sec")
         retries = _required_int(raw, "max_retries", minimum=0)
         temperature = _required_number(raw, "temperature", minimum=0)
-        return cls(kind, profile, base_url, model, max_concurrency, timeout, retries, temperature)
+        tokenizer = _required_string(raw, "tokenizer")
+        return cls(
+            kind,
+            profile,
+            base_url,
+            model,
+            max_concurrency,
+            timeout,
+            retries,
+            temperature,
+            tokenizer,
+        )
 
     def to_mapping(self) -> dict[str, JsonValue]:
         return {
@@ -123,6 +140,7 @@ class ProviderPublicSnapshot:
             "request_timeout_sec": self.request_timeout_sec,
             "max_retries": self.max_retries,
             "temperature": self.temperature,
+            "tokenizer": self.tokenizer,
         }
 
     def changed_fields(self, other: ProviderPublicSnapshot) -> tuple[str, ...]:

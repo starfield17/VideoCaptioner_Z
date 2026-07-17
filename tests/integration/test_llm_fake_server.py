@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
+from typing import cast
 
 import pytest
 
@@ -73,13 +75,48 @@ class FakeStreamResponse:
         yield self.body
 
 
+_SCHEMA_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _validate_provider_schema_name(body: bytes) -> HTTPResponse | None:
+    """Simulate real OpenAI-compatible rejection of illegal json_schema.name."""
+    try:
+        parsed: object = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return HTTPResponse(400, {}, b'{"error":"invalid_json"}')
+    if not isinstance(parsed, dict):
+        return HTTPResponse(400, {}, b'{"error":"invalid_body"}')
+    payload = cast(dict[str, object], parsed)
+    response_format = payload.get("response_format")
+    if not isinstance(response_format, dict):
+        return HTTPResponse(400, {}, b'{"error":"missing_response_format"}')
+    format_map = cast(dict[str, object], response_format)
+    json_schema = format_map.get("json_schema")
+    if not isinstance(json_schema, dict):
+        return HTTPResponse(400, {}, b'{"error":"missing_json_schema"}')
+    schema_map = cast(dict[str, object], json_schema)
+    if "name" not in schema_map:
+        return HTTPResponse(400, {}, b'{"error":"missing_schema_name"}')
+    name = schema_map.get("name")
+    if not isinstance(name, str) or not name:
+        return HTTPResponse(400, {}, b'{"error":"empty_schema_name"}')
+    if _SCHEMA_NAME_RE.fullmatch(name) is None:
+        return HTTPResponse(400, {}, b'{"error":"invalid_schema_name"}')
+    return None
+
+
 @dataclass(slots=True)
 class FakeServer:
     responses: list[HTTPResponse | Exception]
     requests: list[FakeRequest] = field(default_factory=lambda: list[FakeRequest]())
+    validate_schema_name: bool = True
 
     async def __call__(self, request: FakeRequest) -> HTTPResponse:
         self.requests.append(request)
+        if self.validate_schema_name:
+            rejected = _validate_provider_schema_name(request.content)
+            if rejected is not None:
+                return rejected
         outcome = self.responses.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -197,3 +234,38 @@ def test_fake_server_timeout_is_classified_without_secret() -> None:
         asyncio.run(client.close())
         asyncio.run(raw_client.aclose())
     assert "unit-test-key" not in str(raised.value)
+
+
+def test_fake_server_rejects_invalid_schema_name() -> None:
+    server = FakeServer([HTTPResponse(200, {}, _success_body())])
+    # Directly exercise schema-name validation used by FakeServer.
+    missing = _validate_provider_schema_name(b'{"response_format":{"json_schema":{}}}')
+    assert missing is not None and missing.status_code == 400
+    empty = _validate_provider_schema_name(b'{"response_format":{"json_schema":{"name":""}}}')
+    assert empty is not None and empty.status_code == 400
+    illegal = _validate_provider_schema_name(
+        b'{"response_format":{"json_schema":{"name":"bad.<locals>.Name"}}}'
+    )
+    assert illegal is not None and illegal.status_code == 400
+    too_long = _validate_provider_schema_name(
+        json.dumps({"response_format": {"json_schema": {"name": "a" * 65}}}).encode()
+    )
+    assert too_long is not None and too_long.status_code == 400
+    ok = _validate_provider_schema_name(
+        b'{"response_format":{"json_schema":{"name":"captioner_correct_source_batch_v1"}}}'
+    )
+    assert ok is None
+
+    client, raw_client = _client(server)
+    try:
+        result = asyncio.run(
+            client.generate_structured(_request(), SourceCorrectionResponse, ExecutionContext())
+        )
+    finally:
+        asyncio.run(client.close())
+        asyncio.run(raw_client.aclose())
+    assert result.id == "item-1"
+    body = json.loads(server.requests[0].content)
+    name = body["response_format"]["json_schema"]["name"]
+    assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
+    assert "<locals>" not in name

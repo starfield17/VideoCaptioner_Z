@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from captioner.core.domain.errors import AppError
@@ -178,6 +178,54 @@ def _terminology_responses_by_id(
             raise AppError("llm.duplicate_id", {"id": response_id})
         result[response_id] = response
     return result
+
+
+def validate_terminology_chunk(
+    units_by_id: Mapping[str, TerminologyUnit],
+    chunk: object,
+    responses: Sequence[object],
+) -> tuple[object, ...]:
+    """Chunk-local terminology checks that must pass before cache put."""
+    del chunk
+    ordered = tuple(responses)
+    for response in ordered:
+        if not isinstance(response, TerminologyResponse):
+            raise AppError("llm.response_invalid", {"reason": "response_type"})
+        unit = units_by_id.get(response.id)
+        if unit is None:
+            raise AppError("llm.terminology_invalid", {"reason": "unit_id", "id": response.id})
+        for term in response.terms:
+            if not term.source_term.strip() or not term.target_term.strip():
+                raise AppError("llm.terminology_invalid", {"reason": "empty_term"})
+            matched = _match_term_to_word_ids(term.source_term, unit)
+            if not matched:
+                raise AppError("llm.terminology_invalid", {"reason": "term_not_in_unit"})
+            _ensure_protected_numbers(term.source_term, term.target_term, unit.id)
+    return ordered
+
+
+def validate_terminology_aggregate(
+    units: Sequence[TerminologyUnit],
+    responses: Sequence[object],
+) -> tuple[object, ...]:
+    """Cross-chunk conflict detection after all chunks validate locally."""
+    units_by_id = {unit.id: unit for unit in units}
+    targets_by_source: dict[str, str] = {}
+    for response in responses:
+        if not isinstance(response, TerminologyResponse):
+            raise AppError("llm.response_invalid", {"reason": "response_type"})
+        unit = units_by_id.get(response.id)
+        if unit is None:
+            raise AppError("llm.terminology_invalid", {"reason": "unit_id", "id": response.id})
+        for term in response.terms:
+            normalized_source = normalize_term(term.source_term)
+            existing = targets_by_source.get(normalized_source)
+            if existing is None:
+                targets_by_source[normalized_source] = normalize_term(term.target_term)
+                continue
+            if existing != normalize_term(term.target_term):
+                raise AppError("llm.terminology_conflict", {"source": term.source_term})
+    return tuple(responses)
 
 
 def _ensure_protected_numbers(source: str, output: str, word_id: str) -> None:

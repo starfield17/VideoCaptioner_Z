@@ -27,12 +27,15 @@ from captioner.core.policies.llm_chunking import (
     ChunkItem,
     LLMChunk,
     SerializedRequestTokenEstimator,
+    validate_request_budget,
 )
 from captioner.core.policies.llm_validation import validate_response_schema, validate_responses
 from captioner.core.ports.llm import LLMClient
 from captioner.core.ports.llm_cache import LLMCachePort
 
 type ChunkRequestFactory = Callable[[LLMChunk], LLMRequest]
+type ChunkSemanticValidator[T] = Callable[[LLMChunk, tuple[T, ...]], tuple[T, ...]]
+type AggregateSemanticValidator[T] = Callable[[tuple[T, ...]], tuple[T, ...]]
 
 
 class ChunkPlannerPort(Protocol):
@@ -76,6 +79,9 @@ _VALIDATION_REPAIR_ERRORS = frozenset(
         "llm.non_canonical_text",
         "llm.wrong_language",
         "llm.protected_token_lost",
+        "llm.terminology_invalid",
+        "llm.terminology_conflict",
+        "llm.correction_units_invalid",
     }
 )
 
@@ -101,6 +107,7 @@ class LLMChunkExecutionConfig:
     repair_prompt_version: str = ""
     repair_prompt_content_sha256: str = ""
     repair_prompt_content: str = ""
+    tokenizer: str = "cl100k_base"
     context_payload_factory: Callable[[LLMChunk], Mapping[str, JsonValue]] | None = field(
         default=None, repr=False, compare=False
     )
@@ -121,6 +128,10 @@ class LLMChunkExecutor:
     cache: LLMCachePort
     planner: ChunkPlannerPort
     config: LLMChunkExecutionConfig
+    # Keys written during this execute() call; used for aggregate cleanup.
+    _written_keys: list[LLMCacheKey] = field(
+        default_factory=lambda: list[LLMCacheKey](), init=False, repr=False
+    )
 
     async def execute[T](
         self,
@@ -129,6 +140,8 @@ class LLMChunkExecutor:
         context: ExecutionContext | None = None,
         request_factory: ChunkRequestFactory | None = None,
         validation_source_texts: Mapping[str, str] | None = None,
+        semantic_validator: ChunkSemanticValidator[T] | None = None,
+        aggregate_validator: AggregateSemanticValidator[T] | None = None,
     ) -> tuple[T, ...]:
         execution = ExecutionContext() if context is None else context
         ordered = tuple(items)
@@ -137,6 +150,11 @@ class LLMChunkExecutor:
         chunks = self._plan(ordered, factory, batch_schema)
         if not chunks:
             return ()
+        self._written_keys = []
+        object_semantic = cast(
+            ChunkSemanticValidator[object] | None,
+            semantic_validator,
+        )
         tasks = [
             asyncio.create_task(
                 self._execute_with_shrink(
@@ -147,6 +165,7 @@ class LLMChunkExecutor:
                     factory,
                     execution,
                     validation_source_texts,
+                    object_semantic,
                 )
             )
             for chunk in chunks
@@ -169,7 +188,30 @@ class LLMChunkExecutor:
         expected_ids = tuple(item.id for item in ordered)
         if set(by_id) != set(expected_ids):
             raise AppError("llm.missing_id", {"ids": list(expected_ids)})
-        return tuple(cast(T, by_id[item_id]) for item_id in expected_ids)
+        ordered_results = tuple(cast(T, by_id[item_id]) for item_id in expected_ids)
+        if aggregate_validator is not None:
+            try:
+                ordered_results = aggregate_validator(ordered_results)
+            except AppError:
+                self._cleanup_written_keys()
+                raise
+        return ordered_results
+
+    def _cleanup_written_keys(self) -> None:
+        """Remove only cache entries written during this execute() call."""
+        failures: list[str] = []
+        for key in self._written_keys:
+            try:
+                self.cache.remove(key)
+            except Exception as exc:
+                failures.append(key.digest)
+                del exc
+        self._written_keys = []
+        if failures:
+            raise AppError(
+                "llm.cache_cleanup_failed",
+                {"keys": cast(list[JsonValue], failures)},
+            )
 
     async def _execute_with_shrink(
         self,
@@ -180,6 +222,7 @@ class LLMChunkExecutor:
         request_factory: ChunkRequestFactory,
         context: ExecutionContext,
         validation_source_texts: Mapping[str, str] | None,
+        semantic_validator: ChunkSemanticValidator[object] | None,
     ) -> tuple[object, ...]:
         try:
             return await self._execute_chunk(
@@ -189,6 +232,7 @@ class LLMChunkExecutor:
                 request_factory,
                 context,
                 validation_source_texts,
+                semantic_validator,
             )
         except AppError as exc:
             if exc.code not in _ID_MISMATCH_ERRORS or len(chunk.items) < 2:
@@ -222,6 +266,7 @@ class LLMChunkExecutor:
                 request_factory,
                 context,
                 validation_source_texts,
+                semantic_validator,
             )
             right_result = await self._execute_with_shrink(
                 right,
@@ -231,6 +276,7 @@ class LLMChunkExecutor:
                 request_factory,
                 context,
                 validation_source_texts,
+                semantic_validator,
             )
             return (*left_result, *right_result)
 
@@ -242,6 +288,7 @@ class LLMChunkExecutor:
         request_factory: ChunkRequestFactory,
         context: ExecutionContext,
         validation_source_texts: Mapping[str, str] | None,
+        semantic_validator: ChunkSemanticValidator[object] | None,
     ) -> tuple[object, ...]:
         request = request_factory(chunk)
         if request.item_ids != chunk.item_ids or request.context_ids != chunk.context_ids:
@@ -251,36 +298,75 @@ class LLMChunkExecutor:
         cached = self.cache.get(key, batch_schema)
         if cached is not None:
             try:
-                return self._validate_and_order(cached, item_schema, chunk, validation_source_texts)
+                return self._validate_and_order(
+                    cached,
+                    item_schema,
+                    chunk,
+                    validation_source_texts,
+                    semantic_validator,
+                )
             except AppError:
                 self.cache.remove(key)
+        estimator = self._estimator()
+        validate_request_budget(
+            request,
+            batch_schema,
+            estimator,
+            self.config.chunking.max_input_tokens,
+            request_kind=request.task_kind,
+        )
         try:
             generated = await self.client.generate_structured(request, batch_schema, context)
             responses = self._validate_and_order(
-                generated, item_schema, chunk, validation_source_texts
+                generated,
+                item_schema,
+                chunk,
+                validation_source_texts,
+                semantic_validator,
             )
         except AppError as exc:
             if exc.code not in _VALIDATION_REPAIR_ERRORS:
                 raise
             context.raise_if_cancelled()
+            repair_request = structured_repair_request(
+                request,
+                repair_prompt_id=self.config.repair_prompt_id,
+                repair_prompt_version=self.config.repair_prompt_version,
+                repair_prompt_content_sha256=self.config.repair_prompt_content_sha256,
+                repair_prompt_content=self.config.repair_prompt_content,
+            )
+            validate_request_budget(
+                repair_request,
+                batch_schema,
+                estimator,
+                self.config.chunking.max_input_tokens,
+                request_kind=repair_request.task_kind,
+            )
             repaired = await self.client.generate_structured(
-                structured_repair_request(
-                    request,
-                    repair_prompt_id=self.config.repair_prompt_id,
-                    repair_prompt_version=self.config.repair_prompt_version,
-                    repair_prompt_content_sha256=self.config.repair_prompt_content_sha256,
-                    repair_prompt_content=self.config.repair_prompt_content,
-                ),
+                repair_request,
                 batch_schema,
                 context,
             )
             responses = self._validate_and_order(
-                repaired, item_schema, chunk, validation_source_texts
+                repaired,
+                item_schema,
+                chunk,
+                validation_source_texts,
+                semantic_validator,
             )
         cache_value = _batch_from_responses(batch_schema, responses)
         context.raise_if_cancelled()
         self.cache.put(key, cache_value, batch_schema)
+        self._written_keys.append(key)
         return responses
+
+    def _estimator(self) -> SerializedRequestTokenEstimator:
+        return SerializedRequestTokenEstimator(
+            getattr(self.planner, "token_counter", _PlannerCounter()),
+            self.config.model,
+            self.config.temperature,
+            response_schema_version=self.config.response_schema_version,
+        )
 
     def _cache_key(
         self, request: LLMRequest, response_schema: type[StructuredResponseBatch]
@@ -296,6 +382,7 @@ class LLMChunkExecutor:
             chunk_config=self.config.chunk_config(),
             response_schema_version=self.config.response_schema_version,
             response_schema=response_schema,
+            tokenizer=self.config.tokenizer,
         )
 
     def _default_request(self, chunk: LLMChunk) -> LLMRequest:
@@ -327,11 +414,7 @@ class LLMChunkExecutor:
         request_factory: ChunkRequestFactory,
         response_schema: type[StructuredResponseBatch],
     ) -> tuple[LLMChunk, ...]:
-        estimator = SerializedRequestTokenEstimator(
-            getattr(self.planner, "token_counter", _PlannerCounter()),
-            self.config.model,
-            self.config.temperature,
-        )
+        estimator = self._estimator()
         method = getattr(self.planner, "plan_for_request", None)
         if callable(method):
             typed_method = cast(
@@ -365,11 +448,7 @@ class LLMChunkExecutor:
         response_schema: type[StructuredResponseBatch],
         index: int,
     ) -> LLMChunk:
-        estimator = SerializedRequestTokenEstimator(
-            getattr(self.planner, "token_counter", _PlannerCounter()),
-            self.config.model,
-            self.config.temperature,
-        )
+        estimator = self._estimator()
         method = getattr(self.planner, "plan_range_for_request", None)
         if callable(method):
             typed_method = cast(
@@ -396,6 +475,7 @@ class LLMChunkExecutor:
         item_schema: type[object],
         chunk: LLMChunk,
         validation_source_texts: Mapping[str, str] | None,
+        semantic_validator: ChunkSemanticValidator[object] | None,
     ) -> tuple[object, ...]:
         responses = tuple(
             validate_response_schema(_response_mapping(response), item_schema)
@@ -418,7 +498,10 @@ class LLMChunkExecutor:
             target_language=self.config.target_language,
         )
         by_id = {_response_id(response): response for response in validated}
-        return tuple(by_id[item_id] for item_id in expected_ids)
+        ordered = tuple(by_id[item_id] for item_id in expected_ids)
+        if semantic_validator is not None:
+            ordered = semantic_validator(chunk, ordered)
+        return ordered
 
 
 def _responses_from_batch(value: object) -> tuple[object, ...]:

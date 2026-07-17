@@ -108,3 +108,96 @@ def test_cancellation_after_backoff_is_not_retried() -> None:
     service = StructuredLLMService(client, sleep=cancel_sleep)
     with pytest.raises(AppError, match=r"operation\.cancelled"):
         asyncio.run(service.generate_structured(_request(), SourceCorrectionResponse, context))
+
+
+def test_cancel_interrupts_retry_backoff() -> None:
+    client = ScriptedClient([AppError("llm.rate_limited", retryable=True)])
+    context = ExecutionContext()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def sleep(delay: float) -> None:
+        del delay
+        started.set()
+        await asyncio.sleep(10)
+
+    service = StructuredLLMService(client, max_retries=5, sleep=sleep)
+
+    async def run() -> None:
+        try:
+            await service.generate_structured(_request(), SourceCorrectionResponse, context)
+        except AppError as exc:
+            assert exc.code == "operation.cancelled"
+            finished.set()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(run())
+        await started.wait()
+        context.cancel()
+        await asyncio.wait_for(finished.wait(), timeout=1.0)
+        await task
+        pending = [item for item in asyncio.all_tasks() if item is not asyncio.current_task()]
+        assert not any("sleep" in repr(item.get_coro()) for item in pending)
+
+    asyncio.run(scenario())
+    assert len(client.calls) == 1
+
+
+def test_cancelled_backoff_does_not_retry() -> None:
+    client = ScriptedClient([AppError("llm.timeout", retryable=True)])
+    context = ExecutionContext()
+
+    async def sleep(delay: float) -> None:
+        del delay
+        context.cancel()
+        await asyncio.sleep(0.01)
+
+    service = StructuredLLMService(client, max_retries=5, sleep=sleep)
+    with pytest.raises(AppError, match=r"operation\.cancelled"):
+        asyncio.run(service.generate_structured(_request(), SourceCorrectionResponse, context))
+    assert len(client.calls) == 1
+
+
+def test_cancelled_backoff_leaves_no_pending_tasks() -> None:
+    client = ScriptedClient([AppError("llm.network_error", retryable=True)])
+    context = ExecutionContext()
+
+    async def sleep(delay: float) -> None:
+        del delay
+        context.cancel()
+        await asyncio.Event().wait()
+
+    service = StructuredLLMService(client, max_retries=3, sleep=sleep)
+
+    async def scenario() -> None:
+        with pytest.raises(AppError, match=r"operation\.cancelled"):
+            await service.generate_structured(_request(), SourceCorrectionResponse, context)
+        await asyncio.sleep(0)
+        current = asyncio.current_task()
+        leftovers = [
+            task for task in asyncio.all_tasks() if task is not current and not task.done()
+        ]
+        assert leftovers == []
+
+    asyncio.run(scenario())
+
+
+def test_completed_backoff_still_retries() -> None:
+    client = ScriptedClient(
+        [
+            AppError("llm.rate_limited", retryable=True),
+            SourceCorrectionResponse("item-1", "ok"),
+        ]
+    )
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    service = StructuredLLMService(client, max_retries=2, sleep=sleep)
+    result = asyncio.run(
+        service.generate_structured(_request(), SourceCorrectionResponse, ExecutionContext())
+    )
+    assert result.corrected_source == "ok"
+    assert delays == [1.0]
+    assert len(client.calls) == 2

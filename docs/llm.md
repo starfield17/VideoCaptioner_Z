@@ -18,14 +18,22 @@ max_concurrency = 4
 request_timeout_sec = 120
 max_retries = 5
 temperature = 0.1
+tokenizer = "cl100k_base"
 ```
+
+Supported tokenizer IDs are `cl100k_base` and `o200k_base`. The value may also
+be `auto`, which maps only explicitly recognized model IDs; unknown models fail
+closed with `llm.tokenizer_unknown`. Production budgeting uses tiktoken through
+`ModelTokenCounter`. Character-length counters are test doubles only and must
+not be reported as token budgets.
 
 The API key is intentionally plaintext in the OS-specific config directory.
 POSIX creation attempts mode `0600`. The application never generates a real
 credential, accepts one on the CLI, or persists one in JobConfig, Journal,
 Manifest, artifacts, LLM Cache metadata, exceptions, logs, or CLI JSON. Resume
 loads the current credential from the same provider profile while retaining the
-redacted result-affecting Job snapshot.
+redacted result-affecting Job snapshot. Public provider identity includes
+`tokenizer`; only the API key may differ on Resume.
 
 ## Profiles and schemas
 
@@ -39,8 +47,15 @@ redacted result-affecting Job snapshot.
 Structured model responses have exact fields and reject duplicate JSON keys,
 unknown fields, empty/noncanonical text, missing/extra/duplicate IDs, context
 IDs, obvious language mismatch when applicable, and protected numeric loss.
-Response schemas never contain timestamps, durations, Cue boundaries, or Word
-IDs. Application code copies those values from validated domain inputs.
+Protected facts use exact ordered semantic token sequences: adding, deleting, or
+reordering numbers, signs, currency/unit markers, date components, or AM/PM is
+rejected. Response schemas never contain timestamps, durations, Cue boundaries,
+or Word IDs. Application code copies those values from validated domain inputs.
+
+Provider `json_schema.name` values are stable task-based identities such as
+`captioner_translate_fast_batch_v1`. They never derive from Python class
+`__qualname__` and always match `[A-Za-z0-9_-]{1,64}`. Wire requests and Cache
+keys share the same schema identity function.
 
 ## Prompts and artifacts
 
@@ -66,22 +81,30 @@ SRT, WebVTT, and ASS.
 Chunk planning obeys item, complete-request token, context-item, and
 audio-context budgets. The complete request includes the system Prompt, user
 JSON envelope, language/task metadata, dynamic context, and response schema.
-Context IDs never enter the expected output set. ID mismatch deterministically
-bisects the current Chunk and terminates at one item. Invalid schema/text may
-receive at most one structured repair request.
+Every network call — original, repair, and ID-mismatch shrink — is preflighted
+through the same `validate_request_budget` gate before transport. Over-budget
+requests fail with `llm.item_too_large` and never reach the provider. Context
+IDs never enter the expected output set. ID mismatch deterministically bisects
+the current Chunk and terminates at one item. Invalid schema/text may receive
+at most one structured repair request, which is re-budgeted independently.
+
+Stage semantic validation (Fast dual-field protected checks, terminology
+unit/term matching and aggregate conflict detection) runs before Cache put.
+Invalid Cache hits are deleted and re-requested.
 
 Validated Cache entries live under `<AppPaths.cache_dir>/llm/sha256/`. Their key
 binds task, provider identity, normalized base URL identity, model, temperature,
-languages, profile, prompt ID/version/content hash, response schema, ordered
-items/context, dynamic context, repair Prompt identity, and Chunk configuration.
-It excludes credentials, Authorization, timestamps, random IDs, and local
-temporary paths. Entries use canonical JSON,
-flush, fsync, and atomic rename; corrupt or mismatched entries are misses.
+tokenizer, languages, profile, prompt ID/version/content hash, response schema,
+ordered items/context, dynamic context, repair Prompt identity, and Chunk
+configuration. It excludes credentials, Authorization, timestamps, random IDs,
+and local temporary paths. Entries use canonical JSON, flush, fsync, and atomic
+rename; corrupt or mismatched entries are misses.
 
 The adapter classifies 429, 502/503/504, network failure, and timeout as
 retryable. Authentication and request rejection are final. Cancellation is
-never retried. Backoff is bounded, deterministic, and injectable. All Stages
-and Jobs share one client and one application-wide Semaphore.
+never retried. Backoff is bounded, deterministic, injectable, and immediately
+cancellable (sleep races the cancellation token). All Stages and Jobs share one
+client and one application-wide Semaphore.
 
 ## Recovery and redaction
 

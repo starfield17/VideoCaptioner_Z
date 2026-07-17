@@ -32,7 +32,21 @@ class LLMTaskKind(StrEnum):
     TRANSLATE_FAST = "translate_fast"
     TRANSLATE_QUALITY = "translate_quality"
     REVIEW = "review"
+    TERMINOLOGY = "terminology"
     REPAIR_STRUCTURED = "repair_structured"
+
+
+# Stable OpenAI-compatible json_schema.name values. Never derive these from
+# Python class __qualname__ (dynamic batch classes embed "<locals>").
+_PROVIDER_SCHEMA_BASE_NAMES: Mapping[str, str] = {
+    LLMTaskKind.CORRECT_SOURCE.value: "captioner_correct_source_batch",
+    LLMTaskKind.TRANSLATE_FAST.value: "captioner_translate_fast_batch",
+    LLMTaskKind.TRANSLATE_QUALITY.value: "captioner_translate_quality_batch",
+    LLMTaskKind.REVIEW.value: "captioner_review_batch",
+    LLMTaskKind.TERMINOLOGY.value: "captioner_terminology_batch",
+    LLMTaskKind.REPAIR_STRUCTURED.value: "captioner_repair_structured_batch",
+}
+_SCHEMA_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,12 +554,15 @@ def encode_llm_request(
     model: str,
     temperature: float,
     response_schema: type[object],
+    *,
+    response_schema_version: int = LLM_RESPONSE_SCHEMA_VERSION,
 ) -> bytes:
     """Serialize the exact provider request shape used by the adapter.
 
     Keeping this representation in Core lets the token-budget estimator and the
     OpenAI-compatible adapter reason about the same complete request without
-    importing HTTP types into the domain.
+    importing HTTP types into the domain. Schema *body* still comes from the
+    response class; schema *name* is a stable task-based identity.
     """
     schema = response_schema_for(response_schema)
     payload: dict[str, JsonValue] = {
@@ -569,7 +586,7 @@ def encode_llm_request(
         "response_format": {
             "type": "json_schema",
             "json_schema": {
-                "name": _response_schema_name(request.task_kind, response_schema),
+                "name": provider_response_schema_name(request.task_kind, response_schema_version),
                 "strict": True,
                 "schema": schema,
             },
@@ -580,9 +597,44 @@ def encode_llm_request(
     )
 
 
-def response_schema_name(response_schema: type[object], task_kind: str) -> str:
-    """Return a stable schema identity shared by cache and request encoding."""
-    return _response_schema_name(task_kind, response_schema)
+def provider_response_schema_name(
+    task_kind: str,
+    response_schema_version: int = LLM_RESPONSE_SCHEMA_VERSION,
+) -> str:
+    """Return a stable OpenAI-compatible json_schema.name for one task kind.
+
+    Names are derived only from durable business identity. They never depend on
+    Python class ``__name__``, ``__qualname__``, module path, or runtime state.
+    """
+    if type(response_schema_version) is not int or response_schema_version < 1:
+        raise AppError(
+            "llm.schema_name_invalid",
+            {"reason": "version", "version": response_schema_version},
+        )
+    if not task_kind.strip():
+        raise AppError("llm.schema_name_invalid", {"reason": "task_kind"})
+    base = _PROVIDER_SCHEMA_BASE_NAMES.get(task_kind.strip())
+    if base is None:
+        raise AppError("llm.schema_name_invalid", {"task_kind": task_kind})
+    name = f"{base}_v{response_schema_version}"
+    if _SCHEMA_NAME_RE.fullmatch(name) is None:
+        raise AppError("llm.schema_name_invalid", {"name": name})
+    return name
+
+
+def response_schema_name(
+    response_schema: type[object] | None = None,
+    task_kind: str = "",
+    *,
+    response_schema_version: int = LLM_RESPONSE_SCHEMA_VERSION,
+) -> str:
+    """Return a stable schema identity shared by cache and request encoding.
+
+    ``response_schema`` is accepted for call-site compatibility but is ignored;
+    identity is task-based only so dynamic batch classes never leak ``<locals>``.
+    """
+    del response_schema
+    return provider_response_schema_name(task_kind, response_schema_version)
 
 
 def _assert_no_timing_fields(value: object) -> None:
@@ -689,11 +741,6 @@ def _validate_context_entries(
                     _canonical_nonempty(reason, "reason")
                 except AppError as exc:
                     raise AppError("llm.request_invalid", {"field": "context_payload"}) from exc
-
-
-def _response_schema_name(task_kind: str, response_schema: type[object]) -> str:
-    name = getattr(response_schema, "__qualname__", getattr(response_schema, "__name__", "schema"))
-    return f"{task_kind.replace('-', '_')}_{name.replace('.', '_')}"
 
 
 def _canonical_nonempty(value: object, field: str) -> str:

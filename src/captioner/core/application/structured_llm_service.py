@@ -61,8 +61,49 @@ class StructuredLLMService(LLMClient):
                     raise
                 delay = self.backoff_base_sec * (2**retry_index)
                 retry_index += 1
-                context.raise_if_cancelled()
-                await self.sleep(delay)
+                await sleep_with_cancellation(delay, context, self.sleep)
+
+
+async def sleep_with_cancellation(
+    delay: float,
+    context: ExecutionContext,
+    sleep: Sleep,
+) -> None:
+    """Sleep until delay elapses or the execution context is cancelled.
+
+    Cancel wins over sleep: the sleep task is cancelled and cleaned up, then
+    ``operation.cancelled`` is raised so the caller never enters another retry.
+    """
+    context.raise_if_cancelled()
+    if delay <= 0:
+        return
+    sleep_task = asyncio.create_task(_run_sleep(sleep, delay))
+    cancel_task = asyncio.create_task(context.wait_cancelled())
+    try:
+        done, pending = await asyncio.wait(
+            (sleep_task, cancel_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if cancel_task in done:
+            if not sleep_task.done():
+                sleep_task.cancel()
+                await asyncio.gather(sleep_task, return_exceptions=True)
+            raise AppError("operation.cancelled")
+        # Sleep completed first; surface any sleep failure.
+        sleep_task.result()
+    except asyncio.CancelledError:
+        for task in (sleep_task, cancel_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(sleep_task, cancel_task, return_exceptions=True)
+        raise
+
+
+async def _run_sleep(sleep: Sleep, delay: float) -> None:
+    await sleep(delay)
 
 
 def structured_repair_request(
@@ -112,6 +153,7 @@ def _is_retryable(error: AppError) -> bool:
         "llm.response_invalid",
         "llm.id_mismatch",
         "llm.context_id_returned",
+        "llm.item_too_large",
     }:
         return False
     return error.code in _RETRYABLE_ERRORS or error.retryable

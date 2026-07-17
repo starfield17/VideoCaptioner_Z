@@ -248,3 +248,136 @@ def test_semantically_invalid_cache_entry_is_removed_before_re_request(tmp_path:
         asyncio.run(_executor(cache, adapter, config).execute((item,), SourceCorrectionResponse))
     assert adapter.structured_calls
     assert not cache.path_for(key).exists()
+
+
+def test_repair_over_budget_is_not_sent(tmp_path: Path) -> None:
+    """Original may fit while a longer repair prompt exceeds the budget."""
+    from captioner.core.application.llm_chunk_executor import (
+        LLMChunkExecutionConfig,
+        LLMChunkExecutor,
+    )
+    from captioner.core.domain.llm import SourceCorrectionResponse
+    from captioner.core.policies.llm_chunking import ChunkItem, ChunkPlanner
+
+    class CountingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate_structured[T](
+            self,
+            request: LLMRequest,
+            response_schema: type[T],
+            context: ExecutionContext,
+        ) -> T:
+            del request, response_schema, context
+            self.calls += 1
+            # Force a validation failure so the executor attempts repair.
+            raise AppError("llm.schema_invalid")
+
+    class CharCounter:
+        def count(self, text: str) -> int:
+            return len(text)
+
+    short_prompt = "short"
+    long_repair = "R" * 500
+    client = CountingClient()
+    cache = FilesystemLLMCache(tmp_path / "cache")
+    config = LLMChunkExecutionConfig(
+        task_kind="correct_source",
+        provider_kind="openai-compatible",
+        provider_identity="default",
+        base_url_identity="https://example/v1",
+        model="m",
+        temperature=0.1,
+        source_language="en",
+        target_language="zh-CN",
+        profile="quality",
+        prompt_id="correct_source",
+        prompt_version="v1",
+        prompt_content_sha256=__import__("hashlib").sha256(short_prompt.encode()).hexdigest(),
+        prompt_content=short_prompt,
+        # Original serialized request is under this budget; the longer repair prompt is not.
+        chunking=ChunkingConfig(max_items=1, max_input_tokens=1100),
+        repair_prompt_id="repair_structured",
+        repair_prompt_version="v1",
+        repair_prompt_content_sha256=__import__("hashlib").sha256(long_repair.encode()).hexdigest(),
+        repair_prompt_content=long_repair,
+    )
+    from captioner.core.ports.llm import LLMClient
+
+    executor = LLMChunkExecutor(
+        cast(LLMClient, client),
+        cache,
+        ChunkPlanner(CharCounter()),
+        config,
+    )
+    with pytest.raises(AppError, match=r"llm\.item_too_large"):
+        asyncio.run(
+            executor.execute(
+                (ChunkItem("item-1", "source"),),
+                SourceCorrectionResponse,
+            )
+        )
+    assert client.calls == 1
+
+
+def test_over_budget_request_never_reaches_transport(tmp_path: Path) -> None:
+    from captioner.core.application.llm_chunk_executor import (
+        LLMChunkExecutionConfig,
+        LLMChunkExecutor,
+    )
+    from captioner.core.domain.llm import SourceCorrectionResponse
+    from captioner.core.policies.llm_chunking import ChunkItem, ChunkPlanner
+    from captioner.core.ports.llm import LLMClient
+
+    class CountingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate_structured[T](
+            self,
+            request: LLMRequest,
+            response_schema: type[T],
+            context: ExecutionContext,
+        ) -> T:
+            del request, response_schema, context
+            self.calls += 1
+            raise AssertionError("transport_called")
+
+    class CharCounter:
+        def count(self, text: str) -> int:
+            return len(text)
+
+    prompt = "p" * 50
+    client = CountingClient()
+    cache = FilesystemLLMCache(tmp_path / "cache")
+    config = LLMChunkExecutionConfig(
+        task_kind="correct_source",
+        provider_kind="openai-compatible",
+        provider_identity="default",
+        base_url_identity="https://example/v1",
+        model="m",
+        temperature=0.1,
+        source_language="en",
+        target_language=None,
+        profile="quality",
+        prompt_id="correct_source",
+        prompt_version="v1",
+        prompt_content_sha256=__import__("hashlib").sha256(prompt.encode()).hexdigest(),
+        prompt_content=prompt,
+        chunking=ChunkingConfig(max_items=1, max_input_tokens=10),
+    )
+    executor = LLMChunkExecutor(
+        cast(LLMClient, client),
+        cache,
+        ChunkPlanner(CharCounter()),
+        config,
+    )
+    with pytest.raises(AppError, match=r"llm\.item_too_large"):
+        asyncio.run(
+            executor.execute(
+                (ChunkItem("item-1", "source text that is already large"),),
+                SourceCorrectionResponse,
+            )
+        )
+    assert client.calls == 0

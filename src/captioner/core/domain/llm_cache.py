@@ -15,10 +15,8 @@ from captioner.core.domain.llm import (
     LLM_RESPONSE_SCHEMA_VERSION,
     LLMItem,
     LLMRequest,
+    provider_response_schema_name,
     validate_context_payload,
-)
-from captioner.core.domain.llm import (
-    response_schema_name as derive_response_schema_name,
 )
 from captioner.core.domain.result import (
     FrozenJsonValue,
@@ -244,8 +242,13 @@ def build_llm_cache_key_for_request(
     chunk_config: Mapping[str, object] | None,
     response_schema_version: int,
     response_schema: type[object],
+    tokenizer: str | None = None,
 ) -> LLMCacheKey:
     """Derive identity from the final request object, not a parallel config."""
+    del response_schema  # Schema identity is task-based; class qualname is ignored.
+    chunk = {} if chunk_config is None else dict(chunk_config)
+    if tokenizer is not None:
+        chunk = {**chunk, "tokenizer": tokenizer}
     return build_llm_cache_key(
         task_kind=request.task_kind,
         provider_kind=provider_kind,
@@ -261,9 +264,11 @@ def build_llm_cache_key_for_request(
         prompt_content_sha256=request.prompt_content_sha256,
         items=request.items,
         context=request.context,
-        chunk_config=chunk_config,
+        chunk_config=chunk,
         response_schema_version=response_schema_version,
-        response_schema_name=derive_response_schema_name(response_schema, request.task_kind),
+        response_schema_name=provider_response_schema_name(
+            request.task_kind, response_schema_version
+        ),
         context_payload=request.context_payload,
         repair_prompt_id=request.repair_prompt_id,
         repair_prompt_version=request.repair_prompt_version,

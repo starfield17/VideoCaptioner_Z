@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -8,8 +9,11 @@ from typing import cast
 import pytest
 
 from captioner.adapters.llm.http_transport import HTTPResponse, HTTPTimeout
+from captioner.adapters.llm.token_counter import resolve_tokenizer_id
 from captioner.bootstrap import build_llm_runtime, create_llm_job_snapshot
 from captioner.core.domain.errors import AppError
+from captioner.core.domain.llm import LLMItem, LLMRequest, SourceCorrectionResponse
+from captioner.core.domain.llm_cache import build_llm_cache_key_for_request
 from captioner.core.domain.result import FrozenJsonValue, JsonValue, thaw_json_value
 from captioner.core.domain.stage import PipelineProfile
 from captioner.infrastructure.app_paths import AppPaths, resolve_app_paths
@@ -54,6 +58,7 @@ def _write_provider(paths: AppPaths, **values: object) -> None:
         "request_timeout_sec": 30,
         "max_retries": 2,
         "temperature": 0.1,
+        "tokenizer": "cl100k_base",
     }
     defaults.update(values)
     write_llm_config(
@@ -68,6 +73,7 @@ max_concurrency = {max_concurrency}
 request_timeout_sec = {request_timeout_sec}
 max_retries = {max_retries}
 temperature = {temperature}
+tokenizer = "{tokenizer}"
 """.format(**defaults),
     )
 
@@ -186,6 +192,7 @@ def test_malformed_runtime_snapshot_fails_before_transport(tmp_path: Path) -> No
         ("request_timeout_sec", 60),
         ("max_retries", 4),
         ("temperature", 0.7),
+        ("tokenizer", "o200k_base"),
     ],
 )
 def test_public_provider_drift_fails_before_runtime_creation(
@@ -215,3 +222,91 @@ def test_public_provider_drift_fails_before_runtime_creation(
     assert raised.value.params["fields"] == (field,)
     assert transport.calls == 0
     assert str(value) not in str(raised.value)
+
+
+def test_production_counter_uses_configured_tokenizer(tmp_path: Path) -> None:
+    from captioner.adapters.llm.token_counter import ModelTokenCounter, resolve_tokenizer_id
+
+    paths = _paths(tmp_path)
+    _write_provider(paths, tokenizer="cl100k_base")
+    runtime = build_llm_runtime(paths=paths, transport=NoopTransport())
+    try:
+        tokenizer_id = resolve_tokenizer_id(runtime.provider.tokenizer, runtime.provider.model)
+        counter = ModelTokenCounter(tokenizer_id)
+        # Same character length, different token counts under cl100k_base.
+        ascii_like = "aaaaaaaaaa"
+        cjk = "你好你好你好你好你好"
+        assert len(ascii_like) == len(cjk)
+        assert counter.count(ascii_like) != counter.count(cjk)
+        assert counter.tokenizer_id == "cl100k_base"
+    finally:
+        asyncio.run(runtime.close())
+
+
+def test_unknown_tokenizer_fails_closed(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    with pytest.raises(AppError, match=r"llm\.config_invalid|llm\.tokenizer_unknown"):
+        _write_provider(paths, tokenizer="not_a_real_encoding")
+        build_llm_runtime(paths=paths, transport=NoopTransport())
+
+
+def test_tokenizer_is_bound_to_provider_snapshot(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _write_provider(paths, tokenizer="o200k_base")
+    snapshot = create_llm_job_snapshot(
+        target_language="zh-CN",
+        provider_profile="default",
+        source_language="en",
+        paths=paths,
+        pipeline_profile=PipelineProfile.FAST,
+    )
+    assert snapshot["tokenizer"] == "o200k_base"
+
+
+def test_tokenizer_changes_cache_key() -> None:
+    prompt = "p"
+    request = LLMRequest(
+        "correct_source",
+        (LLMItem("i", "s"),),
+        prompt_id="correct_source",
+        prompt_version="v1",
+        prompt_content_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        prompt_content=prompt,
+    )
+    a = build_llm_cache_key_for_request(
+        request,
+        tokenizer="cl100k_base",
+        provider_kind="openai-compatible",
+        provider_identity="default",
+        base_url_identity="https://example/v1",
+        model="m",
+        temperature=0.1,
+        profile="fast",
+        chunk_config={"max_items": 1},
+        response_schema_version=1,
+        response_schema=SourceCorrectionResponse,
+    )
+    b = build_llm_cache_key_for_request(
+        request,
+        tokenizer="o200k_base",
+        provider_kind="openai-compatible",
+        provider_identity="default",
+        base_url_identity="https://example/v1",
+        model="m",
+        temperature=0.1,
+        profile="fast",
+        chunk_config={"max_items": 1},
+        response_schema_version=1,
+        response_schema=SourceCorrectionResponse,
+    )
+    assert a.digest != b.digest
+
+
+def test_auto_tokenizer_maps_known_models_and_rejects_unknown() -> None:
+    assert resolve_tokenizer_id("auto", "gpt-4o") == "o200k_base"
+    assert resolve_tokenizer_id("auto", "gpt-4-turbo") == "cl100k_base"
+    assert resolve_tokenizer_id("cl100k_base", "anything") == "cl100k_base"
+    with pytest.raises(AppError, match=r"llm\.tokenizer_unknown"):
+        resolve_tokenizer_id("auto", "totally-unknown-model-xyz")
+    with pytest.raises(AppError, match=r"llm\.tokenizer_unknown"):
+        resolve_tokenizer_id("not_real", "gpt-4o")

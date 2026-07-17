@@ -459,15 +459,24 @@ def _llm_for_resume(
         return _frozen_llm(overrides.llm)
     if selected_profile is PipelineProfile.DETERMINISTIC:
         return None
-    target_language = overrides.target_language or config.target_language
-    if target_language is None:
+    # Compute effective values first so snapshot identity never reads stale config.
+    effective_language = config.language if overrides.language is None else overrides.language
+    effective_target_language = overrides.target_language or config.target_language
+    if effective_target_language is None:
         raise AppError("llm.target_language_missing")
-    provider_profile = overrides.llm_provider_profile or config.provider_profile or "default"
+    effective_provider_profile = (
+        overrides.llm_provider_profile or config.provider_profile or "default"
+    )
     profile_changed = selected_profile is not config.pipeline_profile
+    snapshot_source = None if config.llm is None else config.llm.get("source_language")
+    if snapshot_source is not None and not isinstance(snapshot_source, str):
+        raise AppError("llm.snapshot_invalid", {"reason": "source_language"})
     identity_changed = (
         overrides.target_language is not None
         or overrides.llm_provider_profile is not None
+        or overrides.language is not None
         or profile_changed
+        or effective_language != snapshot_source
     )
     if not identity_changed:
         if config.llm is None:
@@ -476,9 +485,9 @@ def _llm_for_resume(
     if paths is None:
         raise AppError("llm.config_missing", {"reason": "paths"})
     snapshot = create_llm_job_snapshot(
-        target_language=target_language,
-        provider_profile=provider_profile,
-        source_language=config.language,
+        target_language=effective_target_language,
+        provider_profile=effective_provider_profile,
+        source_language=effective_language,
         paths=paths,
         pipeline_profile=selected_profile,
     )

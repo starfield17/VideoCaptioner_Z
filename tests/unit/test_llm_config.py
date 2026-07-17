@@ -137,6 +137,7 @@ def test_public_snapshot_diff_is_field_exact_and_credential_free() -> None:
         "request_timeout_sec",
         "max_retries",
         "temperature",
+        "tokenizer",
     }
     assert "api_key" not in repr(snapshot)
 
@@ -205,6 +206,7 @@ def test_provider_snapshot_rejects_invalid_numeric_public_fields() -> None:
         "request_timeout_sec": 30.0,
         "max_retries": 1,
         "temperature": 0.1,
+        "tokenizer": "cl100k_base",
     }
     for field, value in (
         ("max_concurrency", 0),
@@ -231,6 +233,7 @@ def test_provider_snapshot_requires_each_public_string(field: str) -> None:
         "request_timeout_sec": 30.0,
         "max_retries": 1,
         "temperature": 0.1,
+        "tokenizer": "cl100k_base",
     }
     with pytest.raises(AppError, match=r"llm\.snapshot_invalid"):
         ProviderPublicSnapshot.from_mapping({**base, field: None})

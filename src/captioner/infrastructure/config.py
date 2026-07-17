@@ -26,8 +26,10 @@ _PROVIDER_FIELDS = frozenset(
         "request_timeout_sec",
         "max_retries",
         "temperature",
+        "tokenizer",
     }
 )
+_SUPPORTED_TOKENIZERS = frozenset({"cl100k_base", "o200k_base", "auto"})
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -58,6 +60,7 @@ class OpenAICompatibleProvider:
     request_timeout_sec: float = 120.0
     max_retries: int = 5
     temperature: float = 0.1
+    tokenizer: str = "cl100k_base"
     kind: str = OPENAI_COMPATIBLE_KIND
 
     def __post_init__(self) -> None:
@@ -91,11 +94,15 @@ class OpenAICompatibleProvider:
             or temperature < 0
         ):
             raise AppError("llm.config_invalid", {"field": "temperature"})
+        tokenizer: object = cast(object, self.tokenizer)
+        if not isinstance(tokenizer, str) or tokenizer.strip() not in _SUPPORTED_TOKENIZERS:
+            raise AppError("llm.config_invalid", {"field": "tokenizer"})
         object.__setattr__(self, "profile_name", profile_name)
         object.__setattr__(self, "base_url", base_url)
         object.__setattr__(self, "model", model.strip())
         object.__setattr__(self, "request_timeout_sec", float(timeout))
         object.__setattr__(self, "temperature", float(temperature))
+        object.__setattr__(self, "tokenizer", tokenizer.strip())
 
     @property
     def api_key(self) -> str:
@@ -116,6 +123,7 @@ class OpenAICompatibleProvider:
             "request_timeout_sec": self.request_timeout_sec,
             "max_retries": self.max_retries,
             "temperature": self.temperature,
+            "tokenizer": self.tokenizer,
             "provider_profile": self.profile_name,
         }
 
@@ -126,7 +134,7 @@ class OpenAICompatibleProvider:
             f"model={self.model!r}, max_concurrency={self.max_concurrency!r}, "
             f"request_timeout_sec={self.request_timeout_sec!r}, "
             f"max_retries={self.max_retries!r}, temperature={self.temperature!r}, "
-            "credential=<redacted>)"
+            f"tokenizer={self.tokenizer!r}, credential=<redacted>)"
         )
 
 
@@ -170,6 +178,7 @@ def load_provider_config(
         request_timeout_sec = provider.get("request_timeout_sec", 120.0)
         max_retries = provider.get("max_retries", 5)
         temperature = provider.get("temperature", 0.1)
+        tokenizer = provider.get("tokenizer", "cl100k_base")
     except KeyError as exc:
         raise AppError("llm.config_invalid", {"field": str(exc.args[0])}) from exc
     if not all(isinstance(item, str) for item in (kind, base_url, api_key, model)):
@@ -180,6 +189,9 @@ def load_provider_config(
         raise AppError("llm.config_invalid", {"field": "request_timeout_sec"})
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
         raise AppError("llm.config_invalid", {"field": "temperature"})
+    if not isinstance(tokenizer, str):
+        raise AppError("llm.config_invalid", {"field": "tokenizer"})
+    typed_tokenizer = tokenizer
     return OpenAICompatibleProvider(
         normalized_profile,
         cast(str, base_url),
@@ -189,6 +201,7 @@ def load_provider_config(
         float(request_timeout_sec),
         max_retries,
         float(temperature),
+        typed_tokenizer,
         cast(str, kind),
     )
 

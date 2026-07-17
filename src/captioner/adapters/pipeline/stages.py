@@ -40,6 +40,8 @@ from captioner.core.application.source_correction import (
     build_corrected_transcript,
     build_terminology_units,
     merge_terminology,
+    validate_terminology_aggregate,
+    validate_terminology_chunk,
 )
 from captioner.core.domain.artifact import ArtifactRef
 from captioner.core.domain.errors import AppError
@@ -217,10 +219,30 @@ class CorrectSourceStage:
             ChunkPlanner(self.token_counter, chunking),
             terminology_config,
         )
+        units_by_id = {unit.id: unit for unit in terminology_units}
+
+        def _terminology_chunk_semantic(
+            chunk: object, responses: tuple[TerminologyResponse, ...]
+        ) -> tuple[TerminologyResponse, ...]:
+            return cast(
+                tuple[TerminologyResponse, ...],
+                validate_terminology_chunk(units_by_id, chunk, responses),
+            )
+
+        def _terminology_aggregate(
+            responses: tuple[TerminologyResponse, ...],
+        ) -> tuple[TerminologyResponse, ...]:
+            return cast(
+                tuple[TerminologyResponse, ...],
+                validate_terminology_aggregate(terminology_units, responses),
+            )
+
         terminology_responses = await terminology_executor.execute(
             terminology_items,
             TerminologyResponse,
             context.execution,
+            semantic_validator=_terminology_chunk_semantic,
+            aggregate_validator=_terminology_aggregate,
         )
         terminology = merge_terminology(
             transcript,
@@ -1108,6 +1130,7 @@ def _stage_execution_config(
     schema_version = values.get("response_schema_version", 1)
     if type(schema_version) is not int or schema_version < 1:
         raise AppError("llm.config_invalid", {"field": "response_schema_version"})
+    tokenizer = _snapshot_string(values, "tokenizer", "cl100k_base")
     return LLMChunkExecutionConfig(
         task_kind=task_kind,
         provider_kind=provider_kind,
@@ -1128,6 +1151,7 @@ def _stage_execution_config(
         repair_prompt_version="" if repair_prompt is None else repair_prompt.prompt_version,
         repair_prompt_content_sha256="" if repair_prompt is None else repair_prompt.content_sha256,
         repair_prompt_content="" if repair_prompt is None else repair_prompt.content,
+        tokenizer=tokenizer,
         context_payload_factory=context_payload_factory,
     )
 

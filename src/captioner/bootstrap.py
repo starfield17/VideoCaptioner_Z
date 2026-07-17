@@ -15,7 +15,7 @@ from captioner.adapters.exporters.srt import serialize_bytes as serialize_srt
 from captioner.adapters.exporters.transcript_json import serialize_bytes as serialize_transcript
 from captioner.adapters.llm.http_transport import HTTPTransport
 from captioner.adapters.llm.openai_compatible import OpenAICompatibleClient
-from captioner.adapters.llm.token_counter import CharacterTokenCounter
+from captioner.adapters.llm.token_counter import ModelTokenCounter, resolve_tokenizer_id
 from captioner.adapters.media.ffmpeg_audio import FFmpegAudioNormalizer
 from captioner.adapters.media.ffprobe import FFprobeMediaInspector
 from captioner.adapters.persistence.batch_lease import BatchLease
@@ -202,6 +202,7 @@ def _validate_provider_snapshot(
                     "request_timeout_sec",
                     "max_retries",
                     "temperature",
+                    "tokenizer",
                 )
             }
         )
@@ -436,7 +437,11 @@ def build_durable_service(
             validate_llm_runtime_snapshot(runtime, llm)
         if runtime is not None:
             cache = cache or FilesystemLLMCache(application_paths.cache_dir)
-            counter = counter or CharacterTokenCounter()
+            if counter is None:
+                tokenizer_id = resolve_tokenizer_id(
+                    runtime.provider.tokenizer, runtime.provider.model
+                )
+                counter = ModelTokenCounter(tokenizer_id)
             if selected_profile is PipelineProfile.FAST:
                 prompt = _prompt_for_snapshot(application_paths, llm, "translate_fast")
                 repair_prompt = _prompt_for_snapshot(application_paths, llm, "repair_structured")

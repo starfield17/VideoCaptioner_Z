@@ -277,10 +277,11 @@ def test_batch_helpers_cover_override_and_collision_policies(tmp_path: Path) -> 
         ("request_timeout_sec", 60.0, StageName.CORRECT_SOURCE),
         ("max_retries", 4, StageName.CORRECT_SOURCE),
         ("temperature", 0.7, StageName.CORRECT_SOURCE),
-        ("source_language", "fr", StageName.CORRECT_SOURCE),
+        ("source_language", "fr", StageName.TRANSCRIBE),
         ("target_language", "de", StageName.TRANSLATE),
         ("chunk", {"max_items": 8}, StageName.CORRECT_SOURCE),
         ("response_schema_version", 2, StageName.CORRECT_SOURCE),
+        ("tokenizer", "o200k_base", StageName.CORRECT_SOURCE),
     ],
 )
 def test_each_llm_snapshot_field_has_an_invalidation_boundary(
@@ -311,7 +312,11 @@ def test_each_llm_snapshot_field_has_an_invalidation_boundary(
         values["chunk"] = chunk
     else:
         values[field] = value
-    changed = replace(quality, llm=values)
+    # JobConfig.language and snapshot.source_language must stay aligned.
+    if field == "source_language":
+        changed = replace(quality, language=cast(str, value), llm=values)
+    else:
+        changed = replace(quality, llm=values)
     assert earliest_change(quality, changed) is expected
 
 
@@ -515,3 +520,81 @@ def test_lease_staleness_classification(tmp_path: Path, value: str | None, expec
     if value is not None:
         path.write_text(value, encoding="utf-8")
     assert lease_is_stale(path) is expected
+
+
+def test_language_override_rebuilds_llm_snapshot(tmp_path: Path) -> None:
+    apply = cast(Callable[..., JobConfig], batch_private._apply_overrides)
+    quality = create_job_config(
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="en",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        output_dir=tmp_path / "output",
+        overwrite=False,
+        pipeline_profile=PipelineProfile.QUALITY,
+        llm=llm_snapshot(PipelineProfile.QUALITY, source_language="en"),
+    )
+    # Without paths, identity rebuild cannot load prompts — but language change
+    # alone must be detected. When paths are unavailable the function raises.
+    from captioner.cli.commands.batch import ResumeOverrides
+
+    overrides = ResumeOverrides(language="ja")
+    with pytest.raises(AppError, match=r"llm\.config_missing"):
+        apply(quality, overrides, paths=None)
+
+
+def test_job_rejects_mismatched_snapshot_source_language(tmp_path: Path) -> None:
+    with pytest.raises(AppError, match=r"job\.config_invalid"):
+        create_job_config(
+            model_ref="tiny",
+            device="cpu",
+            compute_type="int8",
+            language="ja",
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+            output_dir=tmp_path / "output",
+            overwrite=False,
+            pipeline_profile=PipelineProfile.FAST,
+            llm=llm_snapshot(PipelineProfile.FAST, source_language="en"),
+        )
+
+
+def test_language_override_uses_effective_language(tmp_path: Path) -> None:
+    from captioner.cli.commands.batch import ResumeOverrides
+    from captioner.infrastructure.app_paths import resolve_app_paths
+    from captioner.infrastructure.config import write_llm_config
+
+    paths = resolve_app_paths(
+        base_dir=tmp_path,
+        resource_root_override=Path("resources").resolve(),
+    )
+    write_llm_config(
+        paths.config_dir / "llm.toml",
+        """
+[providers.default]
+kind = "openai-compatible"
+base_url = "https://provider.example/v1"
+api_key = "unit-test-key"
+model = "unit-model"
+tokenizer = "cl100k_base"
+""",
+    )
+    quality = create_job_config(
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="en",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        output_dir=tmp_path / "output",
+        overwrite=False,
+        pipeline_profile=PipelineProfile.FAST,
+        llm=llm_snapshot(PipelineProfile.FAST, source_language="en"),
+    )
+    apply = cast(Callable[..., JobConfig], batch_private._apply_overrides)
+    updated = apply(quality, ResumeOverrides(language="ja"), paths=paths)
+    assert updated.language == "ja"
+    assert updated.llm is not None
+    assert updated.llm["source_language"] == "ja"

@@ -267,3 +267,72 @@ def test_single_item_complete_request_over_budget_fails_before_adapter(tmp_path:
     with pytest.raises(AppError, match=r"llm\.item_too_large"):
         asyncio.run(executor.execute((ChunkItem("item-0", "source"),), FastTranslationResponse))
     assert adapter.structured_calls == []
+
+
+def test_original_request_is_preflighted() -> None:
+    from captioner.core.domain.llm import LLMItem, LLMRequest, SourceCorrectionResponse
+    from captioner.core.policies.llm_chunking import (
+        SerializedRequestTokenEstimator,
+        validate_request_budget,
+    )
+
+    class TinyCounter:
+        def count(self, text: str) -> int:
+            return len(text)
+
+    prompt = "p"
+    request = LLMRequest(
+        "correct_source",
+        (LLMItem("item-1", "source"),),
+        prompt_id="correct_source",
+        prompt_version="v1",
+        prompt_content_sha256=__import__("hashlib").sha256(prompt.encode()).hexdigest(),
+        prompt_content=prompt,
+    )
+    estimator = SerializedRequestTokenEstimator(TinyCounter(), "model", 0.1)
+    estimated = validate_request_budget(request, SourceCorrectionResponse, estimator, 100_000)
+    assert estimated > 0
+    with pytest.raises(AppError, match=r"llm\.item_too_large") as raised:
+        validate_request_budget(request, SourceCorrectionResponse, estimator, 1)
+    assert raised.value.params["request_kind"] == "correct_source"
+    assert set(raised.value.params) <= {
+        "item_id",
+        "estimated_tokens",
+        "max_input_tokens",
+        "request_kind",
+    }
+    assert "你好" not in str(raised.value.params)
+
+
+def test_wire_request_and_estimator_use_identical_bytes() -> None:
+    from captioner.core.domain.llm import (
+        LLMItem,
+        LLMRequest,
+        SourceCorrectionResponse,
+        encode_llm_request,
+    )
+    from captioner.core.policies.llm_chunking import SerializedRequestTokenEstimator
+
+    class CaptureCounter:
+        def __init__(self) -> None:
+            self.last = ""
+
+        def count(self, text: str) -> int:
+            self.last = text
+            return len(text)
+
+    prompt = "system prompt"
+    request = LLMRequest(
+        "correct_source",
+        (LLMItem("item-1", "你好 😀"),),
+        prompt_id="correct_source",
+        prompt_version="v1",
+        prompt_content_sha256=__import__("hashlib").sha256(prompt.encode()).hexdigest(),
+        prompt_content=prompt,
+    )
+    counter = CaptureCounter()
+    estimator = SerializedRequestTokenEstimator(counter, "unit-model", 0.2)
+    estimated = estimator.estimate_input_tokens(request, SourceCorrectionResponse)
+    wire = encode_llm_request(request, "unit-model", 0.2, SourceCorrectionResponse)
+    assert counter.last == wire.decode("utf-8")
+    assert estimated == len(wire.decode("utf-8"))

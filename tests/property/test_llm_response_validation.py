@@ -88,3 +88,50 @@ def test_protected_spans_preserve_numeric_semantics(
     source: str, output: str, preserved: bool
 ) -> None:
     assert protected_tokens_preserved(source, output) is preserved
+
+
+@pytest.mark.parametrize(
+    ("source", "output", "preserved"),
+    [
+        ("Total is 10 kg", "total 10 kg and 20 more", False),
+        ("5", "5 5", False),
+        ("5 and 10", "5 10", True),
+        ("5 and 10", "10 5", False),
+        ("January 5, 2024", "February 5, 2024", False),
+        ("January 5, 2024", "2024-01-05", True),
+        ("10:00 AM", "10:00 PM", False),
+        ("10:00 AM", "22:00", False),
+        ("\u22125", "5", False),
+        ("\u22125", "-5", True),
+        ("100元", "100円", False),
+        ("$100", "US$100", False),
+        ("$100", "$100", True),
+    ],
+)
+def test_protected_token_exact_sequence_and_semantic_facts(
+    source: str, output: str, preserved: bool
+) -> None:
+    assert protected_tokens_preserved(source, output) is preserved
+
+
+def test_fast_fields_are_validated_independently() -> None:
+    # corrected_source lost the percent while translated_text kept it.
+    with pytest.raises(AppError, match=r"llm\.protected_token_lost"):
+        validate_responses(
+            (FastTranslationResponse("unit-1", "Price", "价格 20%"),),
+            ("unit-1",),
+            source_texts={"unit-1": "Price 20%"},
+        )
+    # translated_text lost the percent while corrected_source kept it.
+    with pytest.raises(AppError, match=r"llm\.protected_token_lost"):
+        validate_responses(
+            (FastTranslationResponse("unit-1", "Price 20%", "价格"),),
+            ("unit-1",),
+            source_texts={"unit-1": "Price 20%"},
+        )
+    validate_responses(
+        (FastTranslationResponse("unit-1", "Price 20%", "价格 20%"),),
+        ("unit-1",),
+        source_texts={"unit-1": "Price 20%"},
+        target_language="zh-CN",
+    )

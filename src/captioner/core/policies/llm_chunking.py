@@ -97,17 +97,58 @@ class SerializedRequestTokenEstimator:
     token_counter: TokenCounter
     model: str
     temperature: float
+    response_schema_version: int = 1
 
     def estimate_input_tokens(
         self,
         request: LLMRequest,
         response_schema: type[object],
     ) -> int:
-        encoded = encode_llm_request(request, self.model, self.temperature, response_schema)
+        encoded = encode_llm_request(
+            request,
+            self.model,
+            self.temperature,
+            response_schema,
+            response_schema_version=self.response_schema_version,
+        )
         count = self.token_counter.count(encoded.decode("utf-8"))
         if type(count) is not int or count < 0:
             raise AppError("llm.token_count_invalid", {"item_id": request.item_ids[0]})
         return count
+
+
+def validate_request_budget(
+    request: LLMRequest,
+    response_schema: type[object],
+    estimator: LLMRequestEstimator,
+    max_input_tokens: int,
+    *,
+    request_kind: str | None = None,
+) -> int:
+    """Fail closed before network access when a complete request exceeds budget.
+
+    Parameters on the raised error are limited to ids, counts, and kind so that
+    prompt content and source text never enter structured error payloads.
+    """
+    if type(max_input_tokens) is not int or max_input_tokens < 1:
+        raise AppError("llm.chunk_config_invalid", {"reason": "max_input_tokens"})
+    estimated = estimator.estimate_input_tokens(request, response_schema)
+    if type(estimated) is not int or estimated < 0:
+        raise AppError(
+            "llm.token_count_invalid",
+            {"item_id": request.item_ids[0]},
+        )
+    if estimated > max_input_tokens:
+        raise AppError(
+            "llm.item_too_large",
+            {
+                "item_id": request.item_ids[0],
+                "estimated_tokens": estimated,
+                "max_input_tokens": max_input_tokens,
+                "request_kind": request_kind or request.task_kind,
+            },
+        )
+    return estimated
 
 
 class ChunkPlanner:
