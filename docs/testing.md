@@ -1,9 +1,62 @@
 # Testing and quality gates
 
-`python scripts/check.py --quick` runs formatting, Ruff, Pyright, and unit plus
-contract tests. `python scripts/check.py --full` additionally verifies the lock
-file, import contracts, i18n catalogs, forbidden patterns, recovery/property/
-packaging tests, and branch coverage with an 85% minimum.
+The repository has three deliberately different validation layers.
+
+## PR Fast Gate
+
+The required `.github/workflows/ci.yml` workflow is named `Fast Gate`. It runs
+on pull requests and on pushes to `main`, on one Ubuntu runner only. Its
+deterministic command is:
+
+```bash
+uv sync --frozen
+uv run python scripts/check.py --fast
+```
+
+The fast mode verifies the lock file, formatting, Ruff, Pyright, import
+contracts, i18n catalogs, credential/forbidden patterns, all unit and contract
+tests, the local fake-provider contract, focused LLM executor/resume tests, and
+source-tree CLI and offscreen GUI smokes. It intentionally does not run full
+coverage, the complete recovery or property suites, FFmpeg integration,
+Nuitka, compiled smokes, or a cross-platform matrix.
+
+## Local Full Gate
+
+The local full gate is authoritative while developing and before closing a
+Phase or PR. Run the owned checks once in this order:
+
+```bash
+uv sync --frozen
+uv run python scripts/check.py --full
+uv run pytest tests/integration -q -m integration
+uv run pytest tests/golden -q
+uv run python main.py --cli --help
+uv run python main.py --cli doctor --json
+QT_QPA_PLATFORM=offscreen uv run python main.py --gui --smoke-test
+uv run python scripts/build_nuitka.py --clean --version 0.0.0
+./dist/captioner/captioner --cli --help
+./dist/captioner/captioner --cli subtitle-corpus tests/fixtures/transcripts --json
+QT_QPA_PLATFORM=offscreen ./dist/captioner/captioner --gui --smoke-test
+```
+
+`--full` owns the locked checks, static checks, unit/property/contract/
+packaging/recovery/tokenizer tests, credential scan, and the 85% branch-coverage
+gate. The separate commands own integration, golden, and platform-local
+compiled verification. On Windows use the `.exe` binary and the equivalent
+PowerShell commands. Do not treat the PR Fast Gate as release validation.
+
+## Release Full Gate
+
+`.github/workflows/release-full.yml` runs only from `workflow_dispatch` or a
+`v*` tag. It repeats the full checks, integration/golden validation, credential
+scan, and uploads Ubuntu, Windows, and macOS Nuitka artifacts after compiled
+CLI/corpus/GUI smokes. It does not publish a GitHub Release automatically.
+
+`python scripts/check.py --quick` remains a small developer convenience that
+runs formatting, Ruff, Pyright, and unit plus contract tests. `python
+scripts/check.py --full` additionally verifies the lock file, import contracts,
+i18n catalogs, forbidden patterns, recovery/property/packaging tests, and
+branch coverage with an 85% minimum.
 
 Tests are grouped into `unit`, `property`, `contract`, `recovery`, `integration`,
 `golden`, and `packaging`. Recovery parameterizes fault points by each Job's
@@ -95,11 +148,11 @@ or incorrect acknowledgement exits nonzero without modifying any file.
 The corpus runner is shared by the script and CLI. It decodes each Transcript,
 runs the complete deterministic DP/validation pipeline, decodes the canonical
 Track JSON back into a Domain object, re-serializes it byte-for-byte, and parses
-SRT, WebVTT and ASS. The Ubuntu Fast Gate builds the Nuitka standalone binary
-(with a restored Nuitka/ccache directory when available), then runs the same
-corpus through the compiled CLI and a compiled GUI smoke. Source-tree CLI/GUI
-smokes still run on every platform. Compiled smoke paths do not initialize ASR,
-FFmpeg, CUDA, models or network clients.
+SRT, WebVTT and ASS. The local and Release Full Gates build the Nuitka
+standalone binary, then run the same corpus through the compiled CLI and a
+compiled GUI smoke. Source-tree CLI/GUI smokes run in the PR Fast Gate.
+Compiled smoke paths do not initialize ASR, FFmpeg, CUDA, models or network
+clients.
 
 The golden manifest is not advisory. Tests require schema version, current
 policy signature, current exporter versions, exact fixture/format membership,

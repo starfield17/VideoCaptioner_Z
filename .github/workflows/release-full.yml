@@ -1,0 +1,171 @@
+name: Release Full Gate
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  full-checks:
+    name: ubuntu-24.04-full-checks
+    runs-on: ubuntu-24.04
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ffmpeg
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Full quality and coverage gate
+        run: uv run python scripts/check.py --full
+      - name: Real FFmpeg and local integration checks
+        run: uv run pytest tests/integration -q -m integration
+      - name: Golden checks
+        run: uv run pytest tests/golden -q
+      - name: Credential leakage scan
+        run: uv run python scripts/check_forbidden_patterns.py
+
+  package-ubuntu:
+    name: ubuntu-24.04-package
+    needs: full-checks
+    runs-on: ubuntu-24.04
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+      NUITKA_CACHE_DIR: ${{ github.workspace }}/.cache/nuitka
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            ccache \
+            libegl1 \
+            libgl1 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0
+          ccache --max-size=1G
+          ccache --set-config=compression=true
+      - name: Restore Nuitka compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/nuitka
+          key: >-
+            nuitka-${{ runner.os }}-py313-${{ hashFiles('uv.lock', 'scripts/build_nuitka.py') }}-${{ github.sha }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-py313-${{ hashFiles('uv.lock', 'scripts/build_nuitka.py') }}-
+            nuitka-${{ runner.os }}-py313-
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Nuitka standalone build
+        run: uv run python scripts/build_nuitka.py --clean --version 0.0.0
+      - name: Compiled CLI and corpus smokes
+        run: |
+          ./dist/captioner/captioner --cli --help
+          ./dist/captioner/captioner --cli subtitle-corpus tests/fixtures/transcripts --json
+      - name: Compiled GUI smoke
+        run: ./dist/captioner/captioner --gui --smoke-test
+      - name: Upload Ubuntu artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: captioner-ubuntu-${{ github.ref_name }}
+          path: dist/captioner
+          if-no-files-found: error
+
+  package-windows:
+    name: windows-2022-package
+    needs: full-checks
+    runs-on: windows-2022
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Nuitka standalone build
+        run: uv run python scripts/build_nuitka.py --clean --version 0.0.0
+      - name: Compiled CLI and corpus smokes
+        shell: pwsh
+        run: |
+          .\dist\captioner\captioner.exe --cli --help
+          .\dist\captioner\captioner.exe --cli subtitle-corpus tests\fixtures\transcripts --json
+      - name: Compiled GUI smoke
+        shell: pwsh
+        run: .\dist\captioner\captioner.exe --gui --smoke-test
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: captioner-windows-${{ github.ref_name }}
+          path: dist/captioner
+          if-no-files-found: error
+
+  package-macos:
+    name: macos-15-package
+    needs: full-checks
+    runs-on: macos-15
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Nuitka standalone build
+        run: uv run python scripts/build_nuitka.py --clean --version 0.0.0
+      - name: Compiled CLI and corpus smokes
+        run: |
+          ./dist/captioner/captioner --cli --help
+          ./dist/captioner/captioner --cli subtitle-corpus tests/fixtures/transcripts --json
+      - name: Compiled GUI smoke
+        run: ./dist/captioner/captioner --gui --smoke-test
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: captioner-macos-${{ github.ref_name }}
+          path: dist/captioner
+          if-no-files-found: error
