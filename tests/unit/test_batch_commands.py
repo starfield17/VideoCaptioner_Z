@@ -165,6 +165,84 @@ def test_batch_helpers_cover_override_and_collision_policies(tmp_path: Path) -> 
     assert (
         earliest_change(fast, replace(fast, llm={"target_language": "de"})) is StageName.TRANSLATE
     )
+    quality_prompts: dict[str, object] = {
+        "terminology": {"content_sha256": "term-v1"},
+        "correct_source": {"content_sha256": "correct-v1"},
+        "translate_quality": {"content_sha256": "translate-v1"},
+        "review_anomalies": {"content_sha256": "review-v1"},
+    }
+    quality_llm: dict[str, object] = {
+        "provider_profile": "default",
+        "model": "fake",
+        "target_language": "zh-CN",
+        "prompts": quality_prompts,
+    }
+    quality = replace(quality, llm=quality_llm)
+    assert (
+        earliest_change(
+            quality,
+            replace(quality, llm={**quality_llm, "target_language": "de"}),
+        )
+        is StageName.TRANSLATE
+    )
+    review_prompts = {
+        **quality_prompts,
+        "review_anomalies": {"content_sha256": "review-v2"},
+    }
+    assert (
+        earliest_change(
+            quality,
+            replace(quality, llm={**quality_llm, "prompts": review_prompts}),
+        )
+        is StageName.REVIEW
+    )
+    translation_prompts = {
+        **quality_prompts,
+        "translate_quality": {"content_sha256": "translate-v2"},
+    }
+    assert (
+        earliest_change(
+            quality,
+            replace(quality, llm={**quality_llm, "prompts": translation_prompts}),
+        )
+        is StageName.TRANSLATE
+    )
+    correction_prompts = {
+        **quality_prompts,
+        "correct_source": {"content_sha256": "correct-v2"},
+    }
+    assert (
+        earliest_change(
+            quality,
+            replace(quality, llm={**quality_llm, "prompts": correction_prompts}),
+        )
+        is StageName.CORRECT_SOURCE
+    )
+    assert (
+        earliest_change(
+            quality,
+            replace(quality, llm={**quality_llm, "model": "other"}),
+        )
+        is StageName.CORRECT_SOURCE
+    )
+    assert (
+        earliest_change(
+            quality,
+            replace(
+                quality,
+                segmentation={"limit": 42},
+                llm={**quality_llm, "model": "other"},
+            ),
+        )
+        is StageName.CORRECT_SOURCE
+    )
+    assert (
+        earliest_change(
+            quality,
+            replace(quality, pipeline_profile=PipelineProfile.FAST),
+        )
+        is StageName.SEGMENT
+    )
     with pytest.raises(AppError, match=r"batch\.output_collision"):
         validate_collisions(
             (tmp_path / "one" / "news.wav", tmp_path / "two" / "news.mp4"),

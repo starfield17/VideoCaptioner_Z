@@ -255,6 +255,10 @@ class CorrectedTranscript:
         raw = cast(Mapping[str, object], value)
         if set(raw) != {"schema_version", "transcript_id", "source_word_ids", "spans"}:
             raise AppError("transcript.correction_invalid", {"reason": "fields"})
+        raw_transcript_id = raw["transcript_id"]
+        raw_schema_version = raw["schema_version"]
+        if not isinstance(raw_transcript_id, str) or type(raw_schema_version) is not int:
+            raise AppError("transcript.correction_invalid", {"reason": "types"})
         raw_spans = raw["spans"]
         if not isinstance(raw_spans, Sequence) or isinstance(raw_spans, (str, bytes, bytearray)):
             raise AppError("transcript.correction_invalid", {"field": "spans"})
@@ -268,10 +272,13 @@ class CorrectedTranscript:
             word_ids = item["source_word_ids"]
             if not isinstance(word_ids, Sequence) or isinstance(word_ids, (str, bytes, bytearray)):
                 raise AppError("transcript.correction_invalid", {"field": "source_word_ids"})
+            corrected_text = item["corrected_text"]
+            if not isinstance(corrected_text, str):
+                raise AppError("transcript.correction_invalid", {"field": "corrected_text"})
             spans.append(
                 CorrectedSpan(
                     _required_string_sequence(cast(Sequence[object], word_ids), "source_word_ids"),
-                    cast(str, item["corrected_text"]),
+                    corrected_text,
                 )
             )
         source_word_ids = raw["source_word_ids"]
@@ -280,10 +287,10 @@ class CorrectedTranscript:
         ):
             raise AppError("transcript.correction_invalid", {"field": "source_word_ids"})
         return cls(
-            cast(str, raw["transcript_id"]),
+            raw_transcript_id,
             tuple(spans),
             _required_string_sequence(cast(Sequence[object], source_word_ids), "source_word_ids"),
-            cast(int, raw["schema_version"]),
+            raw_schema_version,
         )
 
 

@@ -6,13 +6,17 @@ file, import contracts, i18n catalogs, forbidden patterns, recovery/property/
 packaging tests, and branch coverage with an 85% minimum.
 
 Tests are grouped into `unit`, `property`, `contract`, `recovery`, `integration`,
-`golden`, and `packaging`. Recovery covers all six Stages at all six fault points.
+`golden`, and `packaging`. Recovery parameterizes fault points by each Job's
+actual profile Stage plan.
 Property tests use Hypothesis for locale, domain, segmentation and Journal
 transition invariants, including atomic Batch configuration and interrupted
 cancellation. Recovery also covers status purity, exact multi-Artifact cleanup,
-publication-target corruption and Batch cancellation acknowledgement. Unit
-tests use fake processes, fake ASR models and local artifact stores; they do not
-execute FFmpeg or download models. Output-transaction unit
+publication-target corruption and Batch cancellation acknowledgement. Unit,
+contract, and recovery tests use fake processes, fake ASR/LLM models and local
+artifact stores; they do not call real APIs, networks, FFmpeg, or models.
+Scripted LLM outcomes cover retries, malformed schemas, ID mismatches,
+cancellation, injected crashes, Chunk shrinking, Cache resume, and shared
+concurrency. Output-transaction unit
 tests exercise every cancellation/interrupt boundary, overwrite restoration,
 staging cleanup, and staged-artifact single-use rule. Integration tests use
 the installed FFprobe/FFmpeg and are marked `integration`. The real Faster
@@ -99,3 +103,18 @@ The golden manifest is not advisory. Tests require schema version, current
 policy signature, current exporter versions, exact fixture/format membership,
 canonical POSIX paths and matching SHA-256 hashes. Extra or missing files and
 stale metadata fail the suite.
+
+Phase 4 automated LLM checks remain offline:
+
+```bash
+uv run pytest tests/contract/test_llm_client.py -q
+uv run pytest tests/contract/test_llm_cache.py -q
+uv run pytest tests/integration/test_llm_fake_server.py -q
+uv run pytest tests/property/test_llm_response_validation.py -q
+uv run pytest tests/property/test_llm_chunking.py -q
+uv run pytest tests/recovery/test_llm_chunk_resume.py -q
+```
+
+The fake HTTP server binds locally and uses synthetic credentials. Real-provider
+smoke tests are manual or protected-workflow-only and are never part of default
+CI.

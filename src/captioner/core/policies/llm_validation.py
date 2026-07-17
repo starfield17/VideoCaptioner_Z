@@ -14,6 +14,7 @@ from captioner.core.domain.llm import (
     QualityTranslationResponse,
     ReviewResponse,
     SourceCorrectionResponse,
+    TerminologyResponse,
     response_schema_for,
 )
 from captioner.core.domain.result import JsonValue
@@ -189,7 +190,13 @@ def _response_id(response: object) -> str:
 def _response_texts(response: object) -> tuple[str, ...]:
     if isinstance(response, Mapping):
         raw = cast(Mapping[str, object], response)
-        if set(raw) - {"id", "corrected_source", "translated_text"}:
+        if set(raw) - {
+            "id",
+            "corrected_source",
+            "translated_text",
+            "source_term",
+            "target_term",
+        }:
             raise AppError("llm.response_invalid", {"reason": "fields"})
         values: tuple[object, ...] = tuple(value for key, value in raw.items() if key != "id")
     else:
@@ -197,6 +204,7 @@ def _response_texts(response: object) -> tuple[str, ...]:
             response,
             (
                 SourceCorrectionResponse,
+                TerminologyResponse,
                 FastTranslationResponse,
                 QualityTranslationResponse,
                 ReviewResponse,
@@ -228,12 +236,18 @@ def _protected_output_texts(response: object) -> tuple[str, ...]:
         if isinstance(translated, str):
             return (translated,)
         corrected = raw.get("corrected_source")
-        return (corrected,) if isinstance(corrected, str) else ()
+        if isinstance(corrected, str):
+            return (corrected,)
+        source_term = raw.get("source_term")
+        return (source_term,) if isinstance(source_term, str) else ()
     translated = getattr(response, "translated_text", None)
     if isinstance(translated, str):
         return (translated,)
     corrected = getattr(response, "corrected_source", None)
-    return (corrected,) if isinstance(corrected, str) else ()
+    if isinstance(corrected, str):
+        return (corrected,)
+    source_term = getattr(response, "source_term", None)
+    return (source_term,) if isinstance(source_term, str) else ()
 
 
 def _validate_text(text: str) -> None:

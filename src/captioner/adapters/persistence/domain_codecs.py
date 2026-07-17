@@ -17,7 +17,13 @@ from captioner.core.domain.subtitle import (
     SubtitleCue,
     SubtitleTrack,
 )
-from captioner.core.domain.transcript import Transcript, TranscriptSegment, WordToken
+from captioner.core.domain.terminology import Terminology
+from captioner.core.domain.transcript import (
+    CorrectedTranscript,
+    Transcript,
+    TranscriptSegment,
+    WordToken,
+)
 
 SCHEMA_VERSION = 1
 SOURCE_TRACK_SCHEMA_VERSION = 2
@@ -181,6 +187,28 @@ def decode_transcript(data: bytes) -> Transcript:
         _str(raw, "model_id"),
         cast(Mapping[str, JsonValue], _mapping(raw, "metadata")),
     )
+
+
+def encode_corrected_transcript(corrected: CorrectedTranscript) -> bytes:
+    return encode_json({"schema_version": 1, "corrected_transcript": corrected.to_dict()})
+
+
+def decode_corrected_transcript(data: bytes) -> CorrectedTranscript:
+    root = decode_json(data)
+    raw = _object(root, "corrected_transcript", {"schema_version", "corrected_transcript"})
+    if set(raw) != {"schema_version", "transcript_id", "source_word_ids", "spans"}:
+        raise AppError("artifact.codec_invalid", {"reason": "corrected_transcript_fields"})
+    return CorrectedTranscript.from_mapping(raw)
+
+
+def encode_terminology(terminology: Terminology) -> bytes:
+    return encode_json({"schema_version": 1, "terminology": terminology.to_dict()})
+
+
+def decode_terminology(data: bytes) -> Terminology:
+    root = decode_json(data)
+    raw = _object(root, "terminology", {"schema_version", "terminology"})
+    return Terminology.from_mapping(raw)
 
 
 def encode_track(track: SubtitleTrack) -> bytes:

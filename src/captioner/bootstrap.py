@@ -27,10 +27,13 @@ from captioner.adapters.persistence.json_manifest_store import JsonManifestStore
 from captioner.adapters.persistence.jsonl_journal import JsonlJournal
 from captioner.adapters.persistence.local_artifact_store import LocalArtifactStore
 from captioner.adapters.pipeline.stages import (
+    CorrectSourceStage,
     ExportStage,
     InspectStage,
     NormalizeStage,
     PublishStage,
+    QualityTranslateStage,
+    ReviewStage,
     SegmentStage,
     TranscribeStage,
     TranslateStage,
@@ -63,7 +66,7 @@ from captioner.infrastructure.app_paths import (
 )
 from captioner.infrastructure.config import OpenAICompatibleProvider, load_provider_config
 from captioner.infrastructure.ids import new_id
-from captioner.infrastructure.prompts import PromptLoader
+from captioner.infrastructure.prompts import PromptIdentity, PromptLoader
 
 
 def build_run_service(
@@ -182,6 +185,7 @@ def create_job_config(
     chunk: Mapping[str, object] | None = None,
     prompt_identity: Mapping[str, object] | None = None,
 ) -> JobConfig:
+    selected_profile = PipelineProfile(pipeline_profile)
     model = FasterWhisperConfig(model_ref, device, compute_type, language)
     snapshot: Mapping[str, object] | None = llm
     if snapshot is None and any(
@@ -225,12 +229,19 @@ def create_job_config(
         {
             stage.value: {
                 StageName.SEGMENT.value: "segment-v2",
+                StageName.CORRECT_SOURCE.value: "correct-source-v1",
+                StageName.TRANSLATE.value: (
+                    "translate-quality-v1"
+                    if selected_profile is PipelineProfile.QUALITY
+                    else "translate-v1"
+                ),
+                StageName.REVIEW.value: "review-v1",
                 StageName.EXPORT.value: "export-v3",
                 StageName.PUBLISH.value: "publish-v3",
             }.get(stage.value, "1")
-            for stage in stage_plan_for(pipeline_profile)
+            for stage in stage_plan_for(selected_profile)
         },
-        pipeline_profile=pipeline_profile,
+        pipeline_profile=selected_profile,
         llm=None if snapshot is None else _frozen_mapping(snapshot),
     )
 
@@ -241,8 +252,9 @@ def create_llm_job_snapshot(
     provider_profile: str,
     source_language: str | None,
     paths: AppPaths,
+    pipeline_profile: PipelineProfile = PipelineProfile.FAST,
 ) -> Mapping[str, FrozenJsonValue]:
-    """Build a redacted fast-profile snapshot from runtime config and prompts."""
+    """Build a redacted LLM snapshot from runtime config and versioned prompts."""
     if not target_language.strip():
         raise AppError("llm.target_language_missing")
     if target_language != target_language.strip() or any(
@@ -250,16 +262,40 @@ def create_llm_job_snapshot(
     ):
         raise AppError("llm.target_language_invalid")
     provider = load_provider_config(paths.config_dir, provider_profile)
-    prompt = PromptLoader(paths.prompt_resource_dir).load("translate_fast", "v1")
+    selected_profile = PipelineProfile(pipeline_profile)
+    loader = PromptLoader(paths.prompt_resource_dir)
+    if selected_profile is PipelineProfile.FAST:
+        prompts = {"translate_fast": loader.load("translate_fast", "v1")}
+    elif selected_profile is PipelineProfile.QUALITY:
+        prompts = {
+            prompt_id: loader.load(prompt_id, "v1")
+            for prompt_id in (
+                "terminology",
+                "correct_source",
+                "translate_quality",
+                "review_anomalies",
+            )
+        }
+    else:
+        raise AppError("llm.config_invalid", {"field": "pipeline_profile"})
+    prompt = next(iter(prompts.values()))
     snapshot: dict[str, object] = {
         **provider.to_snapshot(),
-        "profile": PipelineProfile.FAST.value,
+        "profile": selected_profile.value,
         "source_language": source_language,
         "target_language": target_language.strip(),
         "prompt": {
             "prompt_id": prompt.prompt_id,
             "prompt_version": prompt.prompt_version,
             "content_sha256": prompt.content_sha256,
+        },
+        "prompts": {
+            prompt_id: {
+                "prompt_id": identity.prompt_id,
+                "prompt_version": identity.prompt_version,
+                "content_sha256": identity.content_sha256,
+            }
+            for prompt_id, identity in prompts.items()
         },
         "prompt_id": prompt.prompt_id,
         "prompt_version": prompt.prompt_version,
@@ -335,11 +371,6 @@ def build_durable_service(
     token_counter: TokenCounter | None = None,
 ) -> DurableServiceBundle:
     selected_profile = PipelineProfile(pipeline_profile)
-    if selected_profile is PipelineProfile.QUALITY:
-        raise AppError(
-            "llm.profile_unavailable",
-            {"profile": selected_profile.value},
-        )
     application_paths = resolve_app_paths() if paths is None else paths
     if initialize_runtime:
         ensure_runtime_layout(application_paths)
@@ -374,7 +405,7 @@ def build_durable_service(
     runtime = llm_runtime
     cache = llm_cache
     counter = token_counter
-    if selected_profile is PipelineProfile.FAST:
+    if selected_profile in {PipelineProfile.FAST, PipelineProfile.QUALITY}:
         if llm is None:
             raise AppError("llm.config_missing", {"reason": "job_snapshot"})
         if runtime is None and initialize_runtime:
@@ -385,17 +416,46 @@ def build_durable_service(
         if runtime is not None:
             cache = cache or FilesystemLLMCache(application_paths.cache_dir)
             counter = counter or CharacterTokenCounter()
-            prompt = PromptLoader(application_paths.prompt_resource_dir).load(
-                "translate_fast", "v1"
-            )
-            runners[StageName.TRANSLATE] = TranslateStage(
-                durable,
-                runtime.service,
-                cache,
-                counter,
-                prompt,
-                policy,
-            )
+            if selected_profile is PipelineProfile.FAST:
+                prompt = _prompt_for_snapshot(application_paths, llm, "translate_fast")
+                runners[StageName.TRANSLATE] = TranslateStage(
+                    durable,
+                    runtime.service,
+                    cache,
+                    counter,
+                    prompt,
+                    policy,
+                )
+            else:
+                terminology_prompt = _prompt_for_snapshot(application_paths, llm, "terminology")
+                correction_prompt = _prompt_for_snapshot(application_paths, llm, "correct_source")
+                quality_prompt = _prompt_for_snapshot(application_paths, llm, "translate_quality")
+                review_prompt = _prompt_for_snapshot(application_paths, llm, "review_anomalies")
+                runners[StageName.CORRECT_SOURCE] = CorrectSourceStage(
+                    durable,
+                    runtime.service,
+                    cache,
+                    counter,
+                    terminology_prompt,
+                    correction_prompt,
+                    policy,
+                )
+                runners[StageName.TRANSLATE] = QualityTranslateStage(
+                    durable,
+                    runtime.service,
+                    cache,
+                    counter,
+                    quality_prompt,
+                    policy,
+                )
+                runners[StageName.REVIEW] = ReviewStage(
+                    durable,
+                    runtime.service,
+                    cache,
+                    counter,
+                    review_prompt,
+                    policy,
+                )
 
     def verify_committed(job: object, stage: object) -> None:
         from captioner.core.domain.job import JobProjection
@@ -447,6 +507,33 @@ def _snapshot_string(values: Mapping[str, FrozenJsonValue], key: str, default: s
     if not isinstance(value, str) or not value.strip():
         raise AppError("llm.config_invalid", {"field": key})
     return value
+
+
+def _prompt_for_snapshot(
+    paths: AppPaths,
+    snapshot: Mapping[str, FrozenJsonValue],
+    prompt_id: str,
+) -> PromptIdentity:
+    prompt_value: object = None
+    prompts = snapshot.get("prompts")
+    if isinstance(prompts, Mapping):
+        prompt_value = prompts.get(prompt_id)
+    if prompt_value is None and prompt_id == snapshot.get("prompt_id"):
+        prompt_value = {
+            "prompt_id": snapshot.get("prompt_id"),
+            "prompt_version": snapshot.get("prompt_version"),
+            "content_sha256": snapshot.get("prompt_content_sha256"),
+        }
+    if not isinstance(prompt_value, Mapping):
+        raise AppError("prompt.identity_missing", {"prompt_id": prompt_id})
+    version = prompt_value.get("prompt_version")
+    content_hash = prompt_value.get("content_sha256")
+    if not isinstance(version, str) or not isinstance(content_hash, str):
+        raise AppError("prompt.identity_invalid", {"prompt_id": prompt_id})
+    prompt = PromptLoader(paths.prompt_resource_dir).load(prompt_id, version)
+    if prompt.content_sha256 != content_hash:
+        raise AppError("prompt.identity_mismatch", {"prompt_id": prompt_id})
+    return prompt
 
 
 def _validate_fault_point(point: str) -> None:

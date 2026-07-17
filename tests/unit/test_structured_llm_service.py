@@ -113,6 +113,18 @@ def test_schema_failure_gets_exactly_one_repair_request() -> None:
         )
     assert len(failing.calls) == 2
 
+    already_repairing = ScriptedClient([AppError("llm.schema_invalid")])
+    repair_request = LLMRequest("repair_structured", _request().items)
+    with pytest.raises(AppError, match=r"llm\.schema_invalid"):
+        asyncio.run(
+            _service(already_repairing, []).generate_structured(
+                repair_request,
+                SourceCorrectionResponse,
+                ExecutionContext(),
+            )
+        )
+    assert len(already_repairing.calls) == 1
+
 
 def test_cancellation_after_backoff_is_not_retried() -> None:
     context = ExecutionContext()

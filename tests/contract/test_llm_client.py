@@ -17,6 +17,7 @@ from captioner.core.domain.llm import (
     QualityTranslationResponse,
     ReviewResponse,
     SourceCorrectionResponse,
+    TerminologyResponse,
     response_schema_for,
 )
 from captioner.core.ports.llm import LLMClient
@@ -37,6 +38,7 @@ def test_llm_client_port_is_provider_neutral() -> None:
         (FastTranslationResponse, {"id", "corrected_source", "translated_text"}),
         (QualityTranslationResponse, {"id", "translated_text"}),
         (ReviewResponse, {"id", "translated_text"}),
+        (TerminologyResponse, {"id", "source_term", "target_term"}),
     ],
 )
 def test_structured_schemas_are_exact_and_have_no_timing_fields(

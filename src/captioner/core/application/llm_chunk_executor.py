@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Protocol, cast
 
+from captioner.core.application.structured_llm_service import structured_repair_request
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
 from captioner.core.domain.llm import (
@@ -18,12 +19,30 @@ from captioner.core.domain.llm import (
 )
 from captioner.core.domain.llm_cache import LLMCacheKey, build_llm_cache_key
 from captioner.core.domain.result import JsonValue
-from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, ChunkPlanner, LLMChunk
+from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, LLMChunk
 from captioner.core.policies.llm_validation import validate_responses
 from captioner.core.ports.llm import LLMClient
 from captioner.core.ports.llm_cache import LLMCachePort
 
 type ChunkRequestFactory = Callable[[LLMChunk], LLMRequest]
+
+
+class ChunkPlannerPort(Protocol):
+    def plan(
+        self,
+        items: Sequence[ChunkItem],
+        config: ChunkingConfig | None = None,
+    ) -> tuple[LLMChunk, ...]: ...
+
+    def plan_range(
+        self,
+        items: Sequence[ChunkItem],
+        core_start: int,
+        core_end: int,
+        config: ChunkingConfig | None = None,
+        index: int = 0,
+    ) -> LLMChunk: ...
+
 
 _ID_MISMATCH_ERRORS = frozenset(
     {
@@ -32,6 +51,16 @@ _ID_MISMATCH_ERRORS = frozenset(
         "llm.extra_id",
         "llm.duplicate_id",
         "llm.context_id_returned",
+    }
+)
+_VALIDATION_REPAIR_ERRORS = frozenset(
+    {
+        "llm.schema_invalid",
+        "llm.response_invalid",
+        "llm.empty_text",
+        "llm.non_canonical_text",
+        "llm.wrong_language",
+        "llm.protected_token_lost",
     }
 )
 
@@ -68,7 +97,7 @@ class LLMChunkExecutionConfig:
 class LLMChunkExecutor:
     client: LLMClient
     cache: LLMCachePort
-    planner: ChunkPlanner
+    planner: ChunkPlannerPort
     config: LLMChunkExecutionConfig
 
     async def execute[T](
@@ -77,6 +106,7 @@ class LLMChunkExecutor:
         response_schema: type[T],
         context: ExecutionContext | None = None,
         request_factory: ChunkRequestFactory | None = None,
+        validation_source_texts: Mapping[str, str] | None = None,
     ) -> tuple[T, ...]:
         execution = ExecutionContext() if context is None else context
         ordered = tuple(items)
@@ -93,6 +123,7 @@ class LLMChunkExecutor:
                     batch_schema,
                     factory,
                     execution,
+                    validation_source_texts,
                 )
             )
             for chunk in chunks
@@ -124,9 +155,16 @@ class LLMChunkExecutor:
         batch_schema: type[StructuredResponseBatch],
         request_factory: ChunkRequestFactory,
         context: ExecutionContext,
+        validation_source_texts: Mapping[str, str] | None,
     ) -> tuple[object, ...]:
         try:
-            return await self._execute_chunk(chunk, batch_schema, request_factory, context)
+            return await self._execute_chunk(
+                chunk,
+                batch_schema,
+                request_factory,
+                context,
+                validation_source_texts,
+            )
         except AppError as exc:
             if exc.code not in _ID_MISMATCH_ERRORS or len(chunk.items) < 2:
                 raise
@@ -146,10 +184,20 @@ class LLMChunkExecutor:
                 index=chunk.index * 2 + 1,
             )
             left_result = await self._execute_with_shrink(
-                left, all_items, batch_schema, request_factory, context
+                left,
+                all_items,
+                batch_schema,
+                request_factory,
+                context,
+                validation_source_texts,
             )
             right_result = await self._execute_with_shrink(
-                right, all_items, batch_schema, request_factory, context
+                right,
+                all_items,
+                batch_schema,
+                request_factory,
+                context,
+                validation_source_texts,
             )
             return (*left_result, *right_result)
 
@@ -159,19 +207,30 @@ class LLMChunkExecutor:
         batch_schema: type[StructuredResponseBatch],
         request_factory: ChunkRequestFactory,
         context: ExecutionContext,
+        validation_source_texts: Mapping[str, str] | None,
     ) -> tuple[object, ...]:
         request = request_factory(chunk)
         key = self._cache_key(chunk)
         cached = self.cache.get(key, batch_schema)
         if cached is not None:
             try:
-                return self._validate_and_order(cached, chunk)
+                return self._validate_and_order(cached, chunk, validation_source_texts)
             except AppError:
                 # A cached value that fails the complete validator is a miss;
                 # never expose it as a successful response.
                 pass
         generated = await self.client.generate_structured(request, batch_schema, context)
-        responses = self._validate_and_order(generated, chunk)
+        try:
+            responses = self._validate_and_order(generated, chunk, validation_source_texts)
+        except AppError as exc:
+            if exc.code not in _VALIDATION_REPAIR_ERRORS:
+                raise
+            repaired = await self.client.generate_structured(
+                structured_repair_request(request),
+                batch_schema,
+                context,
+            )
+            responses = self._validate_and_order(repaired, chunk, validation_source_texts)
         cache_value = _batch_from_responses(batch_schema, responses)
         self.cache.put(key, cache_value, batch_schema)
         return responses
@@ -213,10 +272,18 @@ class LLMChunkExecutor:
         self,
         value: object,
         chunk: LLMChunk,
+        validation_source_texts: Mapping[str, str] | None,
     ) -> tuple[object, ...]:
         responses = _responses_from_batch(value)
         expected_ids = chunk.item_ids
-        source_texts = {item.id: item.text for item in chunk.items}
+        source_texts = {
+            item.id: (
+                item.text
+                if validation_source_texts is None
+                else validation_source_texts.get(item.id, item.text)
+            )
+            for item in chunk.items
+        }
         validated = validate_responses(
             responses,
             expected_ids,

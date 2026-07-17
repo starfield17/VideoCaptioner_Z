@@ -11,14 +11,18 @@ from typing import cast
 from captioner.adapters.exporters.srt import serialize_bytes as serialize_srt
 from captioner.adapters.persistence.domain_codecs import (
     decode_audio,
+    decode_corrected_transcript,
     decode_media,
     decode_publication_receipt,
+    decode_terminology,
     decode_track,
     decode_transcript,
     encode_audio,
+    encode_corrected_transcript,
     encode_json,
     encode_media,
     encode_publication_receipt,
+    encode_terminology,
     encode_track,
     encode_transcript,
 )
@@ -26,20 +30,38 @@ from captioner.adapters.persistence.local_artifact_store import LocalArtifactSto
 from captioner.adapters.subtitles.ass import serialize_bytes as serialize_ass
 from captioner.adapters.subtitles.json_track import serialize as serialize_track_json
 from captioner.adapters.subtitles.webvtt import serialize_bytes as serialize_webvtt
+from captioner.core.application.anomaly_review import build_reviewed_track, review_report
 from captioner.core.application.llm_chunk_executor import (
     LLMChunkExecutionConfig,
     LLMChunkExecutor,
 )
 from captioner.core.application.output_transaction import commit_output_set
+from captioner.core.application.source_correction import (
+    build_corrected_transcript,
+    merge_terminology,
+)
 from captioner.core.domain.artifact import ArtifactRef
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.llm import FastTranslationResponse, LLMTaskKind
+from captioner.core.domain.llm import (
+    FastTranslationResponse,
+    LLMTaskKind,
+    QualityTranslationResponse,
+    ReviewResponse,
+    SourceCorrectionResponse,
+    TerminologyResponse,
+)
 from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
 from captioner.core.domain.stage import StageName
 from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack, derive_subtitle_track_id
-from captioner.core.domain.subtitle_validation import validate_subtitle_track
+from captioner.core.domain.subtitle_validation import (
+    validate_subtitle_track,
+    validate_translated_mapping,
+)
+from captioner.core.domain.transcript import CorrectedTranscript
 from captioner.core.policies.line_breaking import break_lines
+from captioner.core.policies.llm_anomalies import AnomalyChunkPlanner, detect_anomalies
 from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, ChunkPlanner
+from captioner.core.policies.segmentation import canonical_words
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig, segment_transcript
 from captioner.core.ports.asr import ASREngine, TranscriptionRequest
@@ -136,6 +158,103 @@ class TranscribeStage:
 
 
 @dataclass(slots=True)
+class CorrectSourceStage:
+    """Extract terminology and correct one immutable source Word at a time."""
+
+    artifacts: DurableArtifactStorePort
+    client: LLMClient
+    cache: LLMCachePort
+    token_counter: TokenCounter
+    terminology_prompt: PromptIdentity
+    correction_prompt: PromptIdentity
+    config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
+    name: StageName = StageName.CORRECT_SOURCE
+    version: str = "correct-source-v1"
+
+    async def execute(
+        self, request: StageExecutionRequest, context: StageExecutionContext
+    ) -> tuple[ProducedArtifact, ...]:
+        target_language = request.config.target_language
+        if target_language is None:
+            raise AppError("llm.target_language_missing")
+        _validate_target_language(target_language)
+        transcript = decode_transcript(self.artifacts.read_bytes(_ref(request, "transcript.json")))
+        words = canonical_words(transcript.words)
+        items = tuple(
+            ChunkItem(
+                word.id,
+                _canonical_word_text(word.text),
+                word.start_ms,
+                word.end_ms,
+            )
+            for word in words
+        )
+        chunking = _chunking_from_snapshot(request.config.llm)
+        terminology_config = _stage_execution_config(
+            request.config.llm,
+            "terminology",
+            transcript.language,
+            target_language,
+            self.terminology_prompt,
+            chunking,
+            "quality",
+        )
+        terminology_executor = LLMChunkExecutor(
+            self.client,
+            self.cache,
+            ChunkPlanner(self.token_counter, chunking),
+            terminology_config,
+        )
+        terminology_responses = await terminology_executor.execute(
+            items,
+            TerminologyResponse,
+            context.execution,
+        )
+        terminology = merge_terminology(
+            transcript,
+            transcript.language,
+            target_language,
+            terminology_responses,
+        )
+        correction_prompt = _prompt_with_context(self.correction_prompt, terminology.to_dict())
+        correction_config = _stage_execution_config(
+            request.config.llm,
+            LLMTaskKind.CORRECT_SOURCE.value,
+            transcript.language,
+            target_language,
+            correction_prompt,
+            chunking,
+            "quality",
+        )
+        correction_executor = LLMChunkExecutor(
+            self.client,
+            self.cache,
+            ChunkPlanner(self.token_counter, chunking),
+            correction_config,
+        )
+        correction_responses = await correction_executor.execute(
+            items,
+            SourceCorrectionResponse,
+            context.execution,
+        )
+        corrected = build_corrected_transcript(transcript, correction_responses)
+        return (
+            ProducedArtifact(
+                "terminology-json",
+                "application/json",
+                "terminology.json",
+                data=encode_terminology(terminology),
+            ),
+            ProducedArtifact(
+                "corrected-transcript-json",
+                "application/json",
+                "corrected-transcript.json",
+                data=encode_corrected_transcript(corrected),
+            ),
+        )
+
+
+@dataclass(slots=True)
 class SegmentStage:
     artifacts: DurableArtifactStorePort
     config: SegmentationPolicyConfig | SimpleSegmentationConfig
@@ -147,6 +266,13 @@ class SegmentStage:
     ) -> tuple[ProducedArtifact, ...]:
         context.execution.raise_if_cancelled()
         transcript = decode_transcript(self.artifacts.read_bytes(_ref(request, "transcript.json")))
+        corrected: CorrectedTranscript | None = None
+        corrected_ref = _optional_ref(request, "corrected-transcript.json")
+        if corrected_ref is not None:
+            corrected = decode_corrected_transcript(self.artifacts.read_bytes(corrected_ref))
+            if corrected.transcript_id != transcript.id:
+                raise AppError("transcript.correction_invalid", {"reason": "transcript_id"})
+        corrected_mapping = None if corrected is None else corrected.corrected_text_by_word_id
 
         midpoint_emitted = False
 
@@ -160,8 +286,14 @@ class SegmentStage:
             transcript,
             self.config,
             progress=midpoint,
+            corrected_text_by_word_id=corrected_mapping,
         )
-        report = validate_subtitle_track(track, transcript, _policy_config(self.config))
+        report = validate_subtitle_track(
+            track,
+            transcript,
+            _policy_config(self.config),
+            corrected_text_by_word_id=corrected_mapping,
+        )
         if not report.is_valid:
             first = next(issue for issue in report.issues if issue.severity.value == "error")
             raise AppError("subtitle.validation_failed", {"reason": first.code})
@@ -294,6 +426,245 @@ class TranslateStage:
 
 
 @dataclass(slots=True)
+class QualityTranslateStage:
+    """Translate corrected source cues without changing their mapping."""
+
+    artifacts: DurableArtifactStorePort
+    client: LLMClient
+    cache: LLMCachePort
+    token_counter: TokenCounter
+    prompt: PromptIdentity
+    config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
+    name: StageName = StageName.TRANSLATE
+    version: str = "translate-quality-v1"
+
+    async def execute(
+        self, request: StageExecutionRequest, context: StageExecutionContext
+    ) -> tuple[ProducedArtifact, ...]:
+        target_language = request.config.target_language
+        if target_language is None:
+            raise AppError("llm.target_language_missing")
+        _validate_target_language(target_language)
+        transcript = decode_transcript(self.artifacts.read_bytes(_ref(request, "transcript.json")))
+        source_track = decode_track(self.artifacts.read_bytes(_ref(request, "subtitle-track.json")))
+        policy = _policy_config(self.config)
+        corrected = _read_corrected(self.artifacts, request, transcript)
+        corrected_mapping = None if corrected is None else corrected.corrected_text_by_word_id
+        source_report = validate_subtitle_track(
+            source_track,
+            transcript,
+            policy,
+            corrected_text_by_word_id=corrected_mapping,
+        )
+        if not source_report.is_valid:
+            first = next(issue for issue in source_report.issues if issue.severity.value == "error")
+            raise AppError("subtitle.validation_failed", {"reason": first.code})
+        terminology = decode_terminology(
+            self.artifacts.read_bytes(_ref(request, "terminology.json"))
+        )
+        if (
+            terminology.transcript_id != transcript.id
+            or terminology.target_language != target_language
+        ):
+            raise AppError("llm.terminology_invalid", {"reason": "transcript_or_language"})
+        prompt = _prompt_with_context(self.prompt, terminology.to_dict())
+        chunking = _chunking_from_snapshot(request.config.llm)
+        execution_config = _stage_execution_config(
+            request.config.llm,
+            LLMTaskKind.TRANSLATE_QUALITY.value,
+            transcript.language,
+            target_language,
+            prompt,
+            chunking,
+            "quality",
+        )
+        executor = LLMChunkExecutor(
+            self.client,
+            self.cache,
+            ChunkPlanner(self.token_counter, chunking),
+            execution_config,
+        )
+        items = tuple(
+            ChunkItem(cue.id, cue.source_text, cue.start_ms, cue.end_ms)
+            for cue in source_track.cues
+        )
+        responses = await executor.execute(items, QualityTranslationResponse, context.execution)
+        response_by_id = {_response_id(response): response for response in responses}
+        cues: list[SubtitleCue] = []
+        for cue in source_track.cues:
+            response = response_by_id[cue.id]
+            cues.append(
+                SubtitleCue(
+                    cue.id,
+                    cue.start_ms,
+                    cue.end_ms,
+                    cue.source_word_ids,
+                    cue.source_text,
+                    response.translated_text,
+                    break_lines(response.translated_text, policy),
+                )
+            )
+        translated = SubtitleTrack(
+            derive_subtitle_track_id(
+                transcript.id,
+                target_language,
+                cues,
+                policy.to_mapping(),
+            ),
+            transcript.id,
+            target_language,
+            tuple(cues),
+            1,
+            policy.signature,
+        )
+        report = validate_translated_mapping(
+            translated,
+            transcript,
+            policy,
+            target_language,
+            corrected_mapping,
+        )
+        if not report.is_valid:
+            first = next(issue for issue in report.issues if issue.severity.value == "error")
+            raise AppError("subtitle.validation_failed", {"reason": first.code})
+        return (
+            ProducedArtifact(
+                "translated-subtitle-track-json",
+                "application/json",
+                _translated_track_name(target_language),
+                data=encode_track(translated),
+            ),
+            ProducedArtifact(
+                "translation-report-json",
+                "application/json",
+                "translation-report.json",
+                data=encode_json(
+                    {
+                        "schema_version": 1,
+                        "profile": "quality",
+                        "source_track_id": source_track.id,
+                        "translated_track_id": translated.id,
+                        "source_language": transcript.language,
+                        "target_language": target_language,
+                        "cue_count": len(cues),
+                        "validated": True,
+                    }
+                ),
+            ),
+        )
+
+
+@dataclass(slots=True)
+class ReviewStage:
+    """Review only deterministic anomalies and preserve every source field."""
+
+    artifacts: DurableArtifactStorePort
+    client: LLMClient
+    cache: LLMCachePort
+    token_counter: TokenCounter
+    prompt: PromptIdentity
+    config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
+    name: StageName = StageName.REVIEW
+    version: str = "review-v1"
+
+    async def execute(
+        self, request: StageExecutionRequest, context: StageExecutionContext
+    ) -> tuple[ProducedArtifact, ...]:
+        target_language = request.config.target_language
+        if target_language is None:
+            raise AppError("llm.target_language_missing")
+        _validate_target_language(target_language)
+        transcript = decode_transcript(self.artifacts.read_bytes(_ref(request, "transcript.json")))
+        track = decode_track(
+            self.artifacts.read_bytes(_ref(request, _translated_track_name(target_language)))
+        )
+        policy = _policy_config(self.config)
+        corrected = _read_corrected(self.artifacts, request, transcript)
+        corrected_mapping = None if corrected is None else corrected.corrected_text_by_word_id
+        report = validate_translated_mapping(
+            track,
+            transcript,
+            policy,
+            target_language,
+            corrected_mapping,
+        )
+        if not report.is_valid:
+            first = next(issue for issue in report.issues if issue.severity.value == "error")
+            raise AppError("subtitle.validation_failed", {"reason": first.code})
+        terminology_ref = _optional_ref(request, "terminology.json")
+        terminology = (
+            None
+            if terminology_ref is None
+            else decode_terminology(self.artifacts.read_bytes(terminology_ref))
+        )
+        anomalies = detect_anomalies(track, transcript, target_language, policy, terminology)
+        responses: tuple[object, ...] = ()
+        if anomalies:
+            all_items = tuple(
+                ChunkItem(cue.id, _review_item_text(cue), cue.start_ms, cue.end_ms)
+                for cue in track.cues
+            )
+            anomaly_ids = {anomaly.cue_id for anomaly in anomalies}
+            items = tuple(item for item in all_items if item.id in anomaly_ids)
+            prompt = _prompt_with_context(
+                self.prompt,
+                {
+                    "terminology": None if terminology is None else terminology.to_dict(),
+                    "anomalies": [
+                        {"cue_id": anomaly.cue_id, "reasons": list(anomaly.reasons)}
+                        for anomaly in anomalies
+                    ],
+                },
+            )
+            chunking = _chunking_from_snapshot(request.config.llm)
+            execution_config = _stage_execution_config(
+                request.config.llm,
+                LLMTaskKind.REVIEW.value,
+                transcript.language,
+                target_language,
+                prompt,
+                chunking,
+                "quality",
+            )
+            executor = LLMChunkExecutor(
+                self.client,
+                self.cache,
+                AnomalyChunkPlanner(self.token_counter, all_items),
+                execution_config,
+            )
+            responses = await executor.execute(
+                items,
+                ReviewResponse,
+                context.execution,
+                validation_source_texts={cue.id: cue.source_text for cue in track.cues},
+            )
+        reviewed = build_reviewed_track(
+            track,
+            transcript,
+            target_language,
+            policy,
+            anomalies,
+            responses,
+            terminology,
+            corrected_mapping,
+        )
+        return (
+            ProducedArtifact(
+                "reviewed-subtitle-track-json",
+                "application/json",
+                f"reviewed-track.{target_language}.json",
+                data=encode_track(reviewed),
+            ),
+            ProducedArtifact(
+                "review-report-json",
+                "application/json",
+                "review-report.json",
+                data=encode_json(review_report(track, anomalies, terminology)),
+            ),
+        )
+
+
+@dataclass(slots=True)
 class ExportStage:
     artifacts: DurableArtifactStorePort
     config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
@@ -306,11 +677,18 @@ class ExportStage:
         context.execution.raise_if_cancelled()
         transcript = decode_transcript(self.artifacts.read_bytes(_ref(request, "transcript.json")))
         track_name = "subtitle-track.json"
-        if request.config.pipeline_profile.value == "fast":
+        corrected_mapping = None
+        if request.config.pipeline_profile.value in {"fast", "quality"}:
             target_language = request.config.target_language
             if target_language is None:
                 raise AppError("llm.target_language_missing")
-            track_name = _translated_track_name(target_language)
+            track_name = (
+                _reviewed_track_name(target_language)
+                if request.config.pipeline_profile.value == "quality"
+                else _translated_track_name(target_language)
+            )
+            corrected = _read_corrected(self.artifacts, request, transcript)
+            corrected_mapping = None if corrected is None else corrected.corrected_text_by_word_id
         track = decode_track(self.artifacts.read_bytes(_ref(request, track_name)))
         config = _policy_config(self.config)
         report = validate_subtitle_track(
@@ -318,8 +696,9 @@ class ExportStage:
             transcript,
             config,
             request.config.target_language
-            if request.config.pipeline_profile.value == "fast"
+            if request.config.pipeline_profile.value != "deterministic"
             else None,
+            corrected_mapping,
         )
         if not report.is_valid:
             first = next(issue for issue in report.issues if issue.severity.value == "error")
@@ -421,6 +800,63 @@ def _ref(request: StageExecutionRequest, logical_name: str) -> ArtifactRef:
     if len(matches) == 1:
         return matches[0]
     raise AppError("stage.input_missing", {"logical_name": logical_name})
+
+
+def _optional_ref(request: StageExecutionRequest, logical_name: str) -> ArtifactRef | None:
+    matches = [ref for ref in request.input_artifacts if ref.logical_name == logical_name]
+    if len(matches) > 1:
+        raise AppError("stage.input_duplicate", {"logical_name": logical_name})
+    return matches[0] if matches else None
+
+
+def _read_corrected(
+    artifacts: DurableArtifactStorePort,
+    request: StageExecutionRequest,
+    transcript: object,
+) -> CorrectedTranscript | None:
+    corrected_ref = _optional_ref(request, "corrected-transcript.json")
+    if corrected_ref is None:
+        return None
+    corrected = decode_corrected_transcript(artifacts.read_bytes(corrected_ref))
+    transcript_id = getattr(transcript, "id", None)
+    if corrected.transcript_id != transcript_id:
+        raise AppError("transcript.correction_invalid", {"reason": "transcript_id"})
+    return corrected
+
+
+def _canonical_word_text(value: str) -> str:
+    from captioner.core.policies.unicode_metrics import normalize_text
+
+    return normalize_text(value)
+
+
+def _prompt_with_context(prompt: PromptIdentity, context: object) -> PromptIdentity:
+    context_bytes = encode_json(context)
+    content = f"{prompt.content}\n\nContext:\n{context_bytes.decode('utf-8')}"
+    return PromptIdentity(
+        prompt.prompt_id,
+        prompt.prompt_version,
+        hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        content,
+    )
+
+
+def _review_item_text(cue: SubtitleCue) -> str:
+    return (
+        encode_json(
+            {
+                "source_text": cue.source_text,
+                "translated_text": cue.translated_text,
+            }
+        )
+        .decode("utf-8")
+        .rstrip("\n")
+    )
+
+
+def _reviewed_track_name(target_language: str) -> str:
+    _validate_target_language(target_language)
+    return f"reviewed-track.{target_language}.json"
 
 
 def _sha256(path: Path) -> str:
@@ -546,6 +982,26 @@ def _translation_execution_config(
     prompt: PromptIdentity,
     chunking: ChunkingConfig,
 ) -> LLMChunkExecutionConfig:
+    return _stage_execution_config(
+        llm,
+        LLMTaskKind.TRANSLATE_FAST.value,
+        source_language,
+        target_language,
+        prompt,
+        chunking,
+        "fast",
+    )
+
+
+def _stage_execution_config(
+    llm: Mapping[str, object] | None,
+    task_kind: str,
+    source_language: str,
+    target_language: str | None,
+    prompt: PromptIdentity,
+    chunking: ChunkingConfig,
+    profile: str,
+) -> LLMChunkExecutionConfig:
     values = {} if llm is None else dict(llm)
     provider_kind = _snapshot_string(values, "kind", "openai-compatible")
     provider_identity = _snapshot_string(values, "provider_profile", "default")
@@ -558,7 +1014,7 @@ def _translation_execution_config(
     if type(schema_version) is not int or schema_version < 1:
         raise AppError("llm.config_invalid", {"field": "response_schema_version"})
     return LLMChunkExecutionConfig(
-        task_kind=LLMTaskKind.TRANSLATE_FAST.value,
+        task_kind=task_kind,
         provider_kind=provider_kind,
         provider_identity=provider_identity,
         base_url_identity=base_url,
@@ -566,7 +1022,7 @@ def _translation_execution_config(
         temperature=float(temperature),
         source_language=source_language,
         target_language=target_language,
-        profile="fast",
+        profile=profile,
         prompt_id=prompt.prompt_id,
         prompt_version=prompt.prompt_version,
         prompt_content_sha256=prompt.content_sha256,

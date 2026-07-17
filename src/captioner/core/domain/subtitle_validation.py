@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -47,29 +48,50 @@ def validate_subtitle_track(
     transcript: Transcript,
     config: SegmentationPolicyConfig,
     target_language: str | None = None,
+    corrected_text_by_word_id: Mapping[str, str] | None = None,
 ) -> ValidationReport:
     """Validate the appropriate source or translated-track contract."""
     if _is_translated(track):
-        return validate_translated_track(track, transcript, config, target_language)
-    return validate_source_track(track, transcript, config)
+        return validate_translated_track(
+            track, transcript, config, target_language, corrected_text_by_word_id
+        )
+    return validate_source_track(track, transcript, config, corrected_text_by_word_id)
 
 
 def validate_source_mapping(
     track: SubtitleTrack,
     transcript: Transcript,
     config: SegmentationPolicyConfig,
+    corrected_text_by_word_id: Mapping[str, str] | None = None,
 ) -> ValidationReport:
     """Validate timestamps, cue IDs, and complete source Word assignment."""
-    return _validate(track, transcript, config, translated=False, target_language=None)
+    return _validate(
+        track,
+        transcript,
+        config,
+        translated=False,
+        target_language=None,
+        corrected_text_by_word_id=corrected_text_by_word_id,
+        check_display=True,
+    )
 
 
 def validate_source_track(
     track: SubtitleTrack,
     transcript: Transcript,
     config: SegmentationPolicyConfig,
+    corrected_text_by_word_id: Mapping[str, str] | None = None,
 ) -> ValidationReport:
     """Validate a deterministic source-language track."""
-    return _validate(track, transcript, config, translated=False, target_language=None)
+    return _validate(
+        track,
+        transcript,
+        config,
+        translated=False,
+        target_language=None,
+        corrected_text_by_word_id=corrected_text_by_word_id,
+        check_display=True,
+    )
 
 
 def validate_translated_track(
@@ -77,10 +99,39 @@ def validate_translated_track(
     transcript: Transcript,
     config: SegmentationPolicyConfig,
     target_language: str | None = None,
+    corrected_text_by_word_id: Mapping[str, str] | None = None,
 ) -> ValidationReport:
     """Validate display text while preserving the original source mapping."""
     expected_language = target_language or track.language
-    return _validate(track, transcript, config, translated=True, target_language=expected_language)
+    return _validate(
+        track,
+        transcript,
+        config,
+        translated=True,
+        target_language=expected_language,
+        corrected_text_by_word_id=corrected_text_by_word_id,
+        check_display=True,
+    )
+
+
+def validate_translated_mapping(
+    track: SubtitleTrack,
+    transcript: Transcript,
+    config: SegmentationPolicyConfig,
+    target_language: str | None = None,
+    corrected_text_by_word_id: Mapping[str, str] | None = None,
+) -> ValidationReport:
+    """Validate translated cue identity and mapping before anomaly review."""
+    expected_language = target_language or track.language
+    return _validate(
+        track,
+        transcript,
+        config,
+        translated=True,
+        target_language=expected_language,
+        corrected_text_by_word_id=corrected_text_by_word_id,
+        check_display=False,
+    )
 
 
 def _validate(
@@ -90,6 +141,8 @@ def _validate(
     *,
     translated: bool,
     target_language: str | None,
+    corrected_text_by_word_id: Mapping[str, str] | None,
+    check_display: bool,
 ) -> ValidationReport:
     issues: list[ValidationIssue] = []
     words = {word.id: word for word in transcript.words}
@@ -98,7 +151,24 @@ def _validate(
     )
     canonical_indexes = {word.id: index for index, word in enumerate(canonical_words)}
     canonical_ids = tuple(word.id for word in canonical_words)
-    full_source = join_token_texts(word.text for word in canonical_words)
+    source_texts = (
+        {word.id: word.text for word in canonical_words}
+        if corrected_text_by_word_id is None
+        else dict(corrected_text_by_word_id)
+    )
+    if corrected_text_by_word_id is not None:
+        missing_source_texts = set(canonical_ids) - set(source_texts)
+        extra_source_texts = set(source_texts) - set(canonical_ids)
+        if missing_source_texts or extra_source_texts:
+            issues.append(
+                ValidationIssue(
+                    "subtitle.corrected_mapping_invalid",
+                    ValidationSeverity.ERROR,
+                    actual="|".join(sorted(extra_source_texts)),
+                    limit="|".join(sorted(missing_source_texts)),
+                )
+            )
+    full_source = join_token_texts(source_texts.get(word.id, word.text) for word in canonical_words)
     assigned: list[str] = []
     previous_end = -1
 
@@ -271,7 +341,8 @@ def _validate(
                     ValidationIssue("subtitle.lines_not_derived", ValidationSeverity.ERROR, cue.id)
                 )
             if (
-                target_language is not None
+                check_display
+                and target_language is not None
                 and cue.translated_text is not None
                 and is_obvious_wrong_language(cue.translated_text, target_language)
             ):
@@ -283,9 +354,13 @@ def _validate(
                         actual=target_language,
                     )
                 )
-            if cue.translated_text is not None and (
-                not _protected_numbers_preserved(protected_source, cue.translated_text)
-                or not _protected_numbers_preserved(protected_source, normalized_source)
+            if (
+                cue.translated_text is not None
+                and check_display
+                and (
+                    not _protected_numbers_preserved(protected_source, cue.translated_text)
+                    or not _protected_numbers_preserved(protected_source, normalized_source)
+                )
             ):
                 issues.append(
                     ValidationIssue(
@@ -333,11 +408,16 @@ def _validate(
                     actual=known_ids[0],
                 )
             )
-        if not translated and known_ids == cue.source_word_ids and known_indexes:
+        if (
+            known_ids == cue.source_word_ids
+            and known_indexes
+            and (not translated or corrected_text_by_word_id is not None)
+        ):
             span_start = known_indexes[0]
             span_end = known_indexes[-1] + 1
             expected_text = join_token_texts(
-                word.text for word in canonical_words[span_start:span_end]
+                source_texts.get(word.id, word.text)
+                for word in canonical_words[span_start:span_end]
             )
             if expected_text != normalized_source:
                 issues.append(
@@ -354,7 +434,10 @@ def _validate(
         last_index = canonical_indexes.get(cue.source_word_ids[-1])
         if last_index is not None and last_index < len(canonical_words) - 1:
             boundary_text = normalize_text(
-                "".join(word.text for word in canonical_words[: last_index + 1])
+                "".join(
+                    source_texts.get(word.id, word.text)
+                    for word in canonical_words[: last_index + 1]
+                )
             )
             if protected_break_cost(full_source, len(boundary_text)):
                 issues.append(

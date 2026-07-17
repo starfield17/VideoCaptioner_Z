@@ -53,7 +53,7 @@ class StructuredLLMService(LLMClient):
         context: ExecutionContext,
     ) -> T:
         current_request = request
-        repair_used = False
+        repair_used = request.task_kind == "repair_structured"
         retry_index = 0
         while True:
             context.raise_if_cancelled()
@@ -76,16 +76,21 @@ class StructuredLLMService(LLMClient):
     def _repair_request(self, request: LLMRequest) -> LLMRequest:
         if self.repair_request_factory is not None:
             return self.repair_request_factory(request)
-        return replace(
-            request,
-            task_kind="repair_structured",
-            prompt_id="repair_structured",
-            prompt_version="v1",
-            prompt_content=(
-                f"{request.prompt_content}\n\n"
-                "Return exactly one valid JSON object matching the requested schema."
-            ),
-        )
+        return structured_repair_request(request)
+
+
+def structured_repair_request(request: LLMRequest) -> LLMRequest:
+    """Create the sole deterministic repair request for one logical call."""
+    return replace(
+        request,
+        task_kind="repair_structured",
+        prompt_id="repair_structured",
+        prompt_version="v1",
+        prompt_content=(
+            f"{request.prompt_content}\n\n"
+            "Return exactly one valid JSON object matching the requested schema."
+        ),
+    )
 
 
 def _is_retryable(error: AppError) -> bool:

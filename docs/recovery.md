@@ -41,9 +41,12 @@ claim network-filesystem or distributed-worker safety.
 
 Batch-wide resume overrides are committed as one `batch.config_updated` event.
 Model/language/device/compute/VAD changes invalidate Transcribe onward;
-segmentation changes invalidate Segment onward; output/overwrite changes
-invalidate Publish only; FFprobe changes invalidate Inspect; FFmpeg or
-normalization changes invalidate Normalize onward. A new `resume --output`
+correction provider/model/prompt settings invalidate CorrectSource (or the
+first LLM Stage present in the selected profile) onward; target language and
+translation settings invalidate Translate onward; Review settings invalidate
+Review onward; segmentation changes invalidate Segment onward;
+output/overwrite changes invalidate Publish only; FFprobe changes invalidate
+Inspect; FFmpeg or normalization changes invalidate Normalize onward. A new `resume --output`
 directory is expanded, created and verified while holding the writer lease,
 before that event is appended. Creation failure leaves the Journal unchanged.
 
@@ -53,6 +56,13 @@ selects one documented checkpoint; normal CLI operation cannot activate it.
 
 Abrupt interruption may leave incomplete workspace or output projection state,
 but Journal replay and Artifact verification either repair it or fail explicitly.
+
+LLM recovery is per validated Chunk. Each Cache entry is canonical JSON bound to
+its full Cache key and response schema, fsynced and atomically renamed. Resume
+reuses validated hits before entering the shared Semaphore, so a Stage crash
+requests only Cache misses. A committed LLM Stage is never called again during
+normal resume. Corrupt or mismatched Cache entries are misses, not successful
+results. API-key rotation does not change Cache identity.
 
 Publication target verification performs one regular-file, size, and SHA-256
 pass per target; filesystem races and I/O failures are reported as

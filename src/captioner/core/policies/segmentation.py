@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack, derive_subtitle_track_id
@@ -54,9 +54,20 @@ def segment_transcript_dp(
     transcript: Transcript,
     config: SegmentationPolicyConfig | None = None,
     progress: Callable[[], None] | None = None,
+    corrected_text_by_word_id: Mapping[str, str] | None = None,
 ) -> SubtitleTrack:
     settings = SegmentationPolicyConfig() if config is None else config
-    words = canonical_words(transcript.words)
+    corrected = None if corrected_text_by_word_id is None else dict(corrected_text_by_word_id)
+    if corrected is not None:
+        expected_ids = {word.id for word in transcript.words}
+        if set(corrected) != expected_ids:
+            raise AppError("subtitle.segmentation_failed", {"reason": "corrected_mapping"})
+        words_for_segmentation = tuple(
+            replace(word, text=corrected[word.id]) for word in transcript.words
+        )
+    else:
+        words_for_segmentation = transcript.words
+    words = canonical_words(words_for_segmentation)
     partitions = _hard_partitions(words, settings.hard_gap_ms)
     spans: list[tuple[WordToken, ...]] = []
     progress_emitted = False
@@ -104,7 +115,12 @@ def segment_transcript_dp(
         revision=0,
         policy_signature=settings.signature,
     )
-    report = validate_subtitle_track(track, transcript, settings)
+    report = validate_subtitle_track(
+        track,
+        transcript,
+        settings,
+        corrected_text_by_word_id=corrected,
+    )
     if not report.is_valid:
         first = next(issue for issue in report.issues if issue.severity.value == "error")
         raise AppError("subtitle.validation_failed", {"reason": first.code})

@@ -66,7 +66,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
     output_dir = options.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     llm_snapshot = None
-    if options.pipeline_profile is PipelineProfile.FAST:
+    if options.pipeline_profile in {PipelineProfile.FAST, PipelineProfile.QUALITY}:
         if options.target_language is None:
             raise AppError("llm.target_language_missing")
         llm_snapshot = create_llm_job_snapshot(
@@ -74,6 +74,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
             provider_profile=options.llm_provider_profile,
             source_language=options.language,
             paths=paths,
+            pipeline_profile=options.pipeline_profile,
         )
     config = create_job_config(
         model_ref=options.model_ref,
@@ -137,7 +138,7 @@ def resume(
         projection = _read_projection(batch_id, paths=paths, repair=True)
         config = _common_config(projection)
         selected = config if overrides is None else _apply_overrides(config, overrides)
-        selected = _ensure_fast_snapshot(selected, overrides, paths)
+        selected = _ensure_llm_snapshot(selected, overrides, paths)
         bundle = _bundle(batch_id, selected, paths)
         if selected != config:
             earliest = min(
@@ -457,12 +458,12 @@ def _override_llm(
     return _frozen_llm(values)
 
 
-def _ensure_fast_snapshot(
+def _ensure_llm_snapshot(
     config: JobConfig,
     overrides: ResumeOverrides | None,
     paths: AppPaths,
 ) -> JobConfig:
-    if config.pipeline_profile is not PipelineProfile.FAST:
+    if config.pipeline_profile not in {PipelineProfile.FAST, PipelineProfile.QUALITY}:
         return config
     target_language = config.target_language
     if target_language is None:
@@ -473,6 +474,8 @@ def _ensure_fast_snapshot(
         else config.provider_profile or "default"
     )
     required = {"base_url", "model", "provider_profile"}
+    if config.pipeline_profile is PipelineProfile.QUALITY:
+        required.add("prompts")
     if (
         config.llm is not None
         and required.issubset(config.llm)
@@ -489,6 +492,7 @@ def _ensure_fast_snapshot(
         provider_profile=provider_profile,
         source_language=config.language,
         paths=paths,
+        pipeline_profile=config.pipeline_profile,
     )
     return replace(config, llm=snapshot)
 
@@ -525,44 +529,33 @@ def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:
         new.vad_filter,
     ):
         return StageName.TRANSCRIBE
+    candidates: list[StageName] = []
     if old.segmentation != new.segmentation:
-        return StageName.SEGMENT
+        candidates.append(StageName.SEGMENT)
     if old.pipeline_profile != new.pipeline_profile:
         if new.pipeline_profile is PipelineProfile.QUALITY:
-            return StageName.CORRECT_SOURCE
-        if new.pipeline_profile is PipelineProfile.FAST:
-            return StageName.TRANSLATE
-        return StageName.SEGMENT
+            candidates.append(StageName.CORRECT_SOURCE)
+        elif old.pipeline_profile is PipelineProfile.QUALITY:
+            candidates.append(StageName.SEGMENT)
+        elif new.pipeline_profile is PipelineProfile.FAST:
+            candidates.append(StageName.TRANSLATE)
+        else:
+            candidates.append(StageName.SEGMENT)
     if old.llm != new.llm:
         old_llm: Mapping[str, FrozenJsonValue] = {} if old.llm is None else old.llm
         new_llm: Mapping[str, FrozenJsonValue] = {} if new.llm is None else new.llm
-        changed = set(old_llm) | set(new_llm)
-        if changed & {
-            "provider_profile",
-            "base_url",
-            "model",
-            "temperature",
-            "timeout_sec",
-            "max_retries",
-            "chunk",
-            "correction",
-            "correct_source",
-            "prompt_id",
-            "prompt_version",
-            "prompt_content_sha256",
-        }:
-            return _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
-        if changed & {"target_language", "translation", "translate", "translation_prompt"}:
-            return _available_stage(StageName.TRANSLATE, plan)
-        if changed & {"review", "review_prompt_id", "review_prompt_version"}:
-            return _available_stage(StageName.REVIEW, plan)
+        candidates.extend(_changed_llm_stages(old_llm, new_llm, plan))
     if old.stage_versions != new.stage_versions:
         for stage in plan:
             if old.stage_versions.get(stage.value) != new.stage_versions.get(stage.value):
-                return stage
-        raise AppError("batch.config_inconsistent", {"reason": "stage_versions"})
+                candidates.append(stage)
+                break
+        else:
+            raise AppError("batch.config_inconsistent", {"reason": "stage_versions"})
     if old.output_dir != new.output_dir or old.overwrite != new.overwrite:
-        return StageName.PUBLISH
+        candidates.append(StageName.PUBLISH)
+    if candidates:
+        return min(candidates, key=plan.index)
     if old != new:
         raise AppError("batch.config_inconsistent", {"reason": "unknown_config_change"})
     return StageName.PUBLISH
@@ -582,6 +575,82 @@ def _available_stage(
         if candidate in plan:
             return candidate
     raise AppError("batch.config_inconsistent", {"reason": "empty_stage_plan"})
+
+
+def _changed_prompt_stages(
+    old_llm: Mapping[str, FrozenJsonValue],
+    new_llm: Mapping[str, FrozenJsonValue],
+    plan: tuple[StageName, ...],
+) -> tuple[StageName, ...]:
+    old_prompts = old_llm.get("prompts")
+    new_prompts = new_llm.get("prompts")
+    if not isinstance(old_prompts, Mapping) or not isinstance(new_prompts, Mapping):
+        return (_available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE),)
+    changed_ids = {
+        prompt_id
+        for prompt_id in set(old_prompts) | set(new_prompts)
+        if old_prompts.get(prompt_id) != new_prompts.get(prompt_id)
+    }
+    stages: list[StageName] = []
+    if changed_ids & {"terminology", "correct_source"}:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    if changed_ids & {"translate_fast", "translate_quality"}:
+        stages.append(_available_stage(StageName.TRANSLATE, plan))
+    if "review_anomalies" in changed_ids and StageName.REVIEW in plan:
+        stages.append(StageName.REVIEW)
+    known_ids = {
+        "terminology",
+        "correct_source",
+        "translate_fast",
+        "translate_quality",
+        "review_anomalies",
+    }
+    if changed_ids - known_ids:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    return tuple(stages)
+
+
+def _changed_llm_stages(
+    old_llm: Mapping[str, FrozenJsonValue],
+    new_llm: Mapping[str, FrozenJsonValue],
+    plan: tuple[StageName, ...],
+) -> tuple[StageName, ...]:
+    changed = {key for key in set(old_llm) | set(new_llm) if old_llm.get(key) != new_llm.get(key)}
+    stages: list[StageName] = []
+    if changed & {
+        "provider_profile",
+        "base_url",
+        "model",
+        "temperature",
+        "timeout_sec",
+        "max_retries",
+        "max_concurrency",
+        "chunk",
+        "correction",
+        "correct_source",
+        "terminology",
+        "prompt",
+        "prompt_id",
+        "prompt_version",
+        "prompt_content_sha256",
+    }:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    if changed & {"target_language", "translation", "translate", "translation_prompt"}:
+        stages.append(_available_stage(StageName.TRANSLATE, plan))
+    if (
+        changed & {"review", "review_prompt_id", "review_prompt_version"}
+        and StageName.REVIEW in plan
+    ):
+        stages.append(StageName.REVIEW)
+    if "prompts" in changed:
+        stages.extend(_changed_prompt_stages(old_llm, new_llm, plan))
+    return tuple(stages)
 
 
 def _frozen_llm(value: Mapping[str, object]) -> Mapping[str, FrozenJsonValue]:

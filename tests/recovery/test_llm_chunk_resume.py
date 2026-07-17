@@ -171,3 +171,46 @@ def test_cancellation_leaves_no_partial_cache(tmp_path: Path) -> None:
             )
         )
     assert not cache.root.exists() or not list(cache.root.rglob("*.tmp"))
+
+
+def test_validation_failure_gets_one_repair_before_cache_write(tmp_path: Path) -> None:
+    cache = FilesystemLLMCache(tmp_path)
+    item = ChunkItem("item-0", "source 10")
+    invalid = ScriptedJSON('[{"id":"item-0","corrected_source":"corrected"}]')
+    repaired = ScriptedJSON('[{"id":"item-0","corrected_source":"corrected 10"}]')
+    adapter = ScriptedLLMAdapter(structured_responses=(invalid, repaired))
+
+    result = asyncio.run(
+        _executor(cache, adapter, _config(max_items=1)).execute(
+            (item,),
+            SourceCorrectionResponse,
+        )
+    )
+
+    assert result[0].corrected_source == "corrected 10"
+    assert [call.task_kind for call in adapter.structured_calls] == [
+        "correct_source",
+        "repair_structured",
+    ]
+    assert len(list(cache.root.rglob("*.json"))) == 1
+
+
+def test_failed_validation_repair_is_not_cached(tmp_path: Path) -> None:
+    cache = FilesystemLLMCache(tmp_path)
+    item = ChunkItem("item-0", "source 10")
+    invalid = ScriptedJSON('[{"id":"item-0","corrected_source":"corrected"}]')
+    adapter = ScriptedLLMAdapter(structured_responses=(invalid, invalid))
+
+    with pytest.raises(AppError, match=r"llm\.protected_token_lost"):
+        asyncio.run(
+            _executor(cache, adapter, _config(max_items=1)).execute(
+                (item,),
+                SourceCorrectionResponse,
+            )
+        )
+
+    assert [call.task_kind for call in adapter.structured_calls] == [
+        "correct_source",
+        "repair_structured",
+    ]
+    assert not list(cache.root.rglob("*.json"))

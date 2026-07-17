@@ -1,6 +1,6 @@
 # Architecture
 
-Phase 2 and Phase 3 preserve the following dependency direction:
+Phase 2 through Phase 4 preserve the following dependency direction:
 
 ```text
 GUI / CLI
@@ -26,14 +26,23 @@ each other, and Core cannot depend on adapters or SDKs.
 
 `bootstrap.py` is the explicit composition root. It creates one process runner,
 one FFprobe/FFmpeg pair, one Faster Whisper engine, one local artifact store per
-run, and the injected serializers. The application uses a temporary workspace
-for normalized audio and never writes it beside the input or into resources.
+run, and the injected serializers. When an LLM profile runs, it also creates one
+shared provider runtime, HTTP client, and application-wide Semaphore. Every LLM
+Stage and Job receives that same runtime. The application uses a temporary
+workspace for normalized audio and never writes it beside the input or into
+resources.
 
-The durable pipeline is:
+The durable Stage plan is selected from the persisted Job profile:
 
 ```text
-inspect → normalize → transcribe → segment → export → publish
+deterministic: inspect → normalize → transcribe → segment → export → publish
+fast:          inspect → normalize → transcribe → segment → translate → export → publish
+quality:       inspect → normalize → transcribe → correct_source → segment
+               → translate → review → export → publish
 ```
+
+Unused profile Stages do not receive synthetic commits. Schema-v1 Jobs replay as
+the original deterministic six-Stage plan.
 
 Segment decodes the Transcript, canonicalizes Words, solves cue boundaries,
 breaks lines, validates an immutable `SubtitleTrack`, and writes
@@ -46,10 +55,11 @@ restores every output committed by the current invocation, including previous
 bytes in overwrite mode; this is an in-process transaction, not durable crash
 recovery.
 
-Subtitle processing is a pure deterministic function of the Transcript, the
-canonical policy configuration, and exporter versions. It uses grapheme-aware
-Unicode metrics and exact integer arithmetic; it does not use an LLM,
-translation, current time, locale formatting, or platform newline behavior.
+Deterministic-profile subtitle processing remains a pure function of the
+Transcript, canonical policy configuration, and exporter versions. Fast and
+Quality may obtain text from an LLM, but Cue boundaries, timestamps, Word
+mapping, line breaking, validation, serialization, and publication remain
+application-owned and deterministic.
 
 The Faster Whisper adapter keeps `model_ref` (the SDK loading reference)
 separate from `model_identity` (the stable public value). Named models use a
@@ -72,6 +82,8 @@ attempt events, CAS import and verification, the authoritative
 immutable. Recovery repairs a stale Manifest, records open attempts as
 interrupted, verifies artifacts, and invalidates only the affected suffix.
 
-Phase 2/3 has sequential Jobs and one ASR engine per active Batch. It has no GUI
-workflow, parallel scheduler, LLM, translation, forced alignment, distributed
-locking, artifact GC, runtime installer, muxing, or release workflow.
+Phase 4 keeps sequential Jobs and one ASR engine per active Batch. LLM Chunks
+may execute concurrently through one application-wide provider gate. It has no
+GUI workflow, parallel Job scheduler, provider fallback/routing, forced
+alignment, distributed locking, artifact GC, runtime installer, muxing, or
+release workflow.

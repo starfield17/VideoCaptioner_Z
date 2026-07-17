@@ -185,6 +185,21 @@ class SourceCorrectionResponse(_StrictResponse):
 
 
 @dataclass(frozen=True, slots=True)
+class TerminologyResponse(_StrictResponse):
+    id: str
+    source_term: str
+    target_term: str
+
+    _field_names: ClassVar[tuple[str, ...]] = ("id", "source_term", "target_term")
+    text_fields: ClassVar[tuple[str, ...]] = ("source_term", "target_term")
+
+    def __post_init__(self) -> None:
+        _canonical_nonempty(self.id, "id")
+        _canonical_nonempty(self.source_term, "source_term")
+        _canonical_nonempty(self.target_term, "target_term")
+
+
+@dataclass(frozen=True, slots=True)
 class FastTranslationResponse(_StrictResponse):
     id: str
     corrected_source: str
@@ -229,6 +244,7 @@ class ReviewResponse(_StrictResponse):
 # descriptive and stable.
 CorrectSourceResponse = SourceCorrectionResponse
 SourceCorrection = SourceCorrectionResponse
+Terminology = TerminologyResponse
 FastTranslation = FastTranslationResponse
 QualityTranslation = QualityTranslationResponse
 Review = ReviewResponse

@@ -13,6 +13,7 @@ from captioner.core.domain.llm import (
     QualityTranslationResponse,
     ReviewResponse,
     SourceCorrectionResponse,
+    TerminologyResponse,
     response_schema_for,
 )
 from captioner.core.domain.transcript import CorrectedSpan, CorrectedTranscript
@@ -34,6 +35,7 @@ def test_response_parsing_and_serialization_paths() -> None:
         FastTranslationResponse("unit", "corrected", "translated"),
         QualityTranslationResponse("unit", "translated"),
         ReviewResponse("unit", "translated"),
+        TerminologyResponse("unit", "source", "target"),
     )
     for response in responses:
         assert type(response).from_mapping(response.to_dict()) == response

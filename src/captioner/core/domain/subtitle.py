@@ -69,9 +69,14 @@ class SubtitleCue:
         _text(self.source_text, "source_text")
         if normalize_text(self.source_text) != self.source_text:
             raise AppError("subtitle.invalid", {"field": "source_text", "reason": "not_canonical"})
-        if self.translated_text is not None:
-            _text(self.translated_text, "translated_text")
-            if normalize_text(self.translated_text) != self.translated_text:
+        translated_text = cast(object, self.translated_text)
+        if translated_text is not None:
+            if not isinstance(translated_text, str):
+                raise AppError(
+                    "subtitle.invalid",
+                    {"field": "translated_text", "reason": "type"},
+                )
+            if normalize_text(translated_text) != translated_text:
                 raise AppError(
                     "subtitle.invalid",
                     {"field": "translated_text", "reason": "not_canonical"},
