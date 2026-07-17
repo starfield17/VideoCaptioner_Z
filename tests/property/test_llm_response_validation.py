@@ -5,7 +5,12 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.llm import FastTranslationResponse
+from captioner.core.domain.llm import (
+    FastTranslationResponse,
+    QualityTranslationResponse,
+    ReviewResponse,
+    SourceCorrectionResponse,
+)
 from captioner.core.policies.llm_validation import (
     is_obvious_wrong_language,
     protected_numeric_tokens,
@@ -115,6 +120,22 @@ def test_protected_spans_preserve_numeric_semantics(
         ("100 kg", "100 kg", True),
         ("100 kg", "100 g", False),
         ("10 kg", "10 kg and 20 pieces", False),
+        ("100", "100 dollars", False),
+        ("100", "100 euros", False),
+        ("10", "10 percent", False),
+        ("10", "10 per cent", False),
+        ("100", "100 kilograms", False),
+        ("100", "100 meters", False),
+        ("100 dollars", "100", False),
+        ("10 percent", "10", False),
+        ("100 kilograms", "100", False),
+        ("100 dollars", "100 dollars", True),
+        ("10 percent", "10 percent", True),
+        ("100 kilograms", "100 kg", True),
+        ("1 meter", "1 metre", True),
+        ("1 gigabyte", "1 GB", True),
+        ("100 dollars", "100 euros", False),
+        ("10 kg", "10 g", False),
     ],
 )
 def test_protected_token_exact_sequence_and_semantic_facts(
@@ -167,3 +188,84 @@ def test_fast_fields_are_validated_independently() -> None:
         source_texts={"unit-1": "Price 20%"},
         target_language="zh-CN",
     )
+
+
+def test_protected_diagnostic_identifies_fast_field_and_item() -> None:
+    with pytest.raises(AppError) as raised:
+        validate_responses(
+            (FastTranslationResponse("cue-000123", "Price 100", "It costs 100 dollars"),),
+            ("cue-000123",),
+            source_texts={"cue-000123": "Price 100"},
+        )
+    assert raised.value.params["id"] == "cue-000123"
+    assert raised.value.params["field"] == "translated_text"
+    assert raised.value.params["reason"] == "protected_fact_kind_changed"
+    assert "100 dollars" not in str(raised.value)
+    assert "Price 100" not in str(raised.value)
+
+
+def test_protected_diagnostic_identifies_source_correction_field() -> None:
+    with pytest.raises(AppError) as raised:
+        validate_responses(
+            (FastTranslationResponse("cue-000123", "Weight 100 kilograms", "Weight 100"),),
+            ("cue-000123",),
+            source_texts={"cue-000123": "Weight 100"},
+        )
+    assert raised.value.params["id"] == "cue-000123"
+    assert raised.value.params["field"] == "corrected_source"
+    assert raised.value.params["expected_kind"] == "number"
+    assert raised.value.params["actual_kind"] == "unit"
+
+
+@pytest.mark.parametrize(
+    ("response", "field"),
+    [
+        (SourceCorrectionResponse("cue-1", "100 kilograms"), "corrected_source"),
+        (QualityTranslationResponse("cue-1", "100 dollars"), "translated_text"),
+        (ReviewResponse("cue-1", "10"), "translated_text"),
+    ],
+)
+def test_protected_diagnostic_uses_stage_text_field(response: object, field: str) -> None:
+    source = "10 percent" if isinstance(response, ReviewResponse) else "100"
+    with pytest.raises(AppError) as raised:
+        validate_responses(
+            (response,),
+            ("cue-1",),
+            source_texts={"cue-1": source},
+        )
+    assert raised.value.params["id"] == "cue-1"
+    assert raised.value.params["field"] == field
+
+
+@given(st.sampled_from(("dollars", "euros", "pounds", "yen", "yuan")))
+def test_recognized_textual_currency_cannot_be_added_to_a_bare_number(marker: str) -> None:
+    assert protected_tokens_preserved("100", f"100 {marker}") is False
+
+
+@given(st.sampled_from(("percent", "percentage", "per cent")))
+def test_recognized_textual_percentage_cannot_be_added_to_a_bare_number(marker: str) -> None:
+    assert protected_tokens_preserved("10", f"10 {marker}") is False
+
+
+@given(
+    st.sampled_from(
+        (
+            "kilograms",
+            "grams",
+            "meters",
+            "metres",
+            "centimeters",
+            "gigabytes",
+            "hertz",
+        )
+    )
+)
+def test_recognized_textual_unit_cannot_be_added_to_a_bare_number(marker: str) -> None:
+    assert protected_tokens_preserved("100", f"100 {marker}") is False
+
+
+@pytest.mark.parametrize(
+    "text", ["grammar", "moment", "itemization", "percentagewise", "dollarette"]
+)
+def test_unrelated_words_are_not_textual_markers(text: str) -> None:
+    assert protected_numeric_tokens(text) == ()

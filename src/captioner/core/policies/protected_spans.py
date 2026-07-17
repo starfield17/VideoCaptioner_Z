@@ -91,9 +91,10 @@ _MONTHS = {
     "december": "12",
 }
 
-# These are deliberately explicit.  In particular, "$" and "US$" are not
-# inferred to be interchangeable merely because their text overlaps.
-_CURRENCY_ALIASES = MappingProxyType(
+# These are deliberately explicit.  In particular, "$", "US$", and
+# textual dollar aliases are not inferred to be interchangeable merely
+# because their text overlaps.
+_CURRENCY_SYMBOL_ALIASES = MappingProxyType(
     {
         "$": "symbol:$",
         "US$": "symbol:US$",
@@ -113,10 +114,29 @@ _CURRENCY_ALIASES = MappingProxyType(
         "元": "code:CNY",
         "人民币": "code:CNY",
         "円": "code:JPY",
-        "ドル": "word:dollar",
+        "ドル": "word:USD",
     }
 )
-_UNIT_ALIASES = MappingProxyType(
+_CURRENCY_WORD_ALIASES = MappingProxyType(
+    {
+        "dollar": "word:USD",
+        "dollars": "word:USD",
+        "US dollar": "word:USD",
+        "US dollars": "word:USD",
+        "euro": "word:EUR",
+        "euros": "word:EUR",
+        "pound": "word:GBP",
+        "pounds": "word:GBP",
+        "British pound": "word:GBP",
+        "British pounds": "word:GBP",
+        "yen": "word:JPY",
+        "yuan": "word:CNY",
+        "renminbi": "word:CNY",
+    }
+)
+_CURRENCY_ALIASES = MappingProxyType({**_CURRENCY_SYMBOL_ALIASES, **_CURRENCY_WORD_ALIASES})
+_PERCENTAGE_WORD_ALIASES = MappingProxyType({"percent": "%", "percentage": "%", "per cent": "%"})
+_UNIT_COMPACT_ALIASES = MappingProxyType(
     {
         "kg": "kg",
         "g": "g",
@@ -132,23 +152,73 @@ _UNIT_ALIASES = MappingProxyType(
         "khz": "khz",
         "gb": "gb",
         "mb": "mb",
+    }
+)
+_UNIT_WORD_ALIASES = MappingProxyType(
+    {
+        "kilogram": "kg",
+        "kilograms": "kg",
+        "gram": "g",
+        "grams": "g",
+        "meter": "m",
+        "meters": "m",
+        "metre": "m",
+        "metres": "m",
+        "centimeter": "cm",
+        "centimeters": "cm",
+        "centimetre": "cm",
+        "centimetres": "cm",
+        "millimeter": "mm",
+        "millimeters": "mm",
+        "millimetre": "mm",
+        "millimetres": "mm",
+        "kilometer": "km",
+        "kilometers": "km",
+        "kilometre": "km",
+        "kilometres": "km",
+        "mile": "mile",
+        "miles": "mile",
+        "hour": "hour",
+        "hours": "hour",
+        "minute": "minute",
+        "minutes": "minute",
+        "second": "second",
+        "seconds": "second",
         "piece": "piece",
         "pieces": "piece",
         "item": "item",
         "items": "item",
+        "gigabyte": "gb",
+        "gigabytes": "gb",
+        "megabyte": "mb",
+        "megabytes": "mb",
+        "hertz": "hz",
+        "kilohertz": "khz",
     }
 )
+_UNIT_ALIASES = MappingProxyType({**_UNIT_COMPACT_ALIASES, **_UNIT_WORD_ALIASES})
 
-_CURRENCY_MARKERS = r"US\$|NZ\$|A\$|C\$|[$€£¥₹]|USD|EUR|GBP|JPY|CNY|RMB|元|人民币|円|ドル"
-_UNIT_MARKERS = r"kg|g|km/h|km|m|cm|mm|mph|°C|°F|Hz|kHz|GB|MB|pieces?|items?"
+
+def _alternation(aliases: Sequence[str]) -> str:
+    return "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
+
+
+_CURRENCY_SYMBOL_MARKERS = _alternation(tuple(_CURRENCY_SYMBOL_ALIASES))
+_CURRENCY_WORD_MARKERS = _alternation(tuple(_CURRENCY_WORD_ALIASES))
+_PERCENTAGE_WORD_MARKERS = _alternation(tuple(_PERCENTAGE_WORD_ALIASES))
+_UNIT_COMPACT_MARKERS = _alternation(tuple(_UNIT_COMPACT_ALIASES))
+_UNIT_WORD_MARKERS = _alternation(tuple(_UNIT_WORD_ALIASES))
 _NUMBER = r"\d[\d,\.\u066B\u066C]*"
+_SIGN = r"[+\-\u2212\uff0d]\s*"
 
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "currency",
         re.compile(
-            rf"(?:[+\-\u2212\uff0d]\s*)?(?:{_CURRENCY_MARKERS})\s?{_NUMBER}"
-            rf"|(?:[+\-\u2212\uff0d]\s*)?{_NUMBER}\s?(?:{_CURRENCY_MARKERS})",
+            rf"(?:{_SIGN})?(?:{_CURRENCY_SYMBOL_MARKERS})\s?{_NUMBER}"
+            rf"|(?:{_SIGN})?{_NUMBER}\s?(?:{_CURRENCY_SYMBOL_MARKERS})(?!\w)"
+            rf"|(?:{_SIGN})?(?:{_CURRENCY_WORD_MARKERS})(?!\w)\s+{_NUMBER}"
+            rf"|(?:{_SIGN})?{_NUMBER}\s+(?:{_CURRENCY_WORD_MARKERS})(?!\w)",
             re.IGNORECASE,
         ),
     ),
@@ -173,18 +243,24 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     (
         "percentage",
-        re.compile(rf"(?:[+\-\u2212\uff0d]\s*)?{_NUMBER}\s?%"),
+        re.compile(
+            rf"(?:{_SIGN})?{_NUMBER}\s?%"
+            rf"|(?:{_SIGN})?{_NUMBER}\s+(?:{_PERCENTAGE_WORD_MARKERS})(?!\w)",
+            re.IGNORECASE,
+        ),
     ),
     (
         "unit",
         re.compile(
-            rf"(?:[+\-\u2212\uff0d]\s*)?{_NUMBER}\s?(?:{_UNIT_MARKERS}|\u00d7\s?{_NUMBER})",
+            rf"(?:{_SIGN})?{_NUMBER}\s?(?:{_UNIT_COMPACT_MARKERS})(?!\w)"
+            rf"|(?:{_SIGN})?{_NUMBER}\s+(?:{_UNIT_WORD_MARKERS})(?!\w)"
+            rf"|(?:{_SIGN})?{_NUMBER}\s?\u00d7\s?{_NUMBER}",
             re.IGNORECASE,
         ),
     ),
     (
         "number",
-        re.compile(rf"(?:[+\-\u2212\uff0d]\s*)?{_NUMBER}(?:[:/]{_NUMBER})?"),
+        re.compile(rf"(?:{_SIGN})?{_NUMBER}(?:[:/]{_NUMBER})?"),
     ),
     (
         "abbreviation",

@@ -14,7 +14,6 @@ from captioner.core.domain.llm import (
     ReviewResponse,
     SourceCorrectionResponse,
     TerminologyResponse,
-    TerminologyTerm,
     response_schema_for,
 )
 from captioner.core.domain.result import JsonValue
@@ -249,47 +248,33 @@ def _language_texts(response: object) -> tuple[str, ...]:
     return (value,) if isinstance(value, str) else ()
 
 
-def _protected_output_texts(response: object) -> tuple[str, ...]:
-    """Return every model-controlled text that must preserve protected facts.
-
-    Fast responses yield both corrected_source and translated_text so each field
-    is checked against the source independently.
-    """
+def _protected_output_fields(response: object) -> tuple[tuple[str, str], ...]:
+    """Return protected model fields with their stable response-field names."""
     if isinstance(response, Mapping):
         raw = cast(Mapping[str, object], response)
-        texts: list[str] = []
+        fields: list[tuple[str, str]] = []
         for key in ("corrected_source", "translated_text"):
             value = raw.get(key)
             if isinstance(value, str):
-                texts.append(value)
-        terms = raw.get("terms")
-        if isinstance(terms, Sequence) and not isinstance(terms, (str, bytes, bytearray)):
-            for term in cast(Sequence[object], terms):
-                if not isinstance(term, Mapping):
-                    continue
-                target = cast(Mapping[str, object], term).get("target_term")
-                if isinstance(target, str):
-                    texts.append(target)
-        if texts:
-            return tuple(texts)
-        source_term = raw.get("source_term")
-        return (source_term,) if isinstance(source_term, str) else ()
+                fields.append((key, value))
+        return tuple(fields)
     if isinstance(response, FastTranslationResponse):
-        return (response.corrected_source, response.translated_text)
-    texts_obj: list[str] = []
+        return (
+            ("corrected_source", response.corrected_source),
+            ("translated_text", response.translated_text),
+        )
+    if isinstance(response, SourceCorrectionResponse):
+        return (("corrected_source", response.corrected_source),)
+    if isinstance(response, (QualityTranslationResponse, ReviewResponse)):
+        return (("translated_text", response.translated_text),)
+    if isinstance(response, TerminologyResponse):
+        return ()
+    fields_obj: list[tuple[str, str]] = []
     for attr in ("corrected_source", "translated_text"):
         value = getattr(response, attr, None)
         if isinstance(value, str):
-            texts_obj.append(value)
-    terms = getattr(response, "terms", ())
-    if isinstance(terms, Sequence):
-        for term in cast(Sequence[object], terms):
-            if isinstance(term, TerminologyTerm):
-                texts_obj.append(term.target_term)
-    if texts_obj:
-        return tuple(texts_obj)
-    source_term = getattr(response, "source_term", None)
-    return (source_term,) if isinstance(source_term, str) and source_term else ()
+            fields_obj.append((attr, value))
+    return tuple(fields_obj)
 
 
 def _validate_text(text: str) -> None:
@@ -312,34 +297,20 @@ def _validate_protected_fields(source: str, response: object) -> None:
     validator); generic validation only checks term targets as a group when the
     response is not Fast.
     """
-    if isinstance(response, FastTranslationResponse):
-        for output_text in _protected_output_texts(response):
-            _validate_protected_numbers(source, output_text)
-        return
-    if isinstance(response, Mapping):
-        raw = cast(Mapping[str, object], response)
-        if "corrected_source" in raw and "translated_text" in raw:
-            for output_text in _protected_output_texts(raw):
-                _validate_protected_numbers(source, output_text)
-            return
-        if "terms" in raw:
-            return
-    if isinstance(response, TerminologyResponse):
-        # Term-local protected checks run in the terminology semantic validator.
-        return
-    outputs = _protected_output_texts(cast(object, response))
-    if not outputs:
-        return
-    _validate_protected_numbers(source, " ".join(outputs))
+    response_id = _response_id(response)
+    for field, output in _protected_output_fields(response):
+        _validate_protected_numbers(source, output, response_id, field)
 
 
-def _validate_protected_numbers(source: str, output: str) -> None:
+def _validate_protected_numbers(source: str, output: str, response_id: str, field: str) -> None:
     if not protected_tokens_preserved(source, output):
         difference = protected_token_differences(source, output)[0]
         raise AppError(
             "llm.protected_token_lost",
             {
                 "reason": difference.code,
+                "id": response_id,
+                "field": field,
                 "position": difference.position,
                 "expected_kind": difference.expected_kind,
                 "actual_kind": difference.actual_kind,

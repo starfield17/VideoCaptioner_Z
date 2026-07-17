@@ -18,7 +18,29 @@ from captioner.core.domain.errors import AppError
 from captioner.core.domain.result import JsonValue
 from captioner.core.domain.stage import PipelineProfile, StageName
 from captioner.i18n.service import I18nService
-from captioner.infrastructure.app_paths import resolve_app_paths
+from captioner.infrastructure.app_paths import CompiledRuntime, resolve_app_paths
+
+
+class _SourceLanguageArgumentError(argparse.ArgumentTypeError):
+    @classmethod
+    def detect(cls) -> _SourceLanguageArgumentError:
+        return cls("use --language auto for automatic detection")
+
+    @classmethod
+    def empty(cls) -> _SourceLanguageArgumentError:
+        return cls("language must not be empty")
+
+
+def _parse_source_language(value: str) -> str | None:
+    """Map the explicit CLI ``auto`` value to the optional source language."""
+    normalized = value.strip()
+    if normalized.casefold() == "auto":
+        return None
+    if normalized.casefold() == "detect":
+        raise _SourceLanguageArgumentError.detect()
+    if not normalized:
+        raise _SourceLanguageArgumentError.empty()
+    return normalized
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
     doctor_parser = subparsers.add_parser("doctor", help="Report Phase 0 diagnostics")
     doctor_parser.add_argument("--json", action="store_true", help="Emit JSON")
+    doctor_parser.add_argument(
+        "--tokenizer-smoke",
+        action="store_true",
+        help="Initialize both packaged offline tokenizers",
+    )
     doctor_parser.add_argument("--lang", dest="lang", default=argparse.SUPPRESS)
     run_parser = subparsers.add_parser("run", help="Transcribe one media file")
     run_parser.add_argument("input", nargs="+", type=Path, help="Input audio or video files")
@@ -39,7 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--model", dest="model_ref", default="tiny")
     run_parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     run_parser.add_argument("--compute-type", default="default")
-    run_parser.add_argument("--language", default=None)
+    run_parser.add_argument(
+        "--language",
+        default=None,
+        type=_parse_source_language,
+        help="Configured source language, or auto for automatic detection",
+    )
     run_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     run_parser.add_argument("--ffprobe-bin", default="ffprobe")
     run_parser.add_argument("--overwrite", action="store_true")
@@ -65,7 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument("--model")
             command_parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
             command_parser.add_argument("--compute-type")
-            command_parser.add_argument("--language", default=argparse.SUPPRESS)
+            command_parser.add_argument(
+                "--language",
+                default=argparse.SUPPRESS,
+                type=_parse_source_language,
+                help="Override configured source language, or auto to clear it",
+            )
             command_parser.add_argument("--output", type=Path)
             command_parser.add_argument(
                 "--profile",
@@ -87,7 +124,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    compiled_runtime: CompiledRuntime | None = None,
+) -> int:
     """Run the CLI and return a process exit code."""
     parser = build_parser()
     service: I18nService | None = None
@@ -105,7 +146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "subtitle-corpus",
         ):
             parser.error(f"unknown command: {namespace.command}")
-        paths = resolve_app_paths()
+        paths = resolve_app_paths(compiled_runtime=compiled_runtime)
         service = I18nService(
             locale=namespace.lang,
             resource_dir=paths.i18n_resource_dir,
@@ -118,7 +159,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(render(payload, as_json=as_json))
             return int(report.failed != 0 or bool(report.errors))
         if namespace.command in (None, "doctor"):
-            options = doctor.DoctorOptions(locale=namespace.lang, as_json=as_json, paths=paths)
+            options = doctor.DoctorOptions(
+                locale=namespace.lang,
+                as_json=as_json,
+                paths=paths,
+                tokenizer_smoke=bool(getattr(namespace, "tokenizer_smoke", False)),
+            )
             payload = doctor.run(options, service=service)
             labels = None if as_json else doctor_labels(service)
         elif namespace.command == "run":

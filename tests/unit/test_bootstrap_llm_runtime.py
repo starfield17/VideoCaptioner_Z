@@ -90,7 +90,7 @@ model = "unit-model"
 max_concurrency = 4
 """,
     )
-    paths = resolve_app_paths(base_dir=tmp_path, resource_root_override=tmp_path)
+    paths = resolve_app_paths(base_dir=tmp_path, resource_root_override=Path("resources").resolve())
     runtime = build_llm_runtime(paths=paths, transport=NoopTransport())
     try:
         assert runtime.semaphore is runtime.client.semaphore

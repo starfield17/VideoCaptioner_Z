@@ -8,7 +8,7 @@ from collections.abc import Sequence
 
 from captioner.core.domain.errors import AppError
 from captioner.i18n.service import I18nService
-from captioner.infrastructure.app_paths import resolve_app_paths
+from captioner.infrastructure.app_paths import CompiledRuntime, resolve_app_paths
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -19,12 +19,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    compiled_runtime: CompiledRuntime | None = None,
+) -> int:
     """Create a window and optionally close it after one event-loop turn."""
     try:
         arguments = list(sys.argv[1:] if argv is None else argv)
         namespace = build_parser().parse_args(arguments)
-        paths = resolve_app_paths()
+        paths = resolve_app_paths(compiled_runtime=compiled_runtime)
         service = I18nService(
             locale=namespace.lang,
             resource_dir=paths.i18n_resource_dir,
