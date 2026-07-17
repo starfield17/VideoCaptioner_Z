@@ -38,16 +38,19 @@ def main(
         from PySide6.QtCore import QTimer
         from PySide6.QtWidgets import QApplication
 
+        from captioner.gui.composition import build_batch_controller
         from captioner.gui.main_window import MainWindow
 
         app = QApplication.instance()
         if app is None:
             app = QApplication(["captioner-gui", *arguments])
-        window = MainWindow(service)
+        controller = build_batch_controller(service, paths=paths)
+        window = MainWindow(service, controller)
         window.show()
+        window.start()
         if namespace.smoke_test:
-            QTimer.singleShot(50, window.close)
-            QTimer.singleShot(75, app.quit)
+            QTimer.singleShot(100, window.close)
+            QTimer.singleShot(200, app.quit)
         return int(app.exec())
     except AppError as exc:
         print(exc.to_dict(), file=sys.stderr)
