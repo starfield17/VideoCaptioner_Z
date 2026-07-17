@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from enum import Enum
+
 from PySide6.QtCore import QObject, Signal
 
 from captioner.core.application.configuration import (
@@ -12,6 +14,15 @@ from captioner.core.application.configuration import (
     ProviderSettingsUpdate,
 )
 from captioner.gui.application_runner import ApplicationRunnerBridge, RunnerFailure
+
+
+class _PendingOp(Enum):
+    LOAD = "load"
+    SAVE_GLOBAL = "save_global"
+    SAVE_PROVIDER = "save_provider"
+    SAVE_PRESET = "save_preset"
+    DELETE_PRESET = "delete_preset"
+    TEST_PROVIDER = "test_provider"
 
 
 class SettingsController(QObject):
@@ -38,9 +49,18 @@ class SettingsController(QObject):
         self._restart_required = False
         self._startup_issue = startup_issue
         self._pending_locale: str | None = None
+        self._pending_op: _PendingOp | None = None
 
-        self._runner.configuration_ready.connect(self._on_configuration)
-        self._runner.configuration_failure.connect(self._on_failure)
+        self._runner.configuration_loaded.connect(self._on_loaded)
+        self._runner.global_settings_saved.connect(self._on_global_saved)
+        self._runner.provider_settings_saved.connect(self._on_provider_saved)
+        self._runner.preset_saved.connect(self._on_preset_saved)
+        self._runner.preset_deleted.connect(self._on_preset_deleted)
+        self._runner.configuration_load_failure.connect(self._on_load_failure)
+        self._runner.global_settings_save_failure.connect(self._on_global_failure)
+        self._runner.provider_settings_save_failure.connect(self._on_provider_failure)
+        self._runner.preset_save_failure.connect(self._on_preset_failure)
+        self._runner.preset_delete_failure.connect(self._on_preset_failure)
         self._runner.provider_test_ready.connect(self._on_provider_test)
         self._runner.provider_test_failure.connect(self._on_provider_test_failure)
 
@@ -65,6 +85,7 @@ class SettingsController(QObject):
         return self._startup_issue
 
     def load(self) -> None:
+        self._pending_op = _PendingOp.LOAD
         self._set_busy(True)
         self._runner.request_configuration_load()
 
@@ -75,58 +96,128 @@ class SettingsController(QObject):
             if previous_locale is not None and settings.locale != previous_locale
             else None
         )
+        self._pending_op = _PendingOp.SAVE_GLOBAL
         self._set_busy(True)
         self._runner.request_global_save(settings)
 
     def save_provider(self, update: ProviderSettingsUpdate) -> None:
+        self._pending_op = _PendingOp.SAVE_PROVIDER
         self._set_busy(True)
         self._runner.request_provider_save(update)
-        # Do not retain the key-bearing update after dispatch.
         del update
 
     def save_preset(self, preset: ExecutionPreset) -> None:
+        self._pending_op = _PendingOp.SAVE_PRESET
         self._set_busy(True)
         self._runner.request_preset_save(preset)
 
     def delete_preset(self, name: str) -> None:
+        self._pending_op = _PendingOp.DELETE_PRESET
         self._set_busy(True)
         self._runner.request_preset_delete(name)
 
     def test_provider(self, update: ProviderSettingsUpdate) -> None:
+        self._pending_op = _PendingOp.TEST_PROVIDER
         self._set_busy(True)
         self._runner.request_provider_test(update)
         del update
 
-    def _on_configuration(self, snapshot: object) -> None:
+    def _on_loaded(self, snapshot: object) -> None:
+        if self._pending_op is not _PendingOp.LOAD:
+            return
+        self._accept_snapshot(snapshot, consume_locale=False)
+
+    def _on_global_saved(self, snapshot: object) -> None:
+        if self._pending_op is not _PendingOp.SAVE_GLOBAL:
+            # Still refresh local snapshot from external global saves if idle.
+            if self._pending_op is None and isinstance(snapshot, ConfigurationSnapshot):
+                self._current = snapshot
+                self.configuration_changed.emit(snapshot)
+            return
+        self._accept_snapshot(snapshot, consume_locale=True)
+
+    def _on_provider_saved(self, snapshot: object) -> None:
+        if self._pending_op is not _PendingOp.SAVE_PROVIDER:
+            if self._pending_op is None and isinstance(snapshot, ConfigurationSnapshot):
+                self._current = snapshot
+                self.configuration_changed.emit(snapshot)
+            return
+        self._accept_snapshot(snapshot, consume_locale=False)
+
+    def _on_preset_saved(self, snapshot: object) -> None:
+        if self._pending_op is not _PendingOp.SAVE_PRESET:
+            if self._pending_op is None and isinstance(snapshot, ConfigurationSnapshot):
+                self._current = snapshot
+                self.configuration_changed.emit(snapshot)
+            return
+        self._accept_snapshot(snapshot, consume_locale=False)
+
+    def _on_preset_deleted(self, snapshot: object) -> None:
+        if self._pending_op is not _PendingOp.DELETE_PRESET:
+            if self._pending_op is None and isinstance(snapshot, ConfigurationSnapshot):
+                self._current = snapshot
+                self.configuration_changed.emit(snapshot)
+            return
+        self._accept_snapshot(snapshot, consume_locale=False)
+
+    def _accept_snapshot(self, snapshot: object, *, consume_locale: bool) -> None:
         if not isinstance(snapshot, ConfigurationSnapshot):
             return
         self._current = snapshot
-        if self._pending_locale is not None:
+        if consume_locale and self._pending_locale is not None:
             self._restart_required = True
             self.restart_required_changed.emit(True)
-            self._pending_locale = None
+        self._pending_locale = None
+        self._pending_op = None
         self._last_failure = None
         self.configuration_changed.emit(snapshot)
         self.failure_changed.emit(None)
         self._set_busy(False)
 
-    def _on_failure(self, failure: object) -> None:
+    def _on_load_failure(self, failure: object) -> None:
+        if self._pending_op is not _PendingOp.LOAD:
+            return
+        self._fail(failure)
+
+    def _on_global_failure(self, failure: object) -> None:
+        if self._pending_op is not _PendingOp.SAVE_GLOBAL:
+            return
+        self._pending_locale = None
+        self._fail(failure)
+
+    def _on_provider_failure(self, failure: object) -> None:
+        if self._pending_op is not _PendingOp.SAVE_PROVIDER:
+            return
+        self._fail(failure)
+
+    def _on_preset_failure(self, failure: object) -> None:
+        if self._pending_op not in {_PendingOp.SAVE_PRESET, _PendingOp.DELETE_PRESET}:
+            return
+        self._fail(failure)
+
+    def _fail(self, failure: object) -> None:
         if not isinstance(failure, RunnerFailure):
             failure = RunnerFailure(code="gui.application_bridge_failed", retryable=False)
         self._last_failure = failure
-        self._pending_locale = None
+        self._pending_op = None
         self.failure_changed.emit(failure)
         self._set_busy(False)
 
     def _on_provider_test(self, result: object) -> None:
+        if self._pending_op is not _PendingOp.TEST_PROVIDER:
+            return
         if not isinstance(result, ProviderConnectionResult):
             return
+        self._pending_op = None
         self.provider_test_changed.emit(result)
         self._set_busy(False)
 
     def _on_provider_test_failure(self, failure: object) -> None:
+        if self._pending_op is not _PendingOp.TEST_PROVIDER:
+            return
         if not isinstance(failure, RunnerFailure):
             failure = RunnerFailure(code="gui.application_bridge_failed", retryable=False)
+        self._pending_op = None
         self.provider_test_changed.emit(ProviderConnectionResult(ok=False, code=failure.code))
         self._set_busy(False)
 

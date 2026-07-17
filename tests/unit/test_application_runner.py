@@ -368,10 +368,14 @@ def test_input_config_and_provider_ops_run_on_worker_thread() -> None:
     queue_failures: list[object] = []
     config_failures: list[object] = []
     bridge.input_preview_ready.connect(previews.append)
-    bridge.configuration_ready.connect(configs.append)
+    bridge.configuration_loaded.connect(configs.append)
+    bridge.global_settings_saved.connect(configs.append)
+    bridge.provider_settings_saved.connect(configs.append)
+    bridge.preset_saved.connect(configs.append)
+    bridge.preset_deleted.connect(configs.append)
     bridge.provider_test_ready.connect(tests.append)
     bridge.failure.connect(queue_failures.append)
-    bridge.configuration_failure.connect(config_failures.append)
+    bridge.configuration_load_failure.connect(config_failures.append)
     try:
         bridge.start()
         assert _wait_until(lambda: True)
@@ -438,7 +442,7 @@ def test_configuration_failure_is_operation_specific() -> None:
     queue_failures: list[object] = []
     config_failures: list[object] = []
     bridge.failure.connect(queue_failures.append)
-    bridge.configuration_failure.connect(config_failures.append)
+    bridge.configuration_load_failure.connect(config_failures.append)
     try:
         bridge.start()
         bridge.request_configuration_load()

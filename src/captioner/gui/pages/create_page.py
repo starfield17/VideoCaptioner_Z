@@ -128,6 +128,8 @@ class CreatePage(QWidget):
         controller.draft_changed.connect(self._on_draft)
         controller.busy_changed.connect(self._on_busy)
         controller.failure_changed.connect(self._on_failure)
+        controller.preset_busy_changed.connect(self._on_preset_busy)
+        self._wire_draft_invalidation()
         self._update_llm_enabled()
 
     def _build_input_section(self) -> QWidget:
@@ -214,7 +216,7 @@ class CreatePage(QWidget):
             (PipelineProfile.QUALITY, "gui.profile.quality"),
         ):
             self._profile_combo.addItem(self._service.translate(key), profile.value)
-        self._profile_combo.currentIndexChanged.connect(self._update_llm_enabled)
+        self._profile_combo.currentIndexChanged.connect(self._on_profile_changed)
         form.addRow(self._service.translate("gui.create.profile"), self._profile_combo)
 
         self._model_edit = QLineEdit("tiny")
@@ -246,7 +248,7 @@ class CreatePage(QWidget):
         self._source_auto = QCheckBox(self._service.translate("gui.create.source_auto"))
         self._source_auto.setObjectName("createSourceLanguageAutoCheck")
         self._source_auto.setChecked(True)
-        self._source_auto.toggled.connect(self._on_source_auto)
+        self._source_auto.toggled.connect(self._on_source_auto_toggled)
         form.addRow(self._source_auto)
         self._source_edit.setEnabled(False)
 
@@ -328,13 +330,32 @@ class CreatePage(QWidget):
         if row >= 0:
             self._controller.remove_entry(row)
 
+    def _wire_draft_invalidation(self) -> None:
+        """Any form field that participates in BatchDraft must clear a prior draft."""
+        self._model_edit.textEdited.connect(self._controller.invalidate_draft)
+        self._compute_edit.textEdited.connect(self._controller.invalidate_draft)
+        self._source_edit.textEdited.connect(self._controller.invalidate_draft)
+        self._target_edit.textEdited.connect(self._controller.invalidate_draft)
+        self._provider_profile.textEdited.connect(self._controller.invalidate_draft)
+        self._output_edit.textEdited.connect(self._controller.invalidate_draft)
+        self._device_combo.currentIndexChanged.connect(self._controller.invalidate_draft)
+        self._collision_combo.currentIndexChanged.connect(self._controller.invalidate_draft)
+
     def _on_browse_output(self) -> None:
         directory = QFileDialog.getExistingDirectory(self)
         if directory:
             self._output_edit.setText(directory)
+            self._controller.invalidate_draft()
 
-    def _on_source_auto(self, checked: bool) -> None:
+    def _on_source_auto_toggled(self, checked: bool) -> None:
         self._source_edit.setEnabled(not checked)
+        if not self._applying_preset:
+            self._controller.invalidate_draft()
+
+    def _on_profile_changed(self) -> None:
+        self._update_llm_enabled()
+        if not self._applying_preset:
+            self._controller.invalidate_draft()
 
     def _on_entries(self, entries: object) -> None:
         if not isinstance(entries, tuple):
@@ -521,7 +542,14 @@ class CreatePage(QWidget):
         self._draft_status.clear()
 
     def _on_busy(self, busy: bool) -> None:
-        self._validate_button.setEnabled(not busy)
+        self._validate_button.setEnabled(not busy and not self._controller.preset_busy)
+
+    def _on_preset_busy(self, busy: bool) -> None:
+        for name in ("createSavePresetButton", "createDeletePresetButton"):
+            button = self.findChild(QPushButton, name)
+            if button is not None:
+                button.setEnabled(not busy)
+        self._validate_button.setEnabled(not busy and not self._controller.busy)
 
     def _on_failure(self, failure: object) -> None:
         if failure is None:

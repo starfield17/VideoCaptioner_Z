@@ -128,3 +128,34 @@ def test_unreadable_directory(
     preview = discovery.preview(InputSelectionRequest(entries=(str(folder),), recursive=False))
     assert preview.accepted_paths == ()
     assert any(item.code == "input.directory_unreadable" for item in preview.rejected)
+
+
+def test_recursive_walk_onerror_emits_directory_unreadable(
+    tmp_path: Path, discovery: FilesystemInputDiscovery, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "tree"
+    folder.mkdir()
+    (folder / "ok.wav").write_bytes(b"")
+
+    import os
+    from collections.abc import Callable
+    from typing import Any
+
+    original_walk = os.walk
+
+    def broken_walk(
+        top: Any,
+        topdown: bool = True,
+        onerror: Callable[[OSError], object] | None = None,
+        followlinks: bool = False,
+    ) -> Any:
+        if onerror is not None:
+            onerror(OSError(13, "permission denied", str(folder)))
+        return original_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks)
+
+    monkeypatch.setattr(os, "walk", broken_walk)
+    preview = discovery.preview(InputSelectionRequest(entries=(str(folder),), recursive=True))
+    assert any(item.code == "input.directory_unreadable" for item in preview.rejected)
+    for item in preview.rejected:
+        assert "permission denied" not in item.path
+        assert "permission denied" not in item.code

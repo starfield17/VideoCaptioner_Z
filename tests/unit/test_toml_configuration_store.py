@@ -225,3 +225,92 @@ def test_explicit_api_key_save(tmp_path: Path) -> None:
     snapshot = store.load_snapshot()
     assert "written-key" not in repr(snapshot)
     assert snapshot.provider.credential_source == "config"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        """
+[providers.default]
+kind = "openai-compatible"
+base_url = "https://example.com/v1"
+api_key = "k"
+model = "m"
+request_timeout_sec = -1
+""",
+        """
+[providers.default]
+kind = "openai-compatible"
+base_url = "https://example.com/v1"
+api_key = "k"
+model = "m"
+request_timeout_sec = nan
+""",
+        """
+[providers.default]
+kind = "openai-compatible"
+base_url = "https://example.com/v1"
+api_key = "k"
+model = "m"
+temperature = -5
+""",
+        """
+[providers.default]
+kind = "openai-compatible"
+base_url = "https://example.com/v1"
+api_key = "k"
+model = "m"
+temperature = inf
+""",
+        """
+[providers.default]
+kind = "openai-compatible"
+base_url = "https://example.com/v1"
+api_key = "k"
+model = 123
+""",
+    ],
+)
+def test_invalid_provider_values_yield_issue_and_safe_defaults(
+    tmp_path: Path, content: str
+) -> None:
+    (tmp_path / "llm.toml").write_text(content, encoding="utf-8")
+    original = (tmp_path / "llm.toml").read_text(encoding="utf-8")
+    store = TomlConfigurationStore(tmp_path)
+    snapshot = store.load_snapshot()
+    assert any(issue.code.startswith("llm.") for issue in snapshot.issues)
+    assert snapshot.provider.model == "gpt-4o-mini"  # safe default
+    assert (tmp_path / "llm.toml").read_text(encoding="utf-8") == original
+
+
+def test_numeric_preset_fields_are_rejected(tmp_path: Path) -> None:
+    (tmp_path / "settings.toml").write_text(
+        """
+schema_version = 1
+[global]
+locale = "en"
+default_output_root = ""
+recursive_input = true
+default_preset_name = "deterministic"
+collision_policy = "unique_subdir"
+
+[presets.bad]
+display_name = "Bad"
+pipeline_profile = "fast"
+model_ref = 123
+device = "auto"
+compute_type = 456
+source_language = ""
+target_language = "zh-CN"
+provider_profile = "default"
+ffmpeg_bin = "ffmpeg"
+ffprobe_bin = "ffprobe"
+""",
+        encoding="utf-8",
+    )
+    original = (tmp_path / "settings.toml").read_text(encoding="utf-8")
+    store = TomlConfigurationStore(tmp_path)
+    snapshot = store.load_snapshot()
+    assert any(issue.code == "config.settings_invalid" for issue in snapshot.issues)
+    assert all(preset.built_in for preset in snapshot.presets)
+    assert (tmp_path / "settings.toml").read_text(encoding="utf-8") == original

@@ -181,6 +181,31 @@ def test_builtin_mutation_rejected() -> None:
         service.delete_user_preset("deterministic")
 
 
+@pytest.mark.parametrize(
+    ("timeout", "temperature"),
+    [
+        (-1.0, 0.1),
+        (float("nan"), 0.1),
+        (float("inf"), 0.1),
+        (120.0, -0.1),
+        (120.0, float("nan")),
+        (120.0, float("inf")),
+    ],
+)
+def test_provider_update_rejects_non_finite_or_negative_timeout_temperature(
+    timeout: float,
+    temperature: float,
+) -> None:
+    with pytest.raises(AppError, match=r"config\.provider_invalid"):
+        ProviderSettingsUpdate(
+            profile_name="default",
+            base_url="https://example.com/v1",
+            model="m",
+            request_timeout_sec=timeout,
+            temperature=temperature,
+        )
+
+
 def test_failed_save_raises_and_provider_test() -> None:
     store = FakeStore(fail_save=True)
     previous = store.snapshot

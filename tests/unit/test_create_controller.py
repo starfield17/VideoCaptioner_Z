@@ -16,6 +16,8 @@ from captioner.core.domain.stage import PipelineProfile
 from captioner.gui.application_runner import RunnerFailure
 from captioner.gui.create_controller import CreateController
 
+# re-export for draft invalidation tests
+
 _app = QApplication.instance() or QApplication(["test-create-controller"])
 
 
@@ -25,10 +27,18 @@ class FakeRunner(QObject):
     started = Signal()
     stopped = Signal()
     input_preview_ready = Signal(object)
-    configuration_ready = Signal(object)
-    provider_test_ready = Signal(object)
     input_failure = Signal(object)
-    configuration_failure = Signal(object)
+    configuration_loaded = Signal(object)
+    global_settings_saved = Signal(object)
+    provider_settings_saved = Signal(object)
+    preset_saved = Signal(object)
+    preset_deleted = Signal(object)
+    configuration_load_failure = Signal(object)
+    global_settings_save_failure = Signal(object)
+    provider_settings_save_failure = Signal(object)
+    preset_save_failure = Signal(object)
+    preset_delete_failure = Signal(object)
+    provider_test_ready = Signal(object)
     provider_test_failure = Signal(object)
 
     def __init__(self) -> None:
@@ -159,3 +169,67 @@ def test_failure_does_not_clear_entries() -> None:
     runner.input_failure.emit(RunnerFailure(code="input.unreadable"))
     assert _wait_until(lambda: controller.last_failure is not None)
     assert controller.entries == ("/a.wav",)
+
+
+def test_draft_invalidated_by_form_and_configuration_changes() -> None:
+    runner = FakeRunner()
+    controller = CreateController(runner)  # type: ignore[arg-type]
+    controller.set_entries(("/a.wav",))
+    assert _wait_until(lambda: controller.preview is not None)
+    draft = controller.validate_draft(
+        output_root="/out",
+        preset_name="deterministic",
+        pipeline_profile=PipelineProfile.DETERMINISTIC,
+        model_ref="tiny",
+        device="auto",
+        compute_type="default",
+        source_language=None,
+        target_language=None,
+        provider_profile="default",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        collision_policy="unique_subdir",
+    )
+    assert draft is not None
+    controller.invalidate_draft()
+    assert controller.draft is None
+
+    assert (
+        controller.validate_draft(
+            output_root="/out",
+            preset_name="deterministic",
+            pipeline_profile=PipelineProfile.DETERMINISTIC,
+            model_ref="tiny",
+            device="auto",
+            compute_type="default",
+            source_language=None,
+            target_language=None,
+            provider_profile="default",
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+            collision_policy="unique_subdir",
+        )
+        is not None
+    )
+    controller.select_preset("fast")
+    assert controller.draft is None
+
+    assert (
+        controller.validate_draft(
+            output_root="/out",
+            preset_name="deterministic",
+            pipeline_profile=PipelineProfile.DETERMINISTIC,
+            model_ref="tiny",
+            device="auto",
+            compute_type="default",
+            source_language=None,
+            target_language=None,
+            provider_profile="default",
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+            collision_policy="unique_subdir",
+        )
+        is not None
+    )
+    controller.set_configuration(default_configuration_snapshot())
+    assert controller.draft is None

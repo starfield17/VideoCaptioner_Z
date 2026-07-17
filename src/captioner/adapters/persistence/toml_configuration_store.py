@@ -406,27 +406,80 @@ class TomlConfigurationStore:
             if set(preset_map) - _PRESET_FIELDS:
                 raise AppError("config.settings_invalid")
             try:
+                display_name = preset_map.get("display_name", name)
+                pipeline_profile = preset_map["pipeline_profile"]
+                model_ref = preset_map["model_ref"]
+                device = preset_map.get("device", "auto")
+                compute_type = preset_map.get("compute_type", "default")
                 source = preset_map.get("source_language", "")
                 target = preset_map.get("target_language", "")
-                source_language = None if source in ("", None) else str(source)
-                target_language = None if target in ("", None) else str(target)
+                provider_profile = preset_map.get("provider_profile", "default")
+                ffmpeg_bin = preset_map.get("ffmpeg_bin", "ffmpeg")
+                ffprobe_bin = preset_map.get("ffprobe_bin", "ffprobe")
+            except KeyError as exc:
+                raise AppError("config.settings_invalid") from exc
+            # TOML table keys are strings; values must be exact runtime types.
+            name_text = cast(object, name)
+            if not isinstance(name_text, str) or not name_text.strip():
+                raise AppError("config.settings_invalid")
+            display_obj = cast(object, display_name)
+            pipeline_obj = cast(object, pipeline_profile)
+            model_obj = cast(object, model_ref)
+            device_obj = cast(object, device)
+            compute_obj = cast(object, compute_type)
+            source_obj = cast(object, source)
+            target_obj = cast(object, target)
+            provider_obj = cast(object, provider_profile)
+            ffmpeg_obj = cast(object, ffmpeg_bin)
+            ffprobe_obj = cast(object, ffprobe_bin)
+            if not isinstance(display_obj, str):
+                raise AppError("config.settings_invalid")
+            if not isinstance(pipeline_obj, str):
+                raise AppError("config.settings_invalid")
+            if not isinstance(model_obj, str):
+                raise AppError("config.settings_invalid")
+            if not isinstance(device_obj, str):
+                raise AppError("config.settings_invalid")
+            if not isinstance(compute_obj, str):
+                raise AppError("config.settings_invalid")
+            if source_obj not in ("", None) and not isinstance(source_obj, str):
+                raise AppError("config.settings_invalid")
+            if target_obj not in ("", None) and not isinstance(target_obj, str):
+                raise AppError("config.settings_invalid")
+            if not isinstance(provider_obj, str):
+                raise AppError("config.settings_invalid")
+            if not isinstance(ffmpeg_obj, str):
+                raise AppError("config.settings_invalid")
+            if not isinstance(ffprobe_obj, str):
+                raise AppError("config.settings_invalid")
+            if source_obj in ("", None):
+                source_language: str | None = None
+            else:
+                assert isinstance(source_obj, str)
+                source_language = source_obj
+            if target_obj in ("", None):
+                target_language: str | None = None
+            else:
+                assert isinstance(target_obj, str)
+                target_language = target_obj
+            try:
                 user_presets.append(
                     ExecutionPreset(
-                        name=str(name),
-                        display_name=str(preset_map.get("display_name", name)),
+                        name=name_text,
+                        display_name=display_obj,
                         built_in=False,
-                        pipeline_profile=PipelineProfile(str(preset_map["pipeline_profile"])),
-                        model_ref=str(preset_map["model_ref"]),
-                        device=str(preset_map.get("device", "auto")),  # type: ignore[arg-type]
-                        compute_type=str(preset_map.get("compute_type", "default")),
+                        pipeline_profile=PipelineProfile(pipeline_obj),
+                        model_ref=model_obj,
+                        device=device_obj,  # type: ignore[arg-type]
+                        compute_type=compute_obj,
                         source_language=source_language,
                         target_language=target_language,
-                        provider_profile=str(preset_map.get("provider_profile", "default")),
-                        ffmpeg_bin=str(preset_map.get("ffmpeg_bin", "ffmpeg")),
-                        ffprobe_bin=str(preset_map.get("ffprobe_bin", "ffprobe")),
+                        provider_profile=provider_obj,
+                        ffmpeg_bin=ffmpeg_obj,
+                        ffprobe_bin=ffprobe_obj,
                     )
                 )
-            except (AppError, KeyError, TypeError, ValueError) as exc:
+            except (AppError, TypeError, ValueError) as exc:
                 raise AppError("config.settings_invalid") from exc
         ordered = tuple(
             sorted(
@@ -458,6 +511,12 @@ class TomlConfigurationStore:
             tokenizer_value = raw.get("tokenizer", "cl100k_base")
         except KeyError as exc:
             raise AppError("llm.config_invalid", {"reason": "provider"}) from exc
+        if not isinstance(kind, str):
+            raise AppError("llm.config_invalid", {"field": "kind"})
+        if not isinstance(base_url_value, str):
+            raise AppError("llm.config_invalid", {"field": "base_url"})
+        if not isinstance(model_value, str):
+            raise AppError("llm.config_invalid", {"field": "model"})
         if type(max_concurrency_raw) is not int:
             raise AppError("llm.config_invalid", {"field": "max_concurrency"})
         if type(max_retries_raw) is not int:
@@ -468,15 +527,27 @@ class TomlConfigurationStore:
             raise AppError("llm.config_invalid", {"field": "request_timeout_sec"})
         if isinstance(temperature_raw, bool) or not isinstance(temperature_raw, (int, float)):
             raise AppError("llm.config_invalid", {"field": "temperature"})
+        if not isinstance(tokenizer_value, str):
+            raise AppError("llm.config_invalid", {"field": "tokenizer"})
         try:
-            base_url = normalize_base_url_identity(str(base_url_value))
-            model = str(model_value)
-            max_concurrency = max_concurrency_raw
-            request_timeout_sec = float(request_timeout_raw)
-            max_retries = max_retries_raw
-            temperature = float(temperature_raw)
-            tokenizer = str(tokenizer_value)
-        except (TypeError, ValueError, AppError) as exc:
+            # ProviderPublicSettings enforces finite timeout/temperature parity.
+            public = ProviderPublicSettings(
+                profile_name=profile,
+                base_url=normalize_base_url_identity(base_url_value),
+                model=model_value,
+                max_concurrency=max_concurrency_raw,
+                request_timeout_sec=float(request_timeout_raw),
+                max_retries=max_retries_raw,
+                temperature=float(temperature_raw),
+                tokenizer=tokenizer_value,  # type: ignore[arg-type]
+                credential_source="missing",
+            )
+        except AppError as exc:
+            if exc.code == "config.provider_invalid":
+                raise AppError(
+                    "llm.config_invalid",
+                    {"field": str(exc.params.get("field", "provider"))},
+                ) from exc
             raise AppError("llm.config_invalid", {"reason": "provider"}) from exc
         if kind != OPENAI_COMPATIBLE_KIND:
             raise AppError("llm.config_invalid", {"field": "kind"})
@@ -486,14 +557,14 @@ class TomlConfigurationStore:
         )
         source = self._credential_source(profile, config_api_key)
         return ProviderPublicSettings(
-            profile_name=profile,
-            base_url=base_url,
-            model=model,
-            max_concurrency=max_concurrency,
-            request_timeout_sec=request_timeout_sec,
-            max_retries=max_retries,
-            temperature=temperature,
-            tokenizer=tokenizer,  # type: ignore[arg-type]
+            profile_name=public.profile_name,
+            base_url=public.base_url,
+            model=public.model,
+            max_concurrency=public.max_concurrency,
+            request_timeout_sec=public.request_timeout_sec,
+            max_retries=public.max_retries,
+            temperature=public.temperature,
+            tokenizer=public.tokenizer,
             credential_source=source,
         )
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, Slot
 
 from captioner.core.application.configuration import ConfigurationSnapshot, ExecutionPreset
 from captioner.core.application.input_selection import (
@@ -26,6 +26,7 @@ class CreateController(QObject):
     draft_changed = Signal(object)
     busy_changed = Signal(bool)
     failure_changed = Signal(object)
+    preset_busy_changed = Signal(bool)
 
     def __init__(
         self,
@@ -46,9 +47,15 @@ class CreateController(QObject):
         self._active_generation = 0
         self._validation_error: str | None = None
         self._last_failure: RunnerFailure | None = None
+        self._preset_busy = False
+        self._pending_preset_op: str | None = None
 
         self._runner.input_preview_ready.connect(self._on_preview)
         self._runner.input_failure.connect(self._on_failure)
+        self._runner.preset_saved.connect(self._on_preset_saved)
+        self._runner.preset_deleted.connect(self._on_preset_deleted)
+        self._runner.preset_save_failure.connect(self._on_preset_failure)
+        self._runner.preset_delete_failure.connect(self._on_preset_failure)
 
     @property
     def entries(self) -> tuple[str, ...]:
@@ -79,6 +86,10 @@ class CreateController(QObject):
         return self._preview_busy
 
     @property
+    def preset_busy(self) -> bool:
+        return self._preset_busy
+
+    @property
     def validation_error(self) -> str | None:
         return self._validation_error
 
@@ -88,7 +99,7 @@ class CreateController(QObject):
 
     def set_entries(self, entries: tuple[str, ...]) -> None:
         self._entries = tuple(entries)
-        self._invalidate_draft()
+        self.invalidate_draft()
         self.entries_changed.emit(self._entries)
         self._request_preview()
 
@@ -111,17 +122,19 @@ class CreateController(QObject):
         if self._recursive is recursive:
             return
         self._recursive = bool(recursive)
-        self._invalidate_draft()
+        self.invalidate_draft()
         self._request_preview()
 
     def set_configuration(self, snapshot: ConfigurationSnapshot) -> None:
         self._configuration = snapshot
         if self._selected_preset is None:
             self._selected_preset = snapshot.global_settings.default_preset_name
+        self.invalidate_draft()
         self.configuration_changed.emit(snapshot)
 
     def select_preset(self, name: str) -> ExecutionPreset | None:
         self._selected_preset = name
+        self.invalidate_draft()
         if self._configuration is None:
             return None
         for preset in self._configuration.presets:
@@ -129,11 +142,24 @@ class CreateController(QObject):
                 return preset
         return None
 
+    @Slot()
+    def invalidate_draft(self) -> None:
+        """Clear any validated draft when form fields that affect it change."""
+        if self._draft is None and self._validation_error is None:
+            return
+        self._draft = None
+        self._validation_error = None
+        self.draft_changed.emit(None)
+
     def save_user_preset(self, preset: ExecutionPreset) -> None:
         """Forward user-preset persistence through the shared Application runner."""
+        self._pending_preset_op = "save"
+        self._set_preset_busy(True)
         self._runner.request_preset_save(preset)
 
     def delete_user_preset(self, name: str) -> None:
+        self._pending_preset_op = "delete"
+        self._set_preset_busy(True)
         self._runner.request_preset_delete(name)
 
     def validate_draft(
@@ -199,7 +225,6 @@ class CreateController(QObject):
             self.busy_changed.emit(False)
             return
         if self._preview_busy:
-            # Coalesce: keep at most one follow-up for the latest entries.
             self._preview_queued = True
             return
         self._dispatch_preview()
@@ -255,12 +280,37 @@ class CreateController(QObject):
         self._preview_busy = False
         self.busy_changed.emit(False)
 
-    def _invalidate_draft(self) -> None:
-        if self._draft is None and self._validation_error is None:
+    def _on_preset_saved(self, snapshot: object) -> None:
+        if self._pending_preset_op != "save":
             return
-        self._draft = None
-        self._validation_error = None
-        self.draft_changed.emit(None)
+        if isinstance(snapshot, ConfigurationSnapshot):
+            self.set_configuration(snapshot)
+        self._pending_preset_op = None
+        self._set_preset_busy(False)
+
+    def _on_preset_deleted(self, snapshot: object) -> None:
+        if self._pending_preset_op != "delete":
+            return
+        if isinstance(snapshot, ConfigurationSnapshot):
+            self.set_configuration(snapshot)
+        self._pending_preset_op = None
+        self._set_preset_busy(False)
+
+    def _on_preset_failure(self, failure: object) -> None:
+        if self._pending_preset_op is None:
+            return
+        if not isinstance(failure, RunnerFailure):
+            failure = RunnerFailure(code="gui.application_bridge_failed", retryable=False)
+        self._last_failure = failure
+        self.failure_changed.emit(failure)
+        self._pending_preset_op = None
+        self._set_preset_busy(False)
+
+    def _set_preset_busy(self, busy: bool) -> None:
+        if self._preset_busy is busy:
+            return
+        self._preset_busy = busy
+        self.preset_busy_changed.emit(busy)
 
 
 __all__ = ["CreateController"]

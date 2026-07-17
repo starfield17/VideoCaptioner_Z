@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
@@ -216,10 +217,18 @@ class ProviderPublicSettings:
             raise AppError("config.provider_invalid", {"field": "max_concurrency"})
         if type(self.max_retries) is not int or self.max_retries < 0:
             raise AppError("config.provider_invalid", {"field": "max_retries"})
+        timeout = float(self.request_timeout_sec)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise AppError("config.provider_invalid", {"field": "request_timeout_sec"})
+        temperature = float(self.temperature)
+        if not math.isfinite(temperature) or temperature < 0:
+            raise AppError("config.provider_invalid", {"field": "temperature"})
         if self.tokenizer not in _TOKENIZERS:
             raise AppError("config.provider_invalid", {"field": "tokenizer"})
         if self.credential_source not in {"config", "environment", "missing"}:
             raise AppError("config.provider_invalid", {"field": "credential_source"})
+        object.__setattr__(self, "request_timeout_sec", timeout)
+        object.__setattr__(self, "temperature", temperature)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -247,11 +256,19 @@ class ProviderSettingsUpdate:
             raise AppError("config.provider_invalid", {"field": "max_concurrency"})
         if type(self.max_retries) is not int or self.max_retries < 0:
             raise AppError("config.provider_invalid", {"field": "max_retries"})
+        timeout = float(self.request_timeout_sec)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise AppError("config.provider_invalid", {"field": "request_timeout_sec"})
+        temperature = float(self.temperature)
+        if not math.isfinite(temperature) or temperature < 0:
+            raise AppError("config.provider_invalid", {"field": "temperature"})
         if self.tokenizer not in _TOKENIZERS:
             raise AppError("config.provider_invalid", {"field": "tokenizer"})
         object.__setattr__(self, "profile_name", self.profile_name.strip())
         object.__setattr__(self, "base_url", self.base_url.strip())
         object.__setattr__(self, "model", self.model.strip())
+        object.__setattr__(self, "request_timeout_sec", timeout)
+        object.__setattr__(self, "temperature", temperature)
         if self.api_key is not None:
             object.__setattr__(self, "api_key", self.api_key.strip())
 

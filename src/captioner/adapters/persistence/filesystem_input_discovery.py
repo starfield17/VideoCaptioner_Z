@@ -92,15 +92,28 @@ class FilesystemInputDiscovery:
         candidates: list[Path] = []
         try:
             if recursive:
+                scan_errors: list[OSError] = []
+
+                def onerror(error: OSError) -> None:
+                    scan_errors.append(error)
+
                 for root, dirnames, filenames in os.walk(
                     directory,
                     topdown=True,
                     followlinks=False,
+                    onerror=onerror,
                 ):
                     root_path = Path(root)
                     dirnames[:] = [name for name in dirnames if not (root_path / name).is_symlink()]
                     for filename in filenames:
                         candidates.append(root_path / filename)
+                if scan_errors:
+                    state.rejected.append(
+                        InputRejection(
+                            path=str(directory),
+                            code="input.directory_unreadable",
+                        )
+                    )
             else:
                 try:
                     children = list(directory.iterdir())

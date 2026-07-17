@@ -31,10 +31,18 @@ class FakeRunner(QObject):
     started = Signal()
     stopped = Signal()
     input_preview_ready = Signal(object)
-    configuration_ready = Signal(object)
-    provider_test_ready = Signal(object)
     input_failure = Signal(object)
-    configuration_failure = Signal(object)
+    configuration_loaded = Signal(object)
+    global_settings_saved = Signal(object)
+    provider_settings_saved = Signal(object)
+    preset_saved = Signal(object)
+    preset_deleted = Signal(object)
+    configuration_load_failure = Signal(object)
+    global_settings_save_failure = Signal(object)
+    provider_settings_save_failure = Signal(object)
+    preset_save_failure = Signal(object)
+    preset_delete_failure = Signal(object)
+    provider_test_ready = Signal(object)
     provider_test_failure = Signal(object)
 
     def __init__(self) -> None:
@@ -47,10 +55,10 @@ class FakeRunner(QObject):
         return self._running
 
     def request_configuration_load(self) -> None:
-        self.configuration_ready.emit(default_configuration_snapshot())
+        self.configuration_loaded.emit(default_configuration_snapshot())
 
     def request_global_save(self, settings: object) -> None:
-        self.configuration_ready.emit(
+        self.global_settings_saved.emit(
             ConfigurationSnapshot(
                 global_settings=settings,  # type: ignore[arg-type]
                 presets=built_in_presets(),
@@ -61,7 +69,7 @@ class FakeRunner(QObject):
 
     def request_provider_save(self, update: object) -> None:
         self.provider_updates.append(update)
-        self.configuration_ready.emit(default_configuration_snapshot())
+        self.provider_settings_saved.emit(default_configuration_snapshot())
 
     def request_provider_test(self, update: object) -> None:
         self.provider_updates.append(update)

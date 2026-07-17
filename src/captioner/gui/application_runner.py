@@ -38,10 +38,18 @@ class _ApplicationRunnerWorker(QObject):
     failure = Signal(object)
     initialized = Signal()
     input_preview_ready = Signal(object)
-    configuration_ready = Signal(object)
-    provider_test_ready = Signal(object)
     input_failure = Signal(object)
-    configuration_failure = Signal(object)
+    configuration_loaded = Signal(object)
+    global_settings_saved = Signal(object)
+    provider_settings_saved = Signal(object)
+    preset_saved = Signal(object)
+    preset_deleted = Signal(object)
+    configuration_load_failure = Signal(object)
+    global_settings_save_failure = Signal(object)
+    provider_settings_save_failure = Signal(object)
+    preset_save_failure = Signal(object)
+    preset_delete_failure = Signal(object)
+    provider_test_ready = Signal(object)
     provider_test_failure = Signal(object)
 
     def __init__(self, factory: BoundaryFactory) -> None:
@@ -93,86 +101,86 @@ class _ApplicationRunnerWorker(QObject):
     def load_configuration(self) -> None:
         boundary = self._boundary
         if boundary is None:
-            self.configuration_failure.emit(
+            self.configuration_load_failure.emit(
                 RunnerFailure(code=_UNEXPECTED_FAILURE_CODE, retryable=False)
             )
             return
         try:
             snapshot = boundary.load_configuration()
-            self.configuration_ready.emit(snapshot)
+            self.configuration_loaded.emit(snapshot)
         except Exception as exc:
-            self.configuration_failure.emit(_failure_from_exception(exc))
+            self.configuration_load_failure.emit(_failure_from_exception(exc))
 
     @Slot(object)
     def save_global(self, settings: object) -> None:
         boundary = self._boundary
         if boundary is None:
-            self.configuration_failure.emit(
+            self.global_settings_save_failure.emit(
                 RunnerFailure(code=_UNEXPECTED_FAILURE_CODE, retryable=False)
             )
             return
         if not isinstance(settings, GlobalSettings):
-            self.configuration_failure.emit(
+            self.global_settings_save_failure.emit(
                 RunnerFailure(code=_UNEXPECTED_FAILURE_CODE, retryable=False)
             )
             return
         try:
             snapshot = boundary.save_global_settings(settings)
-            self.configuration_ready.emit(snapshot)
+            self.global_settings_saved.emit(snapshot)
         except Exception as exc:
-            self.configuration_failure.emit(_failure_from_exception(exc))
+            self.global_settings_save_failure.emit(_failure_from_exception(exc))
 
     @Slot(object)
     def save_provider(self, update: object) -> None:
         boundary = self._boundary
         if boundary is None:
-            self.configuration_failure.emit(
+            self.provider_settings_save_failure.emit(
                 RunnerFailure(code=_UNEXPECTED_FAILURE_CODE, retryable=False)
             )
             return
         if not isinstance(update, ProviderSettingsUpdate):
-            self.configuration_failure.emit(
+            self.provider_settings_save_failure.emit(
                 RunnerFailure(code=_UNEXPECTED_FAILURE_CODE, retryable=False)
             )
             return
         try:
             snapshot = boundary.save_provider_settings(update)
-            self.configuration_ready.emit(snapshot)
+            self.provider_settings_saved.emit(snapshot)
         except Exception as exc:
-            self.configuration_failure.emit(_failure_from_exception(exc))
+            self.provider_settings_save_failure.emit(_failure_from_exception(exc))
 
     @Slot(object)
     def save_preset(self, preset: object) -> None:
         boundary = self._boundary
         if boundary is None:
-            self.configuration_failure.emit(
+            self.preset_save_failure.emit(
                 RunnerFailure(code=_UNEXPECTED_FAILURE_CODE, retryable=False)
             )
             return
         if not isinstance(preset, ExecutionPreset):
-            self.configuration_failure.emit(
+            self.preset_save_failure.emit(
                 RunnerFailure(code=_UNEXPECTED_FAILURE_CODE, retryable=False)
             )
             return
         try:
             snapshot = boundary.save_user_preset(preset)
-            self.configuration_ready.emit(snapshot)
+            self.preset_saved.emit(snapshot)
         except Exception as exc:
-            self.configuration_failure.emit(_failure_from_exception(exc))
+            self.preset_save_failure.emit(_failure_from_exception(exc))
 
     @Slot(str)
     def delete_preset(self, name: str) -> None:
         boundary = self._boundary
         if boundary is None:
-            self.configuration_failure.emit(
+            self.preset_delete_failure.emit(
                 RunnerFailure(code=_UNEXPECTED_FAILURE_CODE, retryable=False)
             )
             return
         try:
             snapshot = boundary.delete_user_preset(name)
-            self.configuration_ready.emit(snapshot)
+            self.preset_deleted.emit(snapshot)
         except Exception as exc:
-            self.configuration_failure.emit(_failure_from_exception(exc))
+            self.preset_delete_failure.emit(_failure_from_exception(exc))
 
     @Slot(object)
     def test_provider(self, update: object) -> None:
@@ -202,10 +210,18 @@ class ApplicationRunnerBridge(QObject):
     started = Signal()
     stopped = Signal()
     input_preview_ready = Signal(object)
-    configuration_ready = Signal(object)
-    provider_test_ready = Signal(object)
     input_failure = Signal(object)
-    configuration_failure = Signal(object)
+    configuration_loaded = Signal(object)
+    global_settings_saved = Signal(object)
+    provider_settings_saved = Signal(object)
+    preset_saved = Signal(object)
+    preset_deleted = Signal(object)
+    configuration_load_failure = Signal(object)
+    global_settings_save_failure = Signal(object)
+    provider_settings_save_failure = Signal(object)
+    preset_save_failure = Signal(object)
+    preset_delete_failure = Signal(object)
+    provider_test_ready = Signal(object)
     provider_test_failure = Signal(object)
 
     _refresh_requested = Signal()
@@ -244,10 +260,18 @@ class ApplicationRunnerBridge(QObject):
         worker.snapshot_ready.connect(self.snapshot_ready)
         worker.failure.connect(self.failure)
         worker.input_preview_ready.connect(self.input_preview_ready)
-        worker.configuration_ready.connect(self.configuration_ready)
-        worker.provider_test_ready.connect(self.provider_test_ready)
         worker.input_failure.connect(self.input_failure)
-        worker.configuration_failure.connect(self.configuration_failure)
+        worker.configuration_loaded.connect(self.configuration_loaded)
+        worker.global_settings_saved.connect(self.global_settings_saved)
+        worker.provider_settings_saved.connect(self.provider_settings_saved)
+        worker.preset_saved.connect(self.preset_saved)
+        worker.preset_deleted.connect(self.preset_deleted)
+        worker.configuration_load_failure.connect(self.configuration_load_failure)
+        worker.global_settings_save_failure.connect(self.global_settings_save_failure)
+        worker.provider_settings_save_failure.connect(self.provider_settings_save_failure)
+        worker.preset_save_failure.connect(self.preset_save_failure)
+        worker.preset_delete_failure.connect(self.preset_delete_failure)
+        worker.provider_test_ready.connect(self.provider_test_ready)
         worker.provider_test_failure.connect(self.provider_test_failure)
 
         queued = Qt.ConnectionType.QueuedConnection
