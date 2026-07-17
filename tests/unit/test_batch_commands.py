@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 from typing import cast
 
 import pytest
+from tests.support import llm_snapshot
 
 from captioner.adapters.persistence.jsonl_journal import JsonlJournal
 from captioner.bootstrap import build_durable_service, create_job_config, load_batch_config
@@ -17,7 +18,12 @@ from captioner.core.application.durable_pipeline import DurablePipelineService
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobProjection, JobState
-from captioner.core.domain.stage import PipelineProfile, StageName
+from captioner.core.domain.stage import (
+    PipelineProfile,
+    StageName,
+    stage_plan_for,
+    stage_versions_for,
+)
 from captioner.infrastructure.app_paths import resolve_app_paths
 
 batch_private = import_module("captioner.cli.commands.batch")
@@ -153,41 +159,40 @@ def test_batch_helpers_cover_override_and_collision_policies(tmp_path: Path) -> 
     fast = replace(
         base,
         pipeline_profile=PipelineProfile.FAST,
-        llm={"target_language": "zh-CN", "model": "fake"},
+        stage_versions=stage_versions_for(PipelineProfile.FAST),
+        llm=llm_snapshot(PipelineProfile.FAST),
     )
     quality = replace(
         base,
         pipeline_profile=PipelineProfile.QUALITY,
-        llm={"target_language": "zh-CN", "model": "fake"},
+        stage_versions=stage_versions_for(PipelineProfile.QUALITY),
+        llm=llm_snapshot(PipelineProfile.QUALITY),
     )
     assert earliest_change(base, fast) is StageName.TRANSLATE
     assert earliest_change(base, quality) is StageName.CORRECT_SOURCE
     assert (
-        earliest_change(fast, replace(fast, llm={"target_language": "de"})) is StageName.TRANSLATE
+        earliest_change(
+            fast,
+            replace(fast, llm=llm_snapshot(PipelineProfile.FAST, target_language="de")),
+        )
+        is StageName.TRANSLATE
     )
-    quality_prompts: dict[str, object] = {
-        "terminology": {"content_sha256": "term-v1"},
-        "correct_source": {"content_sha256": "correct-v1"},
-        "translate_quality": {"content_sha256": "translate-v1"},
-        "review_anomalies": {"content_sha256": "review-v1"},
-    }
-    quality_llm: dict[str, object] = {
-        "provider_profile": "default",
-        "model": "fake",
-        "target_language": "zh-CN",
-        "prompts": quality_prompts,
-    }
+    quality_llm = llm_snapshot(PipelineProfile.QUALITY)
+    quality_prompts = dict(cast(dict[str, object], quality_llm["prompts"]))
     quality = replace(quality, llm=quality_llm)
     assert (
         earliest_change(
             quality,
-            replace(quality, llm={**quality_llm, "target_language": "de"}),
+            replace(quality, llm=llm_snapshot(PipelineProfile.QUALITY, target_language="de")),
         )
         is StageName.TRANSLATE
     )
     review_prompts = {
         **quality_prompts,
-        "review_anomalies": {"content_sha256": "review-v2"},
+        "review_anomalies": {
+            **cast(dict[str, object], quality_prompts["review_anomalies"]),
+            "content_sha256": "b" * 64,
+        },
     }
     assert (
         earliest_change(
@@ -198,7 +203,10 @@ def test_batch_helpers_cover_override_and_collision_policies(tmp_path: Path) -> 
     )
     translation_prompts = {
         **quality_prompts,
-        "translate_quality": {"content_sha256": "translate-v2"},
+        "translate_quality": {
+            **cast(dict[str, object], quality_prompts["translate_quality"]),
+            "content_sha256": "c" * 64,
+        },
     }
     assert (
         earliest_change(
@@ -209,7 +217,10 @@ def test_batch_helpers_cover_override_and_collision_policies(tmp_path: Path) -> 
     )
     correction_prompts = {
         **quality_prompts,
-        "correct_source": {"content_sha256": "correct-v2"},
+        "correct_source": {
+            **cast(dict[str, object], quality_prompts["correct_source"]),
+            "content_sha256": "d" * 64,
+        },
     }
     assert (
         earliest_change(
@@ -239,7 +250,12 @@ def test_batch_helpers_cover_override_and_collision_policies(tmp_path: Path) -> 
     assert (
         earliest_change(
             quality,
-            replace(quality, pipeline_profile=PipelineProfile.FAST),
+            replace(
+                quality,
+                pipeline_profile=PipelineProfile.FAST,
+                stage_versions=stage_versions_for(PipelineProfile.FAST),
+                llm=llm_snapshot(PipelineProfile.FAST),
+            ),
         )
         is StageName.SEGMENT
     )
@@ -248,6 +264,101 @@ def test_batch_helpers_cover_override_and_collision_policies(tmp_path: Path) -> 
             (tmp_path / "one" / "news.wav", tmp_path / "two" / "news.mp4"),
             tmp_path / "output",
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("kind", "other-compatible", StageName.CORRECT_SOURCE),
+        ("provider_profile", "other", StageName.CORRECT_SOURCE),
+        ("base_url", "https://other.example/v1", StageName.CORRECT_SOURCE),
+        ("model", "other-model", StageName.CORRECT_SOURCE),
+        ("max_concurrency", 8, StageName.CORRECT_SOURCE),
+        ("request_timeout_sec", 60.0, StageName.CORRECT_SOURCE),
+        ("max_retries", 4, StageName.CORRECT_SOURCE),
+        ("temperature", 0.7, StageName.CORRECT_SOURCE),
+        ("source_language", "fr", StageName.CORRECT_SOURCE),
+        ("target_language", "de", StageName.TRANSLATE),
+        ("chunk", {"max_items": 8}, StageName.CORRECT_SOURCE),
+        ("response_schema_version", 2, StageName.CORRECT_SOURCE),
+    ],
+)
+def test_each_llm_snapshot_field_has_an_invalidation_boundary(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    expected: StageName,
+) -> None:
+    earliest_change = cast(
+        Callable[[JobConfig, JobConfig], StageName], batch_private._earliest_change
+    )
+    quality = create_job_config(
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="en",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        output_dir=tmp_path / "output",
+        overwrite=False,
+        pipeline_profile=PipelineProfile.QUALITY,
+        llm=llm_snapshot(PipelineProfile.QUALITY),
+    )
+    values = dict(cast(Mapping[str, object], quality.llm))
+    if field == "chunk":
+        chunk = dict(cast(Mapping[str, object], values["chunk"]))
+        chunk["max_input_tokens"] = 4095
+        values["chunk"] = chunk
+    else:
+        values[field] = value
+    changed = replace(quality, llm=values)
+    assert earliest_change(quality, changed) is expected
+
+
+def test_all_profile_transition_pairs_have_real_plans(tmp_path: Path) -> None:
+    base = create_job_config(
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="en",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        output_dir=tmp_path / "output",
+        overwrite=False,
+    )
+    fast = replace(
+        base,
+        pipeline_profile=PipelineProfile.FAST,
+        stage_versions=stage_versions_for(PipelineProfile.FAST),
+        llm=llm_snapshot(PipelineProfile.FAST),
+    )
+    quality = replace(
+        base,
+        pipeline_profile=PipelineProfile.QUALITY,
+        stage_versions=stage_versions_for(PipelineProfile.QUALITY),
+        llm=llm_snapshot(PipelineProfile.QUALITY),
+    )
+    configs = {
+        PipelineProfile.DETERMINISTIC: base,
+        PipelineProfile.FAST: fast,
+        PipelineProfile.QUALITY: quality,
+    }
+    expected = {
+        (PipelineProfile.DETERMINISTIC, PipelineProfile.FAST): StageName.TRANSLATE,
+        (PipelineProfile.DETERMINISTIC, PipelineProfile.QUALITY): StageName.CORRECT_SOURCE,
+        (PipelineProfile.FAST, PipelineProfile.DETERMINISTIC): StageName.SEGMENT,
+        (PipelineProfile.FAST, PipelineProfile.QUALITY): StageName.CORRECT_SOURCE,
+        (PipelineProfile.QUALITY, PipelineProfile.DETERMINISTIC): StageName.SEGMENT,
+        (PipelineProfile.QUALITY, PipelineProfile.FAST): StageName.SEGMENT,
+    }
+    earliest_change = cast(
+        Callable[[JobConfig, JobConfig], StageName], batch_private._earliest_change
+    )
+    for (old_profile, new_profile), first_stage in expected.items():
+        old = configs[old_profile]
+        new = configs[new_profile]
+        assert earliest_change(old, new) is first_stage
+        assert set(new.stage_versions) == {stage.value for stage in stage_plan_for(new_profile)}
 
 
 def test_resume_output_creates_new_directory_and_rejects_file(tmp_path: Path) -> None:

@@ -38,7 +38,7 @@ def test_llm_client_port_is_provider_neutral() -> None:
         (FastTranslationResponse, {"id", "corrected_source", "translated_text"}),
         (QualityTranslationResponse, {"id", "translated_text"}),
         (ReviewResponse, {"id", "translated_text"}),
-        (TerminologyResponse, {"id", "source_term", "target_term"}),
+        (TerminologyResponse, {"id", "terms"}),
     ],
 )
 def test_structured_schemas_are_exact_and_have_no_timing_fields(

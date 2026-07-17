@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
+from typing import cast
 
 import pytest
-from tests.support import make_transcript
+from tests.support import llm_snapshot, make_transcript
 
 from captioner.adapters.llm.scripted import ScriptedLLMAdapter
 from captioner.adapters.persistence.content_addressed_artifact_store import (
@@ -28,6 +30,7 @@ from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.llm import LLMRequest
+from captioner.core.domain.result import FrozenJsonValue, thaw_json_value
 from captioner.core.domain.stage import PipelineProfile, stage_plan_for
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.ports.stage_runner import (
@@ -49,7 +52,11 @@ def _parse(schema: type[object], payload: object) -> object:
     return parser(payload)
 
 
-def _config(tmp_path: Path) -> JobConfig:
+def _config(
+    tmp_path: Path,
+    *,
+    chunk: dict[str, int | None] | None = None,
+) -> JobConfig:
     policy = SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100)
     profile = PipelineProfile.QUALITY
     return JobConfig(
@@ -67,21 +74,7 @@ def _config(tmp_path: Path) -> JobConfig:
         False,
         {stage.value: "1" for stage in stage_plan_for(profile)},
         pipeline_profile=profile,
-        llm={
-            "kind": "openai-compatible",
-            "provider_profile": "default",
-            "base_url": "https://provider.example/v1",
-            "model": "unit-test-model",
-            "temperature": 0.1,
-            "target_language": "zh-CN",
-            "chunk": {
-                "max_items": 32,
-                "max_input_tokens": 4096,
-                "context_before_items": 1,
-                "context_after_items": 1,
-                "max_audio_context_duration_ms": 120_000,
-            },
-        },
+        llm=llm_snapshot(profile, chunk=chunk),
     )
 
 
@@ -118,8 +111,14 @@ def _terminology_and_correction(
         payload = [
             {
                 "id": item.id,
-                "source_term": item.source,
-                "target_term": "你好 10" if item.id == "word-000001" else "世界",
+                "terms": (
+                    [
+                        {"source_term": "hello 10", "target_term": "你好 10"},
+                        {"source_term": "world", "target_term": "世界"},
+                    ]
+                    if "hello 10" in item.source
+                    else []
+                ),
             }
             for item in request.items
         ]
@@ -178,24 +177,30 @@ def _number_loss_translation_response(
 
 def _correct_and_segment(
     tmp_path: Path,
+    *,
+    chunk: dict[str, int | None] | None = None,
 ) -> tuple[
     ContentAddressedArtifactStore,
     JobConfig,
     tuple[ArtifactRef, ArtifactRef, ArtifactRef, ArtifactRef],
 ]:
     store = ContentAddressedArtifactStore(tmp_path / "artifacts")
-    config = _config(tmp_path)
+    config = _config(tmp_path, chunk=chunk)
     transcript = make_transcript(("hello 10 ", "world"))
     transcript_ref = _put(store, encode_transcript(transcript), "transcript.json")
     prompt_loader = PromptLoader(Path("resources/prompts"))
     correct_stage = CorrectSourceStage(
         store,
-        ScriptedLLMAdapter(structured_responses=(_terminology_and_correction,) * 2),
+        ScriptedLLMAdapter(
+            structured_responses=(_terminology_and_correction,)
+            * (3 if chunk is not None and chunk["max_items"] == 1 else 2)
+        ),
         FilesystemLLMCache(tmp_path / "cache"),
         CharacterCounter(),
-        prompt_loader.load("terminology", "v1"),
+        prompt_loader.load("terminology", "v2"),
         prompt_loader.load("correct_source", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
+        repair_prompt=prompt_loader.load("repair_structured", "v1"),
     )
     produced = asyncio.run(
         correct_stage.execute(
@@ -247,15 +252,28 @@ def test_quality_correction_and_segmentation_preserve_original_mapping(tmp_path:
 def test_quality_translation_and_anomaly_free_review_do_not_call_review_llm(
     tmp_path: Path,
 ) -> None:
-    store, config, refs = _correct_and_segment(tmp_path)
+    store, config, refs = _correct_and_segment(
+        tmp_path,
+        chunk={
+            "max_items": 1,
+            "max_input_tokens": 4096,
+            "context_before_items": 1,
+            "context_after_items": 1,
+            "max_audio_context_duration_ms": 120_000,
+        },
+    )
     prompt_loader = PromptLoader(Path("resources/prompts"))
+    translation_adapter = ScriptedLLMAdapter(
+        structured_responses=(_translation_response(False),) * 2
+    )
     translate = QualityTranslateStage(
         store,
-        ScriptedLLMAdapter(structured_responses=(_translation_response(False),)),
+        translation_adapter,
         FilesystemLLMCache(tmp_path / "cache-translate"),
         CharacterCounter(),
         prompt_loader.load("translate_quality", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
+        repair_prompt=prompt_loader.load("repair_structured", "v1"),
     )
     translated = asyncio.run(
         translate.execute(
@@ -263,6 +281,15 @@ def test_quality_translation_and_anomaly_free_review_do_not_call_review_llm(
             _context(tmp_path, "translate"),
         )
     )
+    assert len(translation_adapter.structured_calls) == 2
+    first_payload = translation_adapter.structured_calls[0].context_payload
+    second_payload = translation_adapter.structured_calls[1].context_payload
+    assert first_payload is not None
+    assert second_payload is not None
+    first_context = thaw_json_value(cast(FrozenJsonValue, first_payload))
+    second_context = thaw_json_value(cast(FrozenJsonValue, second_payload))
+    assert first_context == {"terminology": [{"source_term": "hello 10", "target_term": "你好 10"}]}
+    assert second_context == {"terminology": [{"source_term": "world", "target_term": "世界"}]}
     translated_ref = _put(store, translated[0].data or b"", "translated-track.zh-CN.json")
     review_adapter = ScriptedLLMAdapter()
     review = ReviewStage(
@@ -272,6 +299,7 @@ def test_quality_translation_and_anomaly_free_review_do_not_call_review_llm(
         CharacterCounter(),
         prompt_loader.load("review_anomalies", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
+        repair_prompt=prompt_loader.load("repair_structured", "v1"),
     )
     reviewed = asyncio.run(
         review.execute(
@@ -281,6 +309,13 @@ def test_quality_translation_and_anomaly_free_review_do_not_call_review_llm(
     )
     assert review_adapter.structured_calls == []
     assert reviewed[0].logical_name == "reviewed-track.zh-CN.json"
+    report = json.loads(
+        next(item.data for item in reviewed if item.logical_name == "review-report.json") or b"{}"
+    )
+    assert report["llm_called"] is False
+    assert report["anomaly_count"] == 0
+    assert report["changed_cue_ids"] == []
+    assert report["validated"] is True
     assert (
         decode_track(
             store.read_bytes(_put(store, reviewed[0].data or b"", reviewed[0].logical_name))
@@ -299,6 +334,7 @@ def test_quality_review_sends_only_anomalies_and_adjacent_context(tmp_path: Path
         CharacterCounter(),
         prompt_loader.load("translate_quality", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
+        repair_prompt=prompt_loader.load("repair_structured", "v1"),
     )
     translated = asyncio.run(
         translate.execute(_request(tmp_path, config, refs), _context(tmp_path, "translate-bad"))
@@ -312,8 +348,9 @@ def test_quality_review_sends_only_anomalies_and_adjacent_context(tmp_path: Path
         CharacterCounter(),
         prompt_loader.load("review_anomalies", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
+        repair_prompt=prompt_loader.load("repair_structured", "v1"),
     )
-    asyncio.run(
+    reviewed = asyncio.run(
         review.execute(
             _request(tmp_path, config, (*refs, translated_ref)),
             _context(tmp_path, "review-bad"),
@@ -322,6 +359,12 @@ def test_quality_review_sends_only_anomalies_and_adjacent_context(tmp_path: Path
     assert len(review_adapter.structured_calls) == 1
     assert review_adapter.structured_calls[0].item_ids == ("cue-000001",)
     assert review_adapter.structured_calls[0].context_ids == ("cue-000002",)
+    report = json.loads(
+        next(item.data for item in reviewed if item.logical_name == "review-report.json") or b"{}"
+    )
+    assert report["anomaly_ids"] == ["cue-000001"]
+    assert report["changed_cue_ids"] == ["cue-000001"]
+    assert report["llm_called"] is True
 
 
 def test_quality_number_loss_is_rejected_before_cache_write(tmp_path: Path) -> None:
@@ -340,6 +383,7 @@ def test_quality_number_loss_is_rejected_before_cache_write(tmp_path: Path) -> N
         CharacterCounter(),
         prompt_loader.load("translate_quality", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
+        repair_prompt=prompt_loader.load("repair_structured", "v1"),
     )
     with pytest.raises(AppError, match=r"llm\.protected_token_lost"):
         asyncio.run(

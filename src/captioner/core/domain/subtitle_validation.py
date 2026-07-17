@@ -9,11 +9,8 @@ from enum import StrEnum
 from captioner.core.domain.subtitle import SubtitleTrack, derive_subtitle_track_id
 from captioner.core.domain.transcript import Transcript
 from captioner.core.policies.line_breaking import break_lines, join_rendered_lines
-from captioner.core.policies.llm_validation import (
-    is_obvious_wrong_language,
-    protected_numeric_tokens,
-)
-from captioner.core.policies.protected_spans import protected_break_cost
+from captioner.core.policies.llm_validation import is_obvious_wrong_language
+from captioner.core.policies.protected_spans import protected_break_cost, protected_tokens_preserved
 from captioner.core.policies.reading_speed import reading_speed
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.unicode_metrics import join_token_texts, measure_text, normalize_text
@@ -358,8 +355,8 @@ def _validate(
                 cue.translated_text is not None
                 and check_display
                 and (
-                    not _protected_numbers_preserved(protected_source, cue.translated_text)
-                    or not _protected_numbers_preserved(protected_source, normalized_source)
+                    not protected_tokens_preserved(protected_source, cue.translated_text)
+                    or not protected_tokens_preserved(protected_source, normalized_source)
                 )
             ):
                 issues.append(
@@ -489,14 +486,3 @@ def _validate(
 
 def _is_translated(track: SubtitleTrack) -> bool:
     return track.revision > 0 or any(cue.translated_text is not None for cue in track.cues)
-
-
-def _protected_numbers_preserved(source: str, output: str) -> bool:
-    output_digits = "".join(character for character in output if character.isdigit())
-    cursor = 0
-    for token in protected_numeric_tokens(source):
-        position = output_digits.find(token.digits, cursor)
-        if position < 0 or (token.percent and "%" not in output):
-            return False
-        cursor = position + len(token.digits)
-    return True

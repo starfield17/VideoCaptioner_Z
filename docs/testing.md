@@ -118,3 +118,10 @@ uv run pytest tests/recovery/test_llm_chunk_resume.py -q
 The fake HTTP server binds locally and uses synthetic credentials. Real-provider
 smoke tests are manual or protected-workflow-only and are never part of default
 CI.
+
+Phase 4 tests also assert that complete encoded requests fit their configured
+budget, Prompt content occurs only in the system message, dynamic terminology
+and anomaly context is Chunk-scoped, repair occurs at most once, public
+provider drift makes zero transport calls, and invalid semantic Cache entries
+are deleted. Platform seams execute both POSIX and Windows branches locally;
+the full branch gate remains 85% or higher and reports missing lines.

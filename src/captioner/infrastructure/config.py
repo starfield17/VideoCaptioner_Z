@@ -251,7 +251,7 @@ def write_llm_config(path: Path, content: str) -> None:
         raise AppError("llm.config_invalid", {"reason": "empty"})
     target = _config_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    mode = 0o600 if os.name != "nt" else 0o666
+    mode = config_file_creation_mode(os.name)
     temporary = target.with_name(f".{target.name}.tmp")
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
@@ -260,9 +260,19 @@ def write_llm_config(path: Path, content: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)
-        if os.name != "nt":
+        if should_chmod_private(os.name):
             os.chmod(target, 0o600)
     except OSError as exc:
         raise AppError("llm.config_write_failed") from exc
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def config_file_creation_mode(platform_name: str) -> int:
+    """Return the portable creation mode for an explicit platform seam."""
+    return 0o666 if platform_name == "nt" else 0o600
+
+
+def should_chmod_private(platform_name: str) -> bool:
+    """POSIX supports the explicit post-write private mode adjustment."""
+    return platform_name != "nt"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
@@ -13,9 +13,6 @@ from captioner.core.domain.llm import LLMRequest
 from captioner.core.ports.llm import LLMClient
 
 type Sleep = Callable[[float], Awaitable[None]]
-type RepairRequestFactory = Callable[[LLMRequest], LLMRequest]
-
-_REPAIRABLE_SCHEMA_ERRORS = frozenset({"llm.schema_invalid", "llm.response_invalid"})
 _RETRYABLE_ERRORS = frozenset(
     {
         "llm.rate_limited",
@@ -34,7 +31,6 @@ class StructuredLLMService(LLMClient):
     max_retries: int = 5
     backoff_base_sec: float = 1.0
     sleep: Sleep = asyncio.sleep
-    repair_request_factory: RepairRequestFactory | None = None
 
     def __post_init__(self) -> None:
         if type(self.max_retries) is not int or self.max_retries < 0:
@@ -53,7 +49,6 @@ class StructuredLLMService(LLMClient):
         context: ExecutionContext,
     ) -> T:
         current_request = request
-        repair_used = request.task_kind == "repair_structured"
         retry_index = 0
         while True:
             context.raise_if_cancelled()
@@ -62,10 +57,6 @@ class StructuredLLMService(LLMClient):
                     current_request, response_schema, context
                 )
             except AppError as exc:
-                if exc.code in _REPAIRABLE_SCHEMA_ERRORS and not repair_used:
-                    repair_used = True
-                    current_request = self._repair_request(request)
-                    continue
                 if not _is_retryable(exc) or retry_index >= self.max_retries:
                     raise
                 delay = self.backoff_base_sec * (2**retry_index)
@@ -73,23 +64,40 @@ class StructuredLLMService(LLMClient):
                 context.raise_if_cancelled()
                 await self.sleep(delay)
 
-    def _repair_request(self, request: LLMRequest) -> LLMRequest:
-        if self.repair_request_factory is not None:
-            return self.repair_request_factory(request)
-        return structured_repair_request(request)
 
-
-def structured_repair_request(request: LLMRequest) -> LLMRequest:
-    """Create the sole deterministic repair request for one logical call."""
-    return replace(
-        request,
+def structured_repair_request(
+    request: LLMRequest,
+    *,
+    repair_prompt_id: str,
+    repair_prompt_version: str,
+    repair_prompt_content_sha256: str,
+    repair_prompt_content: str,
+) -> LLMRequest:
+    """Create the single resource-backed repair request owned by the executor."""
+    if not all(
+        (
+            repair_prompt_id,
+            repair_prompt_version,
+            repair_prompt_content_sha256,
+            repair_prompt_content,
+        )
+    ):
+        raise AppError("prompt.identity_missing", {"prompt_id": "repair_structured"})
+    return LLMRequest(
         task_kind="repair_structured",
-        prompt_id="repair_structured",
-        prompt_version="v1",
-        prompt_content=(
-            f"{request.prompt_content}\n\n"
-            "Return exactly one valid JSON object matching the requested schema."
-        ),
+        items=request.items,
+        context=request.context,
+        source_language=request.source_language,
+        target_language=request.target_language,
+        prompt_id=repair_prompt_id,
+        prompt_version=repair_prompt_version,
+        prompt_content_sha256=repair_prompt_content_sha256,
+        prompt_content=repair_prompt_content,
+        context_payload=request.context_payload,
+        repair_prompt_id=request.repair_prompt_id,
+        repair_prompt_version=request.repair_prompt_version,
+        repair_prompt_content_sha256=request.repair_prompt_content_sha256,
+        repair_prompt_content=request.repair_prompt_content,
     )
 
 

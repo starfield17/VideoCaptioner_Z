@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from tests.support import llm_snapshot
+
 from captioner.adapters.persistence.content_addressed_artifact_store import (
     ContentAddressedArtifactStore,
 )
@@ -71,6 +73,7 @@ def config(
         False,
         {stage.value: "fake-v1" for stage in stage_plan_for(profile)},
         pipeline_profile=profile,
+        llm=None if profile is PipelineProfile.DETERMINISTIC else llm_snapshot(profile),
     )
 
 

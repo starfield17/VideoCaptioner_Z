@@ -54,7 +54,18 @@ def build_steps(mode: str) -> list[tuple[str, list[str]]]:
             "pytest with branch coverage",
             [*_tool("coverage"), "run", "--branch", "-m", "pytest", *pytest_full],
         ),
-        ("coverage report", [*_tool("coverage"), "report", "--fail-under", "85"]),
+        (
+            "coverage report",
+            [
+                *_tool("coverage"),
+                "report",
+                "-m",
+                "--skip-covered",
+                "--sort=cover",
+                "--fail-under",
+                "85",
+            ],
+        ),
     ]
 
 

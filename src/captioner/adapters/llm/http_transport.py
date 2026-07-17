@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -19,7 +20,10 @@ class HTTPTimeout:
 
     def __post_init__(self) -> None:
         values = (self.connect_sec, self.read_sec, self.write_sec, self.pool_sec)
-        if any(isinstance(value, bool) or value <= 0 for value in values):
+        if any(
+            type(value) not in {int, float} or not math.isfinite(float(value)) or float(value) <= 0
+            for value in values
+        ):
             raise ValueError
 
     @classmethod

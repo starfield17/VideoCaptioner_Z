@@ -32,6 +32,13 @@ Stage and Job receives that same runtime. The application uses a temporary
 workspace for normalized audio and never writes it beside the input or into
 resources.
 
+The durable LLM Job snapshot contains the exact public provider settings,
+profile, target language, chunk budget, response schema version, and Prompt
+identity map. Resume loads the same provider profile and compares every public
+field before creating the HTTP client; API-key rotation is the only allowed
+provider drift. Prompt content stays in read-only resources and is verified
+against the persisted SHA-256 identity.
+
 The durable Stage plan is selected from the persisted Job profile:
 
 ```text
@@ -87,3 +94,10 @@ may execute concurrently through one application-wide provider gate. It has no
 GUI workflow, parallel Job scheduler, provider fallback/routing, forced
 alignment, distributed locking, artifact GC, runtime installer, muxing, or
 release workflow.
+
+The complete serialized provider request is the boundary for chunk budgeting:
+system Prompt, user JSON envelope, language and task fields, dynamic context,
+and the strict response schema are counted together. A Cache key is derived
+from that final request, never from a parallel executor descriptor. Structured
+repair is owned by the Chunk executor and is allowed once per logical Chunk;
+transport retry remains the service's separate bounded concern.

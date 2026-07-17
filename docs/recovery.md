@@ -27,6 +27,12 @@ collisions are rejected before `batch.created`. Failed or cancelled Jobs are
 not resumed automatically; `retry` appends `job.retry_requested` and reopens
 only the requested Stage suffix while retaining historical terminal events.
 
+For an LLM Job, Resume binds the durable public provider snapshot before any
+HTTP client or request is created. A changed model, URL, provider kind,
+concurrency, timeout, retry count, or temperature fails with
+`llm.provider_snapshot_mismatch`; only the current API key may differ. The
+error reports changed public field names only, never old/new values or the key.
+
 A cooperative cancel marker becomes durable cancellation events when observed.
 The owning service appends missing `stage.cancelled`/`job.cancelled` events,
 projects the Manifest once, and removes the marker only after that write
@@ -62,7 +68,11 @@ its full Cache key and response schema, fsynced and atomically renamed. Resume
 reuses validated hits before entering the shared Semaphore, so a Stage crash
 requests only Cache misses. A committed LLM Stage is never called again during
 normal resume. Corrupt or mismatched Cache entries are misses, not successful
-results. API-key rotation does not change Cache identity.
+results; an entry that fails the complete semantic validator is removed before
+re-request. API-key rotation does not change Cache identity. A request that is
+cancelled while HTTP is in flight cancels and awaits the transport task,
+releases the shared Semaphore, consumes no repair budget, and writes no Cache
+entry.
 
 Publication target verification performs one regular-file, size, and SHA-256
 pass per target; filesystem races and I/O failures are reported as

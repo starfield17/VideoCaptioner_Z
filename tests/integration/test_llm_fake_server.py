@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -36,10 +37,14 @@ def _provider() -> OpenAICompatibleProvider:
 
 
 def _request() -> LLMRequest:
+    prompt = "unit prompt"
     return LLMRequest(
         "correct_source",
         (LLMItem("item-1", "source text"),),
-        prompt_content="unit prompt",
+        prompt_id="correct_source",
+        prompt_version="v1",
+        prompt_content_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        prompt_content=prompt,
     )
 
 

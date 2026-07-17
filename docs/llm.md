@@ -46,9 +46,9 @@ IDs. Application code copies those values from validated domain inputs.
 
 Prompt identities contain `prompt_id`, `prompt_version`, `content_sha256`, and
 content. Changing content requires a new version; runtime loading verifies the
-persisted identity. Phase 4 v1 prompts are:
+persisted identity. The current Prompt identities are:
 
-- `terminology.v1`
+- `terminology.v2` (the sparse glossary contract)
 - `correct_source.v1`
 - `translate_fast.v1`
 - `translate_quality.v1`
@@ -63,7 +63,9 @@ SRT, WebVTT, and ASS.
 
 ## Chunking, validation, Cache, and retry
 
-Chunk planning obeys item, token, context-item, and audio-context budgets.
+Chunk planning obeys item, complete-request token, context-item, and
+audio-context budgets. The complete request includes the system Prompt, user
+JSON envelope, language/task metadata, dynamic context, and response schema.
 Context IDs never enter the expected output set. ID mismatch deterministically
 bisects the current Chunk and terminates at one item. Invalid schema/text may
 receive at most one structured repair request.
@@ -71,8 +73,9 @@ receive at most one structured repair request.
 Validated Cache entries live under `<AppPaths.cache_dir>/llm/sha256/`. Their key
 binds task, provider identity, normalized base URL identity, model, temperature,
 languages, profile, prompt ID/version/content hash, response schema, ordered
-items/context, and Chunk configuration. It excludes credentials, Authorization,
-timestamps, random IDs, and local temporary paths. Entries use canonical JSON,
+items/context, dynamic context, repair Prompt identity, and Chunk configuration.
+It excludes credentials, Authorization, timestamps, random IDs, and local
+temporary paths. Entries use canonical JSON,
 flush, fsync, and atomic rename; corrupt or mismatched entries are misses.
 
 The adapter classifies 429, 502/503/504, network failure, and timeout as
@@ -82,11 +85,17 @@ and Jobs share one client and one application-wide Semaphore.
 
 ## Recovery and redaction
 
-Each Chunk retries and commits Cache independently. Resume reuses validated
+Each Chunk retries and commits Cache independently. The key is derived from the
+final actual `LLMRequest`, including dynamic context and repair Prompt identity.
+Resume reuses validated
 hits before Semaphore acquisition, so successful Chunks are not requested
 again after a Stage crash. Once a Stage commit is durable, normal resume skips
 the Stage entirely. Cancellation removes incomplete tasks and temporary Cache
-files while retaining already committed valid entries.
+files while retaining already committed valid entries. Structured repair has one
+owner, the Chunk executor: transport retries do not consume its budget, and an
+ID mismatch shrinks the Chunk instead of repairing it. The provider adapter
+races every in-flight request against cancellation and awaits cleanup before
+releasing the shared Semaphore.
 
 Authorization and credentials are redacted before logging or structured error
 creation. Provider credentials suppress dataclass representation. Automated
@@ -96,6 +105,8 @@ tests use scripted adapters or a local fake server and synthetic keys only.
 
 Phase 4 v1 supports one provider profile per Job, one OpenAI-compatible endpoint,
 non-streaming responses, deterministic script-based language heuristics, and
-one-Word Quality correction units. Terminology conflicts fail explicitly rather
-than choosing a target silently. Real-provider validation is a manual or
+one-Word Quality correction units. Terminology is sparse: ordinary units may
+return no terms, source terms must match token boundaries in their input unit,
+and conflicts fail explicitly rather than choosing a target silently.
+Real-provider validation is a manual or
 protected-workflow smoke test, not default CI.

@@ -1,4 +1,4 @@
-"""Phase 1 composition root for the one-shot CLI workflow."""
+"""Phase-aware composition root for durable subtitle pipelines."""
 
 from __future__ import annotations
 
@@ -51,8 +51,18 @@ from captioner.core.application.structured_llm_service import Sleep, StructuredL
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.journal import replay
-from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
-from captioner.core.domain.stage import PipelineProfile, StageName, stage_plan_for
+from captioner.core.domain.llm_job_config import (
+    LLMJobSnapshot,
+    PromptSnapshot,
+    ProviderPublicSnapshot,
+    required_prompts_for,
+)
+from captioner.core.domain.result import FrozenJsonValue, freeze_json_value, thaw_json_value
+from captioner.core.domain.stage import (
+    PipelineProfile,
+    StageName,
+    stage_versions_for,
+)
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig
 from captioner.core.ports.llm_cache import LLMCachePort
@@ -143,11 +153,13 @@ def build_llm_runtime(
     transport: HTTPTransport | None = None,
     sleep: Sleep | None = None,
     max_response_bytes: int = 2 * 1024 * 1024,
+    expected_snapshot: Mapping[str, FrozenJsonValue] | None = None,
 ) -> LLMRuntime:
     """Create the single shared LLM runtime at the composition root."""
     application_paths = resolve_app_paths() if paths is None else paths
     ensure_runtime_layout(application_paths)
     provider = load_provider_config(application_paths.config_dir, provider_profile)
+    _validate_provider_snapshot(provider, expected_snapshot)
     semaphore = asyncio.Semaphore(provider.max_concurrency)
     client = OpenAICompatibleClient(
         provider,
@@ -161,6 +173,44 @@ def build_llm_runtime(
         sleep=asyncio.sleep if sleep is None else sleep,
     )
     return LLMRuntime(provider, semaphore, client, service)
+
+
+def validate_llm_runtime_snapshot(
+    runtime: LLMRuntime,
+    snapshot: Mapping[str, FrozenJsonValue],
+) -> None:
+    """Fail before a request when a resumed runtime changed public identity."""
+    _validate_provider_snapshot(runtime.provider, snapshot)
+
+
+def _validate_provider_snapshot(
+    provider: OpenAICompatibleProvider,
+    snapshot: Mapping[str, FrozenJsonValue] | None,
+) -> None:
+    if snapshot is None:
+        return
+    try:
+        durable = ProviderPublicSnapshot.from_mapping(
+            {
+                field: snapshot[field]
+                for field in (
+                    "kind",
+                    "provider_profile",
+                    "base_url",
+                    "model",
+                    "max_concurrency",
+                    "request_timeout_sec",
+                    "max_retries",
+                    "temperature",
+                )
+            }
+        )
+    except (KeyError, TypeError, AppError) as exc:
+        raise AppError("llm.provider_snapshot_mismatch", {"fields": ["snapshot"]}) from exc
+    current = ProviderPublicSnapshot.from_mapping(provider.to_snapshot())
+    changed = durable.changed_fields(current)
+    if changed:
+        raise AppError("llm.provider_snapshot_mismatch", {"fields": list(changed)})
 
 
 def create_job_config(
@@ -202,17 +252,10 @@ def create_job_config(
             prompt_identity,
         )
     ):
-        snapshot = {
-            **({"target_language": target_language} if target_language is not None else {}),
-            **({"provider_profile": provider_profile} if provider_profile is not None else {}),
-            **({"base_url": llm_base_url} if llm_base_url is not None else {}),
-            **({"model": llm_model} if llm_model is not None else {}),
-            **({"temperature": temperature} if temperature is not None else {}),
-            **({"timeout_sec": timeout_sec} if timeout_sec is not None else {}),
-            **({"max_retries": max_retries} if max_retries is not None else {}),
-            **({"chunk": chunk} if chunk is not None else {}),
-            **({"prompt": prompt_identity} if prompt_identity is not None else {}),
-        }
+        raise AppError(
+            "llm.config_invalid",
+            {"reason": "complete_snapshot_required"},
+        )
     return JobConfig(
         model.model_ref,
         model.model_identity,
@@ -226,21 +269,7 @@ def create_job_config(
         SimpleSegmentationConfig().to_policy_config().to_mapping(),
         str(output_dir.expanduser().resolve()),
         overwrite,
-        {
-            stage.value: {
-                StageName.SEGMENT.value: "segment-v2",
-                StageName.CORRECT_SOURCE.value: "correct-source-v1",
-                StageName.TRANSLATE.value: (
-                    "translate-quality-v1"
-                    if selected_profile is PipelineProfile.QUALITY
-                    else "translate-v1"
-                ),
-                StageName.REVIEW.value: "review-v1",
-                StageName.EXPORT.value: "export-v3",
-                StageName.PUBLISH.value: "publish-v3",
-            }.get(stage.value, "1")
-            for stage in stage_plan_for(selected_profile)
-        },
+        stage_versions_for(selected_profile),
         pipeline_profile=selected_profile,
         llm=None if snapshot is None else _frozen_mapping(snapshot),
     )
@@ -264,52 +293,38 @@ def create_llm_job_snapshot(
     provider = load_provider_config(paths.config_dir, provider_profile)
     selected_profile = PipelineProfile(pipeline_profile)
     loader = PromptLoader(paths.prompt_resource_dir)
-    if selected_profile is PipelineProfile.FAST:
-        prompts = {"translate_fast": loader.load("translate_fast", "v1")}
-    elif selected_profile is PipelineProfile.QUALITY:
-        prompts = {
-            prompt_id: loader.load(prompt_id, "v1")
-            for prompt_id in (
-                "terminology",
-                "correct_source",
-                "translate_quality",
-                "review_anomalies",
-            )
-        }
-    else:
+    if selected_profile is PipelineProfile.DETERMINISTIC:
         raise AppError("llm.config_invalid", {"field": "pipeline_profile"})
-    prompt = next(iter(prompts.values()))
-    snapshot: dict[str, object] = {
-        **provider.to_snapshot(),
-        "profile": selected_profile.value,
-        "source_language": source_language,
-        "target_language": target_language.strip(),
-        "prompt": {
-            "prompt_id": prompt.prompt_id,
-            "prompt_version": prompt.prompt_version,
-            "content_sha256": prompt.content_sha256,
-        },
-        "prompts": {
-            prompt_id: {
-                "prompt_id": identity.prompt_id,
-                "prompt_version": identity.prompt_version,
-                "content_sha256": identity.content_sha256,
-            }
-            for prompt_id, identity in prompts.items()
-        },
-        "prompt_id": prompt.prompt_id,
-        "prompt_version": prompt.prompt_version,
-        "prompt_content_sha256": prompt.content_sha256,
-        "chunk": {
+    prompt_versions = {
+        "terminology": "v2",
+    }
+    prompts = {
+        prompt_id: loader.load(prompt_id, prompt_versions.get(prompt_id, "v1"))
+        for prompt_id in required_prompts_for(selected_profile)
+    }
+    snapshot = LLMJobSnapshot(
+        profile=selected_profile,
+        provider=ProviderPublicSnapshot.from_mapping(provider.to_snapshot()),
+        source_language=source_language,
+        target_language=target_language.strip(),
+        chunk={
             "max_items": 32,
             "max_input_tokens": 4096,
             "context_before_items": 1,
             "context_after_items": 1,
             "max_audio_context_duration_ms": 120_000,
         },
-        "response_schema_version": 1,
-    }
-    return _frozen_mapping(snapshot)
+        prompts={
+            prompt_id: PromptSnapshot(
+                identity.prompt_id,
+                identity.prompt_version,
+                identity.content_sha256,
+            )
+            for prompt_id, identity in prompts.items()
+        },
+        response_schema_version=1,
+    )
+    return snapshot.to_mapping()
 
 
 def create_batch_lease(batch_dir: Path) -> BatchLease:
@@ -408,16 +423,23 @@ def build_durable_service(
     if selected_profile in {PipelineProfile.FAST, PipelineProfile.QUALITY}:
         if llm is None:
             raise AppError("llm.config_missing", {"reason": "job_snapshot"})
+        snapshot = LLMJobSnapshot.from_mapping(thaw_json_value(llm))
+        if snapshot.profile is not selected_profile:
+            raise AppError("llm.snapshot_invalid", {"reason": "profile"})
         if runtime is None and initialize_runtime:
             runtime = build_llm_runtime(
                 provider_profile=_snapshot_string(llm, "provider_profile", "default"),
                 paths=application_paths,
+                expected_snapshot=llm,
             )
+        elif runtime is not None:
+            validate_llm_runtime_snapshot(runtime, llm)
         if runtime is not None:
             cache = cache or FilesystemLLMCache(application_paths.cache_dir)
             counter = counter or CharacterTokenCounter()
             if selected_profile is PipelineProfile.FAST:
                 prompt = _prompt_for_snapshot(application_paths, llm, "translate_fast")
+                repair_prompt = _prompt_for_snapshot(application_paths, llm, "repair_structured")
                 runners[StageName.TRANSLATE] = TranslateStage(
                     durable,
                     runtime.service,
@@ -425,12 +447,14 @@ def build_durable_service(
                     counter,
                     prompt,
                     policy,
+                    repair_prompt=repair_prompt,
                 )
             else:
                 terminology_prompt = _prompt_for_snapshot(application_paths, llm, "terminology")
                 correction_prompt = _prompt_for_snapshot(application_paths, llm, "correct_source")
                 quality_prompt = _prompt_for_snapshot(application_paths, llm, "translate_quality")
                 review_prompt = _prompt_for_snapshot(application_paths, llm, "review_anomalies")
+                repair_prompt = _prompt_for_snapshot(application_paths, llm, "repair_structured")
                 runners[StageName.CORRECT_SOURCE] = CorrectSourceStage(
                     durable,
                     runtime.service,
@@ -439,6 +463,7 @@ def build_durable_service(
                     terminology_prompt,
                     correction_prompt,
                     policy,
+                    repair_prompt=repair_prompt,
                 )
                 runners[StageName.TRANSLATE] = QualityTranslateStage(
                     durable,
@@ -447,6 +472,7 @@ def build_durable_service(
                     counter,
                     quality_prompt,
                     policy,
+                    repair_prompt=repair_prompt,
                 )
                 runners[StageName.REVIEW] = ReviewStage(
                     durable,
@@ -455,6 +481,7 @@ def build_durable_service(
                     counter,
                     review_prompt,
                     policy,
+                    repair_prompt=repair_prompt,
                 )
 
     def verify_committed(job: object, stage: object) -> None:
@@ -518,12 +545,6 @@ def _prompt_for_snapshot(
     prompts = snapshot.get("prompts")
     if isinstance(prompts, Mapping):
         prompt_value = prompts.get(prompt_id)
-    if prompt_value is None and prompt_id == snapshot.get("prompt_id"):
-        prompt_value = {
-            "prompt_id": snapshot.get("prompt_id"),
-            "prompt_version": snapshot.get("prompt_version"),
-            "content_sha256": snapshot.get("prompt_content_sha256"),
-        }
     if not isinstance(prompt_value, Mapping):
         raise AppError("prompt.identity_missing", {"prompt_id": prompt_id})
     version = prompt_value.get("prompt_version")

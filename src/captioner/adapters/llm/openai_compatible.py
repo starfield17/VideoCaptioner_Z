@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any, Protocol, TypeVar, cast
 
 from captioner.adapters.llm.http_transport import (
+    HTTPResponse,
     HTTPTimeout,
     HTTPTransport,
     HTTPTransportError,
@@ -15,8 +16,7 @@ from captioner.adapters.llm.http_transport import (
 )
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
-from captioner.core.domain.llm import LLMRequest, response_schema_for
-from captioner.core.domain.result import JsonValue
+from captioner.core.domain.llm import LLMRequest, encode_llm_request
 from captioner.core.ports.llm import LLMClient
 from captioner.infrastructure.config import OpenAICompatibleProvider
 
@@ -78,32 +78,50 @@ class OpenAICompatibleClient(LLMClient):
         context: ExecutionContext,
     ) -> T:
         context.raise_if_cancelled()
-        schema = response_schema_for(cast(type[object], response_schema))
-        body = _encode_request(request, self._provider.model, self._provider.temperature, schema)
+        body = _encode_request(
+            request,
+            self._provider.model,
+            self._provider.temperature,
+            cast(type[object], response_schema),
+        )
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self._provider.api_key}",
         }
         await _acquire_semaphore(self._semaphore, context)
+        request_task: asyncio.Task[HTTPResponse] | None = None
+        cancel_task: asyncio.Task[None] | None = None
         try:
             context.raise_if_cancelled()
-            try:
-                response = await self._transport.request(
+            request_task = asyncio.create_task(
+                self._request_transport(
                     "POST",
                     f"{self._provider.base_url}/chat/completions",
                     headers,
                     body,
-                    HTTPTimeout.all(self._provider.request_timeout_sec),
-                    self._max_response_bytes,
                 )
-            except HTTPTransportError as exc:
-                raise _transport_app_error(exc) from exc
-            except TimeoutError as exc:
-                raise AppError("llm.timeout", retryable=True) from exc
-            except OSError as exc:
-                raise AppError("llm.network_error", retryable=True) from exc
+            )
+            cancel_task = asyncio.create_task(context.wait_cancelled())
+            done, _ = await asyncio.wait(
+                (request_task, cancel_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if cancel_task in done:
+                request_task.cancel()
+                await asyncio.gather(request_task, return_exceptions=True)
+                raise AppError("operation.cancelled")
+            response = request_task.result()
+        except asyncio.CancelledError:
+            if request_task is not None and not request_task.done():
+                request_task.cancel()
+            if request_task is not None:
+                await asyncio.gather(request_task, return_exceptions=True)
+            raise
         finally:
+            if cancel_task is not None and not cancel_task.done():
+                cancel_task.cancel()
+            if cancel_task is not None:
+                await asyncio.gather(cancel_task, return_exceptions=True)
             self._semaphore.release()
         if len(response.body) > self._max_response_bytes:
             raise AppError("llm.response_too_large")
@@ -124,6 +142,29 @@ class OpenAICompatibleClient(LLMClient):
             f"provider={self._provider!r}, max_response_bytes={self._max_response_bytes!r})"
         )
 
+    async def _request_transport(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes,
+    ) -> HTTPResponse:
+        try:
+            return await self._transport.request(
+                method,
+                url,
+                headers,
+                body,
+                HTTPTimeout.all(self._provider.request_timeout_sec),
+                self._max_response_bytes,
+            )
+        except HTTPTransportError as exc:
+            raise _transport_app_error(exc) from exc
+        except TimeoutError as exc:
+            raise AppError("llm.timeout", retryable=True) from exc
+        except OSError as exc:
+            raise AppError("llm.network_error", retryable=True) from exc
+
 
 OpenAICompatibleLLMClient = OpenAICompatibleClient
 OpenAICompatibleAdapter = OpenAICompatibleClient
@@ -133,35 +174,9 @@ def _encode_request(
     request: LLMRequest,
     model: str,
     temperature: float,
-    response_schema: Mapping[str, JsonValue],
+    response_schema: type[object],
 ) -> bytes:
-    payload: dict[str, JsonValue] = {
-        "model": model,
-        "temperature": temperature,
-        "messages": [
-            {
-                "role": "system",
-                "content": request.prompt_content or "Return only the requested JSON object.",
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    request.to_dict(), ensure_ascii=False, allow_nan=False, separators=(",", ":")
-                ),
-            },
-        ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": request.task_kind.replace("-", "_"),
-                "strict": True,
-                "schema": dict(response_schema),
-            },
-        },
-    }
-    return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    return encode_llm_request(request, model, temperature, response_schema)
 
 
 def _decode_response[T](

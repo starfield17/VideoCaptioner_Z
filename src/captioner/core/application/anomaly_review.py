@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from typing import Protocol
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.llm import ReviewResponse
@@ -13,6 +14,17 @@ from captioner.core.domain.transcript import Transcript
 from captioner.core.policies.line_breaking import break_lines
 from captioner.core.policies.llm_anomalies import SubtitleAnomaly, detect_anomalies
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
+
+
+class PromptIdentityLike(Protocol):
+    @property
+    def prompt_id(self) -> str: ...
+
+    @property
+    def prompt_version(self) -> str: ...
+
+    @property
+    def content_sha256(self) -> str: ...
 
 
 def build_reviewed_track(
@@ -102,16 +114,34 @@ def review_report(
     track: SubtitleTrack,
     anomalies: Sequence[SubtitleAnomaly],
     terminology: Terminology | None = None,
+    *,
+    output_track_id: str | None = None,
+    target_language: str | None = None,
+    changed_cue_ids: Sequence[str] = (),
+    llm_called: bool | None = None,
+    validated: bool = True,
+    prompt: PromptIdentityLike | None = None,
 ) -> dict[str, object]:
     """Return a stable report even when no review request was needed."""
-    del terminology
+    prompt_fields = (
+        {}
+        if prompt is None
+        else {
+            "prompt_id": prompt.prompt_id,
+            "prompt_version": prompt.prompt_version,
+            "prompt_content_sha256": prompt.content_sha256,
+        }
+    )
     return {
         "schema_version": 1,
-        "source_track_id": track.id,
+        "input_track_id": track.id,
+        "output_track_id": output_track_id or track.id,
+        "target_language": target_language or track.language,
         "anomaly_count": len(anomalies),
-        "anomalies": [
-            {"cue_id": anomaly.cue_id, "reasons": list(anomaly.reasons)} for anomaly in anomalies
-        ],
-        "reviewed": True,
-        "llm_called": bool(anomalies),
+        "anomaly_ids": [anomaly.cue_id for anomaly in anomalies],
+        "changed_cue_ids": list(dict.fromkeys(changed_cue_ids)),
+        "llm_called": bool(anomalies) if llm_called is None else llm_called,
+        "validated": validated,
+        "terminology_present": terminology is not None,
+        **prompt_fields,
     }

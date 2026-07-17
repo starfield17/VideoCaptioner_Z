@@ -1,9 +1,9 @@
-"""Six concrete Stage runners composed from Phase 1 adapters."""
+"""Profile-aware Phase 4 Stage runners composed from application ports."""
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -38,6 +38,7 @@ from captioner.core.application.llm_chunk_executor import (
 from captioner.core.application.output_transaction import commit_output_set
 from captioner.core.application.source_correction import (
     build_corrected_transcript,
+    build_terminology_units,
     merge_terminology,
 )
 from captioner.core.domain.artifact import ArtifactRef
@@ -51,16 +52,22 @@ from captioner.core.domain.llm import (
     TerminologyResponse,
 )
 from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
+from captioner.core.domain.result import JsonValue
 from captioner.core.domain.stage import StageName
 from captioner.core.domain.subtitle import SubtitleCue, SubtitleTrack, derive_subtitle_track_id
 from captioner.core.domain.subtitle_validation import (
     validate_subtitle_track,
     validate_translated_mapping,
 )
+from captioner.core.domain.terminology import Terminology
 from captioner.core.domain.transcript import CorrectedTranscript
 from captioner.core.policies.line_breaking import break_lines
-from captioner.core.policies.llm_anomalies import AnomalyChunkPlanner, detect_anomalies
-from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, ChunkPlanner
+from captioner.core.policies.llm_anomalies import (
+    AnomalyChunkPlanner,
+    SubtitleAnomaly,
+    detect_anomalies,
+)
+from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, ChunkPlanner, LLMChunk
 from captioner.core.policies.segmentation import canonical_words
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig, segment_transcript
@@ -170,6 +177,7 @@ class CorrectSourceStage:
     config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
     name: StageName = StageName.CORRECT_SOURCE
     version: str = "correct-source-v1"
+    repair_prompt: PromptIdentity | None = None
 
     async def execute(
         self, request: StageExecutionRequest, context: StageExecutionContext
@@ -180,7 +188,11 @@ class CorrectSourceStage:
         _validate_target_language(target_language)
         transcript = decode_transcript(self.artifacts.read_bytes(_ref(request, "transcript.json")))
         words = canonical_words(transcript.words)
-        items = tuple(
+        terminology_units = build_terminology_units(transcript)
+        terminology_items = tuple(
+            ChunkItem(unit.id, unit.text, unit.start_ms, unit.end_ms) for unit in terminology_units
+        )
+        correction_items = tuple(
             ChunkItem(
                 word.id,
                 _canonical_word_text(word.text),
@@ -206,7 +218,7 @@ class CorrectSourceStage:
             terminology_config,
         )
         terminology_responses = await terminology_executor.execute(
-            items,
+            terminology_items,
             TerminologyResponse,
             context.execution,
         )
@@ -215,16 +227,21 @@ class CorrectSourceStage:
             transcript.language,
             target_language,
             terminology_responses,
+            units=terminology_units,
         )
-        correction_prompt = _prompt_with_context(self.correction_prompt, terminology.to_dict())
         correction_config = _stage_execution_config(
             request.config.llm,
             LLMTaskKind.CORRECT_SOURCE.value,
             transcript.language,
             target_language,
-            correction_prompt,
+            self.correction_prompt,
             chunking,
             "quality",
+            self.repair_prompt,
+            lambda chunk: _terminology_context(
+                terminology,
+                {item_id for item in chunk.items for item_id in (item.id,)},
+            ),
         )
         correction_executor = LLMChunkExecutor(
             self.client,
@@ -233,7 +250,7 @@ class CorrectSourceStage:
             correction_config,
         )
         correction_responses = await correction_executor.execute(
-            items,
+            correction_items,
             SourceCorrectionResponse,
             context.execution,
         )
@@ -319,6 +336,7 @@ class TranslateStage:
     config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
     name: StageName = StageName.TRANSLATE
     version: str = "translate-v1"
+    repair_prompt: PromptIdentity | None = None
 
     async def execute(
         self, request: StageExecutionRequest, context: StageExecutionContext
@@ -346,6 +364,7 @@ class TranslateStage:
             target_language,
             self.prompt,
             chunking,
+            self.repair_prompt,
         )
         executor = LLMChunkExecutor(
             self.client,
@@ -437,6 +456,7 @@ class QualityTranslateStage:
     config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
     name: StageName = StageName.TRANSLATE
     version: str = "translate-quality-v1"
+    repair_prompt: PromptIdentity | None = None
 
     async def execute(
         self, request: StageExecutionRequest, context: StageExecutionContext
@@ -467,16 +487,21 @@ class QualityTranslateStage:
             or terminology.target_language != target_language
         ):
             raise AppError("llm.terminology_invalid", {"reason": "transcript_or_language"})
-        prompt = _prompt_with_context(self.prompt, terminology.to_dict())
         chunking = _chunking_from_snapshot(request.config.llm)
         execution_config = _stage_execution_config(
             request.config.llm,
             LLMTaskKind.TRANSLATE_QUALITY.value,
             transcript.language,
             target_language,
-            prompt,
+            self.prompt,
             chunking,
             "quality",
+            self.repair_prompt,
+            lambda chunk: _terminology_context_for_cues(
+                terminology,
+                {item.id for item in chunk.items},
+                source_track,
+            ),
         )
         executor = LLMChunkExecutor(
             self.client,
@@ -566,6 +591,7 @@ class ReviewStage:
     config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
     name: StageName = StageName.REVIEW
     version: str = "review-v1"
+    repair_prompt: PromptIdentity | None = None
 
     async def execute(
         self, request: StageExecutionRequest, context: StageExecutionContext
@@ -606,25 +632,22 @@ class ReviewStage:
             )
             anomaly_ids = {anomaly.cue_id for anomaly in anomalies}
             items = tuple(item for item in all_items if item.id in anomaly_ids)
-            prompt = _prompt_with_context(
-                self.prompt,
-                {
-                    "terminology": None if terminology is None else terminology.to_dict(),
-                    "anomalies": [
-                        {"cue_id": anomaly.cue_id, "reasons": list(anomaly.reasons)}
-                        for anomaly in anomalies
-                    ],
-                },
-            )
             chunking = _chunking_from_snapshot(request.config.llm)
             execution_config = _stage_execution_config(
                 request.config.llm,
                 LLMTaskKind.REVIEW.value,
                 transcript.language,
                 target_language,
-                prompt,
+                self.prompt,
                 chunking,
                 "quality",
+                self.repair_prompt,
+                lambda chunk: _review_context(
+                    anomalies,
+                    terminology,
+                    track,
+                    chunk,
+                ),
             )
             executor = LLMChunkExecutor(
                 self.client,
@@ -648,6 +671,11 @@ class ReviewStage:
             terminology,
             corrected_mapping,
         )
+        changed_cue_ids = tuple(
+            before.id
+            for before, after in zip(track.cues, reviewed.cues, strict=True)
+            if before.translated_text != after.translated_text
+        )
         return (
             ProducedArtifact(
                 "reviewed-subtitle-track-json",
@@ -659,7 +687,19 @@ class ReviewStage:
                 "review-report-json",
                 "application/json",
                 "review-report.json",
-                data=encode_json(review_report(track, anomalies, terminology)),
+                data=encode_json(
+                    review_report(
+                        track,
+                        anomalies,
+                        terminology,
+                        output_track_id=reviewed.id,
+                        target_language=target_language,
+                        changed_cue_ids=changed_cue_ids,
+                        llm_called=bool(anomalies),
+                        validated=True,
+                        prompt=self.prompt,
+                    )
+                ),
             ),
         )
 
@@ -830,14 +870,65 @@ def _canonical_word_text(value: str) -> str:
     return normalize_text(value)
 
 
-def _prompt_with_context(prompt: PromptIdentity, context: object) -> PromptIdentity:
-    context_bytes = encode_json(context)
-    content = f"{prompt.content}\n\nContext:\n{context_bytes.decode('utf-8')}"
-    return PromptIdentity(
-        prompt.prompt_id,
-        prompt.prompt_version,
-        hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        content,
+def _terminology_context(terminology: Terminology, word_ids: set[str]) -> Mapping[str, JsonValue]:
+    entries = terminology.entries
+    values = [
+        {"source_term": entry.source, "target_term": entry.target}
+        for entry in entries
+        if set(entry.source_word_ids) & word_ids
+    ]
+    return cast(Mapping[str, JsonValue], {"terminology": values})
+
+
+def _terminology_context_for_cues(
+    terminology: Terminology,
+    cue_ids: set[str],
+    track: SubtitleTrack,
+) -> Mapping[str, JsonValue]:
+    cue_words = {
+        word_id for cue in track.cues if cue.id in cue_ids for word_id in cue.source_word_ids
+    }
+    return _terminology_context(terminology, cue_words)
+
+
+def _review_context(
+    anomalies: tuple[SubtitleAnomaly, ...],
+    terminology: Terminology | None,
+    track: SubtitleTrack,
+    chunk: LLMChunk,
+) -> Mapping[str, JsonValue]:
+    core_ids = {item.id for item in chunk.items}
+    context_ids = {item.id for item in chunk.context}
+    reasons = [
+        {"cue_id": anomaly.cue_id, "reasons": list(anomaly.reasons)}
+        for anomaly in anomalies
+        if anomaly.cue_id in core_ids
+    ]
+    nearby = [
+        {
+            "cue_id": cue.id,
+            "source_text": cue.source_text,
+            "translated_text": cue.translated_text,
+        }
+        for cue in track.cues
+        if cue.id in context_ids
+    ]
+    cue_words = {
+        word_id
+        for cue in track.cues
+        if cue.id in core_ids | context_ids
+        for word_id in cue.source_word_ids
+    }
+    terms = []
+    if terminology is not None:
+        terms = [
+            {"source_term": entry.source, "target_term": entry.target}
+            for entry in terminology.entries
+            if set(entry.source_word_ids) & cue_words
+        ]
+    return cast(
+        Mapping[str, JsonValue],
+        {"anomalies": reasons, "nearby_cues": nearby, "terminology": terms},
     )
 
 
@@ -981,6 +1072,7 @@ def _translation_execution_config(
     target_language: str,
     prompt: PromptIdentity,
     chunking: ChunkingConfig,
+    repair_prompt: PromptIdentity | None = None,
 ) -> LLMChunkExecutionConfig:
     return _stage_execution_config(
         llm,
@@ -990,6 +1082,7 @@ def _translation_execution_config(
         prompt,
         chunking,
         "fast",
+        repair_prompt,
     )
 
 
@@ -1001,6 +1094,8 @@ def _stage_execution_config(
     prompt: PromptIdentity,
     chunking: ChunkingConfig,
     profile: str,
+    repair_prompt: PromptIdentity | None = None,
+    context_payload_factory: Callable[[LLMChunk], Mapping[str, JsonValue]] | None = None,
 ) -> LLMChunkExecutionConfig:
     values = {} if llm is None else dict(llm)
     provider_kind = _snapshot_string(values, "kind", "openai-compatible")
@@ -1029,6 +1124,11 @@ def _stage_execution_config(
         prompt_content=prompt.content,
         chunking=chunking,
         response_schema_version=schema_version,
+        repair_prompt_id="" if repair_prompt is None else repair_prompt.prompt_id,
+        repair_prompt_version="" if repair_prompt is None else repair_prompt.prompt_version,
+        repair_prompt_content_sha256="" if repair_prompt is None else repair_prompt.content_sha256,
+        repair_prompt_content="" if repair_prompt is None else repair_prompt.content,
+        context_payload_factory=context_payload_factory,
     )
 
 

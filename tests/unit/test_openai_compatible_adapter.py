@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
-from collections.abc import Mapping
+import math
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
+from typing import cast
 
 import pytest
 
@@ -11,6 +14,7 @@ from captioner.adapters.llm.http_transport import (
     HTTPResponse,
     HTTPTimeout,
     HTTPTransportError,
+    HttpxTransport,
 )
 from captioner.adapters.llm.openai_compatible import OpenAICompatibleClient
 from captioner.core.domain.errors import AppError
@@ -33,10 +37,14 @@ def _provider(*, max_concurrency: int = 2) -> OpenAICompatibleProvider:
 
 
 def _request(item_id: str = "item-1") -> LLMRequest:
+    prompt = "Return JSON."
     return LLMRequest(
         "correct_source",
         (LLMItem(item_id, "source text"),),
-        prompt_content="Return JSON.",
+        prompt_id="correct_source",
+        prompt_version="v1",
+        prompt_content_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        prompt_content=prompt,
     )
 
 
@@ -75,6 +83,33 @@ class QueueTransport:
 
     async def close(self) -> None:
         self.closed = True
+
+
+@dataclass
+class HangingTransport:
+    started: bool = False
+    cancelled: bool = False
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        content: bytes,
+        timeout: HTTPTimeout,
+        max_response_bytes: int,
+    ) -> HTTPResponse:
+        del method, url, headers, content, timeout, max_response_bytes
+        self.started = True
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("unreachable")
+
+    async def close(self) -> None:
+        return None
 
 
 def test_success_uses_schema_and_redacts_runtime_credential() -> None:
@@ -126,6 +161,8 @@ def test_network_timeout_and_response_shape_failures_are_structured() -> None:
         (HTTPTransportError("timeout"), "llm.timeout"),
         (HTTPTransportError("network"), "llm.network_error"),
         (HTTPTransportError("response_too_large"), "llm.response_too_large"),
+        (TimeoutError("timeout"), "llm.timeout"),
+        (OSError("network"), "llm.network_error"),
     ):
         transport = QueueTransport([outcome])
         client = OpenAICompatibleClient(_provider(), transport=transport)
@@ -152,6 +189,67 @@ def test_id_mismatch_is_not_retried_by_the_adapter() -> None:
         asyncio.run(
             client.generate_structured(_request(), SourceCorrectionResponse, ExecutionContext())
         )
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        (b"[]", "envelope_object"),
+        (b'{"choices":[]}', "choices"),
+        (b'{"choices":[1]}', "choice"),
+        (b'{"choices":[{"message":1}]}', "message"),
+        (b'{"choices":[{"message":{"content":1}}]}', "content"),
+    ],
+)
+def test_response_envelope_shape_is_strict(body: bytes, reason: str) -> None:
+    client = OpenAICompatibleClient(
+        _provider(),
+        transport=QueueTransport([HTTPResponse(200, {}, body)]),
+    )
+    with pytest.raises(AppError) as raised:
+        asyncio.run(
+            client.generate_structured(_request(), SourceCorrectionResponse, ExecutionContext())
+        )
+    assert raised.value.code == "llm.schema_invalid"
+    assert raised.value.params["reason"] == reason
+
+
+def test_unknown_http_status_is_classified_without_retry() -> None:
+    client = OpenAICompatibleClient(
+        _provider(),
+        transport=QueueTransport([HTTPResponse(418, {}, b"provider body")]),
+    )
+    with pytest.raises(AppError) as raised:
+        asyncio.run(
+            client.generate_structured(_request(), SourceCorrectionResponse, ExecutionContext())
+        )
+    assert raised.value.code == "llm.http_error"
+    assert raised.value.retryable is False
+
+
+def test_cancellation_while_waiting_for_global_semaphore_does_not_leave_a_waiter() -> None:
+    async def run() -> None:
+        semaphore = asyncio.Semaphore(1)
+        await semaphore.acquire()
+        transport = QueueTransport([_response()])
+        client = OpenAICompatibleClient(_provider(), transport=transport, semaphore=semaphore)
+        context = ExecutionContext()
+        task = asyncio.create_task(
+            client.generate_structured(_request(), SourceCorrectionResponse, context)
+        )
+        await asyncio.sleep(0.06)
+        context.cancel()
+        with pytest.raises(AppError, match=r"operation\.cancelled"):
+            await asyncio.wait_for(task, timeout=1)
+        assert transport.calls == []
+        semaphore.release()
+        result = await client.generate_structured(
+            _request(), SourceCorrectionResponse, ExecutionContext()
+        )
+        assert result == SourceCorrectionResponse("item-1", "corrected")
+        await client.close()
+
+    asyncio.run(run())
 
 
 def test_shared_semaphore_limits_active_requests() -> None:
@@ -201,3 +299,98 @@ def test_cancelled_context_never_sends_request() -> None:
     with pytest.raises(AppError, match=r"operation\.cancelled"):
         asyncio.run(client.generate_structured(_request(), SourceCorrectionResponse, context))
     assert transport.calls == []
+
+
+def test_cancel_interrupts_hanging_transport_and_releases_semaphore() -> None:
+    async def run() -> None:
+        context = ExecutionContext()
+        transport = HangingTransport()
+        semaphore = asyncio.Semaphore(1)
+        client = OpenAICompatibleClient(_provider(), transport=transport, semaphore=semaphore)
+        task = asyncio.create_task(
+            client.generate_structured(_request(), SourceCorrectionResponse, context)
+        )
+        for _ in range(100):
+            if transport.started:
+                break
+            await asyncio.sleep(0)
+        assert transport.started
+        context.cancel()
+        with pytest.raises(AppError, match=r"operation\.cancelled"):
+            await asyncio.wait_for(task, timeout=1)
+        assert transport.cancelled
+        assert semaphore._value == 1
+        current = asyncio.current_task()
+        assert all(candidate is current or candidate.done() for candidate in asyncio.all_tasks())
+        await client.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("value", [True, "1", 0, -1, math.nan, math.inf, -math.inf])
+def test_http_timeout_rejects_non_positive_or_non_finite_values(value: object) -> None:
+    with pytest.raises(ValueError):
+        HTTPTimeout(cast(float, value), 1, 1, 1)
+
+
+@dataclass
+class StreamResponse:
+    status_code: int = 200
+    headers: Mapping[str, str] = field(default_factory=lambda: dict[str, str]())
+    chunks: tuple[bytes, ...] = (b"ok",)
+
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            yield chunk
+
+
+class StreamContext:
+    def __init__(self, response: StreamResponse) -> None:
+        self.response = response
+
+    async def __aenter__(self) -> StreamResponse:
+        return self.response
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+
+class FakeHTTPXClient:
+    def __init__(self, outcome: StreamResponse | Exception) -> None:
+        self.outcome = outcome
+        self.closed = False
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        content: bytes,
+        timeout: object,
+    ) -> StreamContext:
+        del method, url, headers, content, timeout
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return StreamContext(self.outcome)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_httpx_transport_bounds_reads_and_closes_injected_client() -> None:
+    raw = FakeHTTPXClient(StreamResponse(headers={"content-type": "text/plain"}))
+    transport = HttpxTransport(timeout=HTTPTimeout.all(1), client=raw)
+    result = asyncio.run(
+        transport.request("POST", "https://provider.example/v1", {}, b"{}", HTTPTimeout.all(1), 10)
+    )
+    assert result.body == b"ok"
+    asyncio.run(transport.close())
+    assert raw.closed is False
+
+    oversized = FakeHTTPXClient(StreamResponse(chunks=(b"too", b"large")))
+    bounded = HttpxTransport(timeout=HTTPTimeout.all(1), client=oversized)
+    with pytest.raises(HTTPTransportError, match="response_too_large"):
+        asyncio.run(
+            bounded.request("POST", "https://provider.example/v1", {}, b"{}", HTTPTimeout.all(1), 4)
+        )

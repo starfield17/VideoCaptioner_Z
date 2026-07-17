@@ -78,7 +78,10 @@ def test_fast_snapshot_is_redacted_and_bootstrap_registers_translate_stage(
         paths=paths,
     )
     assert snapshot["target_language"] == "zh-CN"
-    assert snapshot["prompt_id"] == "translate_fast"
+    prompts = snapshot["prompts"]
+    assert isinstance(prompts, Mapping)
+    assert set(prompts) == {"translate_fast", "repair_structured"}
+    assert "prompt_id" not in snapshot
     assert "api_key" not in repr(snapshot)
 
     runtime = build_llm_runtime(paths=paths, transport=NoopTransport())
@@ -143,6 +146,7 @@ def test_quality_profile_registers_correction_translation_and_review_stages(
             "correct_source",
             "translate_quality",
             "review_anomalies",
+            "repair_structured",
         }
         assert "api_key" not in repr(snapshot)
     finally:

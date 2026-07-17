@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -41,7 +40,6 @@ def _service(
     delays: list[float],
     *,
     max_retries: int = 5,
-    repair_request_factory: Callable[[LLMRequest], LLMRequest] | None = None,
 ) -> StructuredLLMService:
     async def sleep(delay: float) -> None:
         delays.append(delay)
@@ -50,7 +48,6 @@ def _service(
         client,
         max_retries=max_retries,
         sleep=sleep,
-        repair_request_factory=repair_request_factory,
     )
 
 
@@ -87,43 +84,17 @@ def test_permanent_failure_and_id_mismatch_are_not_retried() -> None:
         assert len(client.calls) == 1
 
 
-def test_schema_failure_gets_exactly_one_repair_request() -> None:
-    client = ScriptedClient(
-        [
-            AppError("llm.schema_invalid"),
-            SourceCorrectionResponse("item-1", "corrected"),
-        ]
-    )
+def test_schema_failure_belongs_to_chunk_executor_not_transport_service() -> None:
+    client = ScriptedClient([AppError("llm.schema_invalid")])
     delays: list[float] = []
-    result = asyncio.run(
-        _service(client, delays).generate_structured(
-            _request(), SourceCorrectionResponse, ExecutionContext()
-        )
-    )
-    assert result == SourceCorrectionResponse("item-1", "corrected")
-    assert [call.task_kind for call in client.calls] == ["correct_source", "repair_structured"]
-    assert delays == []
-
-    failing = ScriptedClient([AppError("llm.schema_invalid"), AppError("llm.schema_invalid")])
     with pytest.raises(AppError, match=r"llm\.schema_invalid"):
         asyncio.run(
-            _service(failing, []).generate_structured(
+            _service(client, delays).generate_structured(
                 _request(), SourceCorrectionResponse, ExecutionContext()
             )
         )
-    assert len(failing.calls) == 2
-
-    already_repairing = ScriptedClient([AppError("llm.schema_invalid")])
-    repair_request = LLMRequest("repair_structured", _request().items)
-    with pytest.raises(AppError, match=r"llm\.schema_invalid"):
-        asyncio.run(
-            _service(already_repairing, []).generate_structured(
-                repair_request,
-                SourceCorrectionResponse,
-                ExecutionContext(),
-            )
-        )
-    assert len(already_repairing.calls) == 1
+    assert [call.task_kind for call in client.calls] == ["correct_source"]
+    assert delays == []
 
 
 def test_cancellation_after_backoff_is_not_retried() -> None:

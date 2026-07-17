@@ -21,5 +21,9 @@ class LLMCachePort(Protocol):
         """Atomically store a response that the application fully validated."""
         ...
 
+    def remove(self, key: LLMCacheKey) -> None:
+        """Delete an entry that failed the complete validator."""
+        ...
+
 
 LLMCache = LLMCachePort

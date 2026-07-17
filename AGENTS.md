@@ -39,6 +39,26 @@ This file is the repository-local contract for humans and coding agents.
 - Coding agents must not lower strictness, coverage, or lint standards to make CI pass.
 - Coding agents must not automatically batch-update golden files.
 - Every patch must report the tests run and known limitations.
+- LLM responses can never change timestamps, Cue boundaries, Cue IDs, or source
+  Word mapping; application code copies those values from the source Track.
+- API keys are plaintext runtime credentials in the OS config directory. Only
+  the credential may rotate on Resume; public provider snapshot drift fails
+  before client creation and never enters durable Job data.
+- Every LLM Stage and Job uses the one provider client and one Semaphore made by
+  the composition root; no Stage or Chunk planner owns another concurrency gate.
+- Complete serialized requests, including system Prompt, user envelope,
+  dynamic context, and response schema, must fit the configured token budget.
+- Terminology is sparse: an input unit may return an empty `terms` list;
+  application code resolves source Word IDs with token-boundary matching.
+- Structured repair has one owner (`LLMChunkExecutor`) and one repair per
+  logical Chunk; transport retries do not consume that repair budget.
+- In-flight HTTP requests must be cancellable, and cancellation is never
+  retried or cached.
+- Cache identity is derived from the final actual `LLMRequest`, including
+  dynamic context and repair Prompt identity; invalid validated entries are
+  removed before re-request.
+- Prompt content changes require a version bump. Unit, contract, recovery, and
+  default integration tests never use real credentials or external providers.
 
 Phase 4 has profile-specific sequential plans. Deterministic keeps the original
 six Stages; Fast adds Translate; Quality adds CorrectSource, Translate, and

@@ -5,7 +5,6 @@ from __future__ import annotations
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from typing import Protocol, cast
 
 from captioner.core.domain.errors import AppError
@@ -15,18 +14,18 @@ from captioner.core.domain.llm import (
     ReviewResponse,
     SourceCorrectionResponse,
     TerminologyResponse,
+    TerminologyTerm,
     response_schema_for,
 )
 from captioner.core.domain.result import JsonValue
-from captioner.core.policies.protected_spans import find_protected_spans
+from captioner.core.policies.protected_spans import (
+    ProtectedToken,
+    protected_tokens,
+    protected_tokens_preserved,
+)
 from captioner.core.policies.unicode_metrics import normalize_text
 
-
-@dataclass(frozen=True, slots=True)
-class ProtectedNumericToken:
-    text: str
-    digits: str
-    percent: bool
+ProtectedNumericToken = ProtectedToken
 
 
 def validate_responses(
@@ -124,12 +123,7 @@ def response_schema_has_no_timestamps(response_schema: type[object]) -> bool:
 
 
 def protected_numeric_tokens(text: str) -> tuple[ProtectedNumericToken, ...]:
-    tokens: list[ProtectedNumericToken] = []
-    for span in find_protected_spans(text):
-        digits = "".join(character for character in span.text if character.isdigit())
-        if digits:
-            tokens.append(ProtectedNumericToken(span.text, digits, "%" in span.text))
-    return tuple(tokens)
+    return protected_tokens(text)
 
 
 def script_heuristic(text: str) -> str:
@@ -196,8 +190,25 @@ def _response_texts(response: object) -> tuple[str, ...]:
             "translated_text",
             "source_term",
             "target_term",
+            "terms",
         }:
             raise AppError("llm.response_invalid", {"reason": "fields"})
+        if "terms" in raw:
+            terms = raw.get("terms")
+            if not isinstance(terms, Sequence) or isinstance(terms, (str, bytes, bytearray)):
+                raise AppError("llm.response_invalid", {"reason": "terms"})
+            values = tuple(
+                value
+                for term in cast(Sequence[object], terms)
+                if isinstance(term, Mapping)
+                for value in (
+                    cast(Mapping[str, object], term).get("source_term"),
+                    cast(Mapping[str, object], term).get("target_term"),
+                )
+            )
+            if any(not isinstance(value, str) for value in values):
+                raise AppError("llm.response_invalid", {"reason": "terms"})
+            return tuple(cast(str, value) for value in values)
         values: tuple[object, ...] = tuple(value for key, value in raw.items() if key != "id")
     else:
         if isinstance(
@@ -210,12 +221,20 @@ def _response_texts(response: object) -> tuple[str, ...]:
                 ReviewResponse,
             ),
         ):
+            if isinstance(response, TerminologyResponse):
+                return tuple(
+                    value
+                    for term in response.terms
+                    for value in (term.source_term, term.target_term)
+                )
             fields = response.text_fields
         else:
             fields = tuple(
                 name for name in ("corrected_source", "translated_text") if hasattr(response, name)
             )
         values = tuple(getattr(response, field) for field in fields)
+    if not values and isinstance(response, TerminologyResponse):
+        return ()
     if not values or any(not isinstance(value, str) for value in values):
         raise AppError("llm.response_invalid", {"reason": "text"})
     return tuple(cast(str, value) for value in values)
@@ -239,6 +258,15 @@ def _protected_output_texts(response: object) -> tuple[str, ...]:
         if isinstance(corrected, str):
             return (corrected,)
         source_term = raw.get("source_term")
+        terms = raw.get("terms")
+        if isinstance(terms, Sequence) and not isinstance(terms, (str, bytes, bytearray)):
+            return tuple(
+                value
+                for term in cast(Sequence[object], terms)
+                if isinstance(term, Mapping)
+                for value in (cast(Mapping[str, object], term).get("target_term"),)
+                if isinstance(value, str)
+            )
         return (source_term,) if isinstance(source_term, str) else ()
     translated = getattr(response, "translated_text", None)
     if isinstance(translated, str):
@@ -247,7 +275,16 @@ def _protected_output_texts(response: object) -> tuple[str, ...]:
     if isinstance(corrected, str):
         return (corrected,)
     source_term = getattr(response, "source_term", None)
-    return (source_term,) if isinstance(source_term, str) else ()
+    if isinstance(source_term, str) and source_term:
+        return (source_term,)
+    terms = getattr(response, "terms", ())
+    if isinstance(terms, Sequence):
+        return tuple(
+            term.target_term
+            for term in cast(Sequence[object], terms)
+            if isinstance(term, TerminologyTerm)
+        )
+    return ()
 
 
 def _validate_text(text: str) -> None:
@@ -262,16 +299,12 @@ def _validate_text(text: str) -> None:
 
 
 def _validate_protected_numbers(source: str, output: str) -> None:
-    source_tokens = protected_numeric_tokens(source)
-    output_digits = "".join(character for character in output if character.isdigit())
-    cursor = 0
-    for token in source_tokens:
-        position = output_digits.find(token.digits, cursor)
-        if position < 0:
-            raise AppError("llm.protected_token_lost", {"token": token.text})
-        if token.percent and "%" not in output:
-            raise AppError("llm.protected_token_lost", {"token": token.text})
-        cursor = position + len(token.digits)
+    if not protected_tokens_preserved(source, output):
+        token = next(iter(protected_numeric_tokens(source)), None)
+        raise AppError(
+            "llm.protected_token_lost",
+            {"token": "protected" if token is None else token.text},
+        )
 
 
 def _contains_forbidden_key(value: object) -> bool:

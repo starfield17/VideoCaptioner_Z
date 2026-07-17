@@ -10,8 +10,19 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import cast
 
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.result import FrozenJsonValue, JsonValue, freeze_json_value
-from captioner.core.domain.stage import PipelineProfile, StageName, StageProjection, stage_plan_for
+from captioner.core.domain.llm_job_config import LLMJobSnapshot
+from captioner.core.domain.result import (
+    FrozenJsonValue,
+    JsonValue,
+    freeze_json_value,
+    thaw_json_value,
+)
+from captioner.core.domain.stage import (
+    PipelineProfile,
+    StageName,
+    StageProjection,
+    stage_plan_for,
+)
 
 JOB_CONFIG_SCHEMA_VERSION = 2
 LEGACY_JOB_CONFIG_SCHEMA_VERSION = 1
@@ -62,7 +73,10 @@ class JobConfig:
     llm: Mapping[str, FrozenJsonValue] | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {LEGACY_JOB_CONFIG_SCHEMA_VERSION, JOB_CONFIG_SCHEMA_VERSION}:
+        if type(self.schema_version) is not int or self.schema_version not in {
+            LEGACY_JOB_CONFIG_SCHEMA_VERSION,
+            JOB_CONFIG_SCHEMA_VERSION,
+        }:
             raise AppError("job.config_invalid", {"field": "schema_version"})
         try:
             profile = PipelineProfile(self.pipeline_profile)
@@ -82,15 +96,38 @@ class JobConfig:
             raise AppError("job.config_invalid", {"field": "executables"})
         if not Path(self.output_dir).is_absolute():
             raise AppError("job.config_invalid", {"field": "output_dir"})
+        expected_stage_names = {stage.value for stage in stage_plan_for(profile)}
+        if set(self.stage_versions) != expected_stage_names:
+            raise AppError("job.config_invalid", {"field": "stage_versions"})
+        if any(
+            not isinstance(version, str) or not version.strip()
+            for version in self.stage_versions.values()
+        ):
+            raise AppError("job.config_invalid", {"field": "stage_versions"})
         for name in ("normalization", "segmentation", "stage_versions"):
-            frozen = freeze_json_value(getattr(self, name))
+            try:
+                frozen = freeze_json_value(getattr(self, name))
+            except (TypeError, ValueError) as exc:
+                raise AppError("job.config_invalid", {"field": name}) from exc
             object.__setattr__(self, name, cast(Mapping[str, FrozenJsonValue], frozen))
+        if profile is PipelineProfile.DETERMINISTIC and self.llm is not None:
+            raise AppError("job.config_invalid", {"field": "llm"})
+        if profile is not PipelineProfile.DETERMINISTIC and self.llm is None:
+            raise AppError("job.config_invalid", {"field": "llm"})
         if self.llm is not None:
-            frozen_llm = freeze_json_value(self.llm)
+            try:
+                frozen_llm = freeze_json_value(self.llm)
+            except (TypeError, ValueError) as exc:
+                raise AppError("job.config_invalid", {"field": "llm"}) from exc
             if not isinstance(frozen_llm, Mapping):
                 raise AppError("job.config_invalid", {"field": "llm"})
             if _contains_secret_key(frozen_llm):
                 raise AppError("job.config_invalid", {"field": "llm"})
+            if profile is not PipelineProfile.DETERMINISTIC:
+                snapshot = LLMJobSnapshot.from_mapping(thaw_json_value(frozen_llm))
+                if snapshot.profile is not profile:
+                    raise AppError("job.config_invalid", {"field": "llm.profile"})
+                frozen_llm = snapshot.to_mapping()
             object.__setattr__(
                 self,
                 "llm",
@@ -194,7 +231,8 @@ def _hashable_json(value: FrozenJsonValue) -> object:
 def _contains_secret_key(value: FrozenJsonValue) -> bool:
     if isinstance(value, Mapping):
         return any(
-            key.lower().replace("-", "_") in {"api_key", "authorization", "access_token"}
+            key.lower().replace("-", "_")
+            in {"api_key", "authorization", "access_token", "token", "secret", "password"}
             or _contains_secret_key(item)
             for key, item in value.items()
         )

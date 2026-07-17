@@ -1,4 +1,4 @@
-"""Durable Phase 2/3 Batch CLI command boundaries."""
+"""Profile-aware durable Batch CLI command boundaries."""
 
 from __future__ import annotations
 
@@ -25,8 +25,14 @@ from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobState, validate_identifier
 from captioner.core.domain.journal import replay
+from captioner.core.domain.llm_job_config import LLMJobSnapshot
 from captioner.core.domain.result import FrozenJsonValue, freeze_json_value, thaw_json_value
-from captioner.core.domain.stage import PipelineProfile, StageName, stage_plan_for
+from captioner.core.domain.stage import (
+    PipelineProfile,
+    StageName,
+    stage_plan_for,
+    stage_versions_for,
+)
 from captioner.infrastructure.app_paths import AppPaths, resolve_safe_child
 from captioner.infrastructure.ids import new_id
 
@@ -137,8 +143,7 @@ def resume(
             overrides = replace(overrides, output_dir=output_dir)
         projection = _read_projection(batch_id, paths=paths, repair=True)
         config = _common_config(projection)
-        selected = config if overrides is None else _apply_overrides(config, overrides)
-        selected = _ensure_llm_snapshot(selected, overrides, paths)
+        selected = config if overrides is None else _apply_overrides(config, overrides, paths)
         bundle = _bundle(batch_id, selected, paths)
         if selected != config:
             earliest = min(
@@ -393,8 +398,17 @@ def _read_projection(batch_id: str, *, paths: AppPaths, repair: bool) -> BatchPr
     return replay(events)
 
 
-def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig:
-    llm = _override_llm(config, overrides)
+def _apply_overrides(
+    config: JobConfig,
+    overrides: ResumeOverrides,
+    paths: AppPaths | None = None,
+) -> JobConfig:
+    selected_profile = (
+        config.pipeline_profile
+        if overrides.pipeline_profile is None
+        else PipelineProfile(overrides.pipeline_profile)
+    )
+    llm = _llm_for_resume(config, overrides, selected_profile, paths)
     if overrides.model_ref is not None:
         candidate = create_job_config(
             model_ref=overrides.model_ref,
@@ -407,9 +421,7 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
             if overrides.output_dir is None
             else overrides.output_dir,
             overwrite=config.overwrite,
-            pipeline_profile=config.pipeline_profile
-            if overrides.pipeline_profile is None
-            else PipelineProfile(overrides.pipeline_profile),
+            pipeline_profile=selected_profile,
             llm=llm,
         )
         return replace(
@@ -419,7 +431,7 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
             ffprobe_bin=config.ffprobe_bin,
             normalization=config.normalization,
             segmentation=config.segmentation,
-            stage_versions=config.stage_versions,
+            stage_versions=stage_versions_for(selected_profile),
             pipeline_profile=candidate.pipeline_profile,
             llm=candidate.llm,
         )
@@ -431,70 +443,46 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
         output_dir=config.output_dir
         if overrides.output_dir is None
         else str(overrides.output_dir.resolve()),
-        pipeline_profile=config.pipeline_profile
-        if overrides.pipeline_profile is None
-        else PipelineProfile(overrides.pipeline_profile),
+        pipeline_profile=selected_profile,
+        stage_versions=stage_versions_for(selected_profile),
         llm=llm,
     )
 
 
-def _override_llm(
-    config: JobConfig, overrides: ResumeOverrides
+def _llm_for_resume(
+    config: JobConfig,
+    overrides: ResumeOverrides,
+    selected_profile: PipelineProfile,
+    paths: AppPaths | None,
 ) -> Mapping[str, FrozenJsonValue] | None:
     if overrides.llm is not None:
         return _frozen_llm(overrides.llm)
-    if overrides.target_language is None and overrides.llm_provider_profile is None:
-        return config.llm
-    values: dict[str, object] = {}
-    if config.llm is not None:
-        thawed = thaw_json_value(config.llm)
-        if not isinstance(thawed, Mapping):
-            raise AppError("job.config_invalid", {"field": "llm"})
-        values.update(thawed)
-    if overrides.target_language is not None:
-        values["target_language"] = overrides.target_language
-    if overrides.llm_provider_profile is not None:
-        values["provider_profile"] = overrides.llm_provider_profile
-    return _frozen_llm(values)
-
-
-def _ensure_llm_snapshot(
-    config: JobConfig,
-    overrides: ResumeOverrides | None,
-    paths: AppPaths,
-) -> JobConfig:
-    if config.pipeline_profile not in {PipelineProfile.FAST, PipelineProfile.QUALITY}:
-        return config
-    target_language = config.target_language
+    if selected_profile is PipelineProfile.DETERMINISTIC:
+        return None
+    target_language = overrides.target_language or config.target_language
     if target_language is None:
         raise AppError("llm.target_language_missing")
-    provider_profile = (
-        overrides.llm_provider_profile
-        if overrides is not None and overrides.llm_provider_profile is not None
-        else config.provider_profile or "default"
+    provider_profile = overrides.llm_provider_profile or config.provider_profile or "default"
+    profile_changed = selected_profile is not config.pipeline_profile
+    identity_changed = (
+        overrides.target_language is not None
+        or overrides.llm_provider_profile is not None
+        or profile_changed
     )
-    required = {"base_url", "model", "provider_profile"}
-    if config.pipeline_profile is PipelineProfile.QUALITY:
-        required.add("prompts")
-    if (
-        config.llm is not None
-        and required.issubset(config.llm)
-        and not (
-            overrides is not None
-            and (
-                overrides.target_language is not None or overrides.llm_provider_profile is not None
-            )
-        )
-    ):
-        return config
+    if not identity_changed:
+        if config.llm is None:
+            raise AppError("llm.config_missing", {"reason": "job_snapshot"})
+        return config.llm
+    if paths is None:
+        raise AppError("llm.config_missing", {"reason": "paths"})
     snapshot = create_llm_job_snapshot(
         target_language=target_language,
         provider_profile=provider_profile,
         source_language=config.language,
         paths=paths,
-        pipeline_profile=config.pipeline_profile,
+        pipeline_profile=selected_profile,
     )
-    return replace(config, llm=snapshot)
+    return snapshot
 
 
 async def _run_and_close(
@@ -542,16 +530,15 @@ def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:
         else:
             candidates.append(StageName.SEGMENT)
     if old.llm != new.llm:
-        old_llm: Mapping[str, FrozenJsonValue] = {} if old.llm is None else old.llm
-        new_llm: Mapping[str, FrozenJsonValue] = {} if new.llm is None else new.llm
-        candidates.extend(_changed_llm_stages(old_llm, new_llm, plan))
+        candidates.extend(_changed_llm_stages(old, new, plan))
     if old.stage_versions != new.stage_versions:
         for stage in plan:
             if old.stage_versions.get(stage.value) != new.stage_versions.get(stage.value):
                 candidates.append(stage)
                 break
         else:
-            raise AppError("batch.config_inconsistent", {"reason": "stage_versions"})
+            if old.pipeline_profile is new.pipeline_profile:
+                raise AppError("batch.config_inconsistent", {"reason": "stage_versions"})
     if old.output_dir != new.output_dir or old.overwrite != new.overwrite:
         candidates.append(StageName.PUBLISH)
     if candidates:
@@ -578,18 +565,14 @@ def _available_stage(
 
 
 def _changed_prompt_stages(
-    old_llm: Mapping[str, FrozenJsonValue],
-    new_llm: Mapping[str, FrozenJsonValue],
+    old_snapshot: LLMJobSnapshot,
+    new_snapshot: LLMJobSnapshot,
     plan: tuple[StageName, ...],
 ) -> tuple[StageName, ...]:
-    old_prompts = old_llm.get("prompts")
-    new_prompts = new_llm.get("prompts")
-    if not isinstance(old_prompts, Mapping) or not isinstance(new_prompts, Mapping):
-        return (_available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE),)
     changed_ids = {
         prompt_id
-        for prompt_id in set(old_prompts) | set(new_prompts)
-        if old_prompts.get(prompt_id) != new_prompts.get(prompt_id)
+        for prompt_id in set(old_snapshot.prompts) | set(new_snapshot.prompts)
+        if old_snapshot.prompts.get(prompt_id) != new_snapshot.prompts.get(prompt_id)
     }
     stages: list[StageName] = []
     if changed_ids & {"terminology", "correct_source"}:
@@ -615,41 +598,34 @@ def _changed_prompt_stages(
 
 
 def _changed_llm_stages(
-    old_llm: Mapping[str, FrozenJsonValue],
-    new_llm: Mapping[str, FrozenJsonValue],
+    old: JobConfig,
+    new: JobConfig,
     plan: tuple[StageName, ...],
 ) -> tuple[StageName, ...]:
-    changed = {key for key in set(old_llm) | set(new_llm) if old_llm.get(key) != new_llm.get(key)}
+    if old.llm is None or new.llm is None:
+        return ()
+    old_snapshot = LLMJobSnapshot.from_mapping(thaw_json_value(old.llm))
+    new_snapshot = LLMJobSnapshot.from_mapping(thaw_json_value(new.llm))
     stages: list[StageName] = []
-    if changed & {
-        "provider_profile",
-        "base_url",
-        "model",
-        "temperature",
-        "timeout_sec",
-        "max_retries",
-        "max_concurrency",
-        "chunk",
-        "correction",
-        "correct_source",
-        "terminology",
-        "prompt",
-        "prompt_id",
-        "prompt_version",
-        "prompt_content_sha256",
-    }:
+    if old_snapshot.provider != new_snapshot.provider:
         stages.append(
             _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
         )
-    if changed & {"target_language", "translation", "translate", "translation_prompt"}:
+    if old_snapshot.source_language != new_snapshot.source_language:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    if old_snapshot.target_language != new_snapshot.target_language:
         stages.append(_available_stage(StageName.TRANSLATE, plan))
-    if (
-        changed & {"review", "review_prompt_id", "review_prompt_version"}
-        and StageName.REVIEW in plan
-    ):
-        stages.append(StageName.REVIEW)
-    if "prompts" in changed:
-        stages.extend(_changed_prompt_stages(old_llm, new_llm, plan))
+    if old_snapshot.chunk != new_snapshot.chunk:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    if old_snapshot.response_schema_version != new_snapshot.response_schema_version:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    stages.extend(_changed_prompt_stages(old_snapshot, new_snapshot, plan))
     return tuple(stages)
 
 

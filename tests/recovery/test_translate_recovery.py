@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from tests.support import llm_snapshot
 
 from captioner.adapters.llm.scripted import ScriptedLLMAdapter
 from captioner.adapters.persistence.content_addressed_artifact_store import (
@@ -101,18 +102,16 @@ def _fixture(
         False,
         {stage.value: "1" for stage in stage_plan_for(profile)},
         pipeline_profile=profile,
-        llm={
-            "provider_profile": "default",
-            "base_url": "https://provider.example/v1",
-            "model": "unit-test-model",
-            "target_language": "zh-CN",
-            "chunk": {
+        llm=llm_snapshot(
+            profile,
+            chunk={
                 "max_items": 1,
                 "max_input_tokens": 4096,
                 "context_before_items": 0,
                 "context_after_items": 0,
+                "max_audio_context_duration_ms": None,
             },
-        },
+        ),
     )
     return store, job_config, (transcript_ref, track_ref)
 

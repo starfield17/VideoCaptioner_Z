@@ -11,6 +11,7 @@ from captioner.core.policies.llm_validation import (
     protected_numeric_tokens,
     validate_responses,
 )
+from captioner.core.policies.protected_spans import protected_tokens_preserved
 
 
 @given(st.text(alphabet=st.characters(blacklist_categories=("Cs",)), min_size=1, max_size=30))
@@ -58,3 +59,32 @@ def test_script_heuristic_and_protected_token_extraction_are_deterministic() -> 
     assert is_obvious_wrong_language("hello", "zh-CN")
     assert not is_obvious_wrong_language("你好", "zh-CN")
     assert protected_numeric_tokens("USD 12.50 and 20%")
+
+
+@pytest.mark.parametrize(
+    ("source", "output", "preserved"),
+    [
+        ("-5", "5", False),
+        ("-5", "-5", True),
+        ("12.30", "1230", False),
+        ("12.30", "12,3", True),
+        ("$100", "100", False),
+        ("$100", "$100", True),
+        ("-$100", "$100", False),
+        ("-$100", "-$100", True),
+        ("10 kg", "10", False),
+        ("10 kg", "10 kg", True),
+        ("1,000", "1000", True),
+        ("10%", "10", False),
+        ("10%", "10 %", True),
+        ("2024-01-02", "2024/1/2", True),
+        ("2024-01-02", "2024/1/3", False),
+        ("١٢\u066b٣", "12.3", True),
+        ("5 and -2.5", "5 -2.5", True),
+        ("5 and -2.5", "-2.5 5", False),
+    ],
+)
+def test_protected_spans_preserve_numeric_semantics(
+    source: str, output: str, preserved: bool
+) -> None:
+    assert protected_tokens_preserved(source, output) is preserved

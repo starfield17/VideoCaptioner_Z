@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from captioner.core.domain.errors import AppError
+from captioner.core.domain.llm import LLMRequest
 from captioner.core.domain.subtitle import SubtitleTrack
-from captioner.core.domain.terminology import Terminology, normalize_term
+from captioner.core.domain.terminology import Terminology, contains_term
 from captioner.core.domain.transcript import Transcript
 from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, ChunkPlanner, LLMChunk
 from captioner.core.policies.llm_validation import (
     is_obvious_wrong_language,
-    protected_numeric_tokens,
 )
+from captioner.core.policies.protected_spans import protected_tokens_preserved
 from captioner.core.policies.reading_speed import reading_speed
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.unicode_metrics import join_token_texts, measure_text, normalize_text
-from captioner.core.ports.token_counter import TokenCounter
+from captioner.core.ports.token_counter import LLMRequestEstimator, TokenCounter
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,10 @@ class AnomalyChunkPlanner:
         self._token_counter = token_counter
         self._all_items = tuple(all_items)
         self._positions = {item.id: index for index, item in enumerate(self._all_items)}
+
+    @property
+    def token_counter(self) -> TokenCounter:
+        return self._token_counter
 
     def plan(
         self,
@@ -65,27 +70,93 @@ class AnomalyChunkPlanner:
         )
         return self._with_context(chunk, selected)
 
-    def _with_context(self, chunk: LLMChunk, config: ChunkingConfig) -> LLMChunk:
+    def plan_for_request(
+        self,
+        items: Sequence[ChunkItem],
+        config: ChunkingConfig,
+        request_factory: Callable[[LLMChunk], LLMRequest],
+        response_schema: type[object],
+        estimator: LLMRequestEstimator,
+    ) -> tuple[LLMChunk, ...]:
+        core_config = replace(config, context_before_items=0, context_after_items=0)
+        core_planner = ChunkPlanner(self._token_counter, core_config)
+        core_chunks = core_planner.plan_for_request(
+            items,
+            core_config,
+            lambda chunk: request_factory(
+                self._with_context(chunk, config, request_factory, response_schema, estimator)
+            ),
+            response_schema,
+            estimator,
+        )
+        return tuple(
+            self._with_context(chunk, config, request_factory, response_schema, estimator)
+            for chunk in core_chunks
+        )
+
+    def plan_range_for_request(
+        self,
+        items: Sequence[ChunkItem],
+        core_start: int,
+        core_end: int,
+        config: ChunkingConfig,
+        request_factory: Callable[[LLMChunk], LLMRequest],
+        response_schema: type[object],
+        estimator: LLMRequestEstimator,
+        index: int = 0,
+    ) -> LLMChunk:
+        core_config = replace(config, context_before_items=0, context_after_items=0)
+        core_planner = ChunkPlanner(self._token_counter, core_config)
+        core_chunk = core_planner.plan_range_for_request(
+            items,
+            core_start,
+            core_end,
+            core_config,
+            lambda chunk: request_factory(
+                self._with_context(chunk, config, request_factory, response_schema, estimator)
+            ),
+            response_schema,
+            estimator,
+            index,
+        )
+        return self._with_context(core_chunk, config, request_factory, response_schema, estimator)
+
+    def _with_context(
+        self,
+        chunk: LLMChunk,
+        config: ChunkingConfig,
+        request_factory: Callable[[LLMChunk], LLMRequest] | None = None,
+        response_schema: type[object] | None = None,
+        estimator: LLMRequestEstimator | None = None,
+    ) -> LLMChunk:
         positions = [self._positions[item.id] for item in chunk.items]
         first = min(positions)
         last = max(positions) + 1
         before = list(self._all_items[max(0, first - config.context_before_items) : first])
         after = list(self._all_items[last : last + config.context_after_items])
         core_tokens = sum(self._token_counter.count(item.text) for item in chunk.items)
-        while before or after:
+        while True:
             context = tuple(before + after)
             total_tokens = core_tokens + sum(
                 self._token_counter.count(item.text) for item in context
             )
-            if total_tokens <= config.max_input_tokens and self._within_audio_budget(
+            complete_tokens = total_tokens
+            if request_factory is not None:
+                if response_schema is None or estimator is None:
+                    raise AppError("llm.chunk_config_invalid", {"reason": "request_budget"})
+                complete_tokens = estimator.estimate_input_tokens(
+                    request_factory(LLMChunk(chunk.index, chunk.items, context)), response_schema
+                )
+            if complete_tokens <= config.max_input_tokens and self._within_audio_budget(
                 chunk.items, context, config
             ):
                 return LLMChunk(chunk.index, chunk.items, context)
+            if not before and not after:
+                raise AppError("llm.item_too_large", {"item_id": chunk.items[0].id})
             if before:
                 before.pop(0)
             else:
                 after.pop()
-        return LLMChunk(chunk.index, chunk.items, ())
 
     @staticmethod
     def _within_audio_budget(
@@ -123,7 +194,7 @@ def detect_anomalies(
             original_source = join_token_texts(
                 words[word_id].text for word_id in cue.source_word_ids if word_id in words
             )
-            if not _protected_numbers_preserved(original_source or cue.source_text, translated):
+            if not protected_tokens_preserved(original_source or cue.source_text, translated):
                 reasons.append("protected_token_loss")
             try:
                 if normalize_text(translated) != translated:
@@ -152,27 +223,14 @@ def detect_anomalies(
 
 
 def _terminology_inconsistent(source: str, translated: str, terminology: Sequence[object]) -> bool:
-    source_normalized = normalize_term(source)
-    target_normalized = normalize_term(translated)
     for entry in terminology:
-        entry_source = getattr(entry, "normalized_source", "")
+        entry_source = getattr(entry, "source", "")
         entry_target = getattr(entry, "target", "")
         if (
             entry_source
-            and entry_source in source_normalized
+            and contains_term(source, entry_source)
             and entry_target
-            and normalize_term(entry_target) not in target_normalized
+            and not contains_term(translated, entry_target)
         ):
             return True
     return False
-
-
-def _protected_numbers_preserved(source: str, output: str) -> bool:
-    output_digits = "".join(character for character in output if character.isdigit())
-    cursor = 0
-    for token in protected_numeric_tokens(source):
-        position = output_digits.find(token.digits, cursor)
-        if position < 0 or (token.percent and "%" not in output):
-            return False
-        cursor = position + len(token.digits)
-    return True

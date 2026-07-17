@@ -50,16 +50,24 @@ class FilesystemLLMCache(LLMCachePort):
                 object_pairs_hook=_reject_duplicate_keys,
                 parse_constant=_reject_json_constant,
             )
+        except FileNotFoundError:
+            return None
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, AppError, TypeError):
-            # A corrupt or stale cache is a miss; it must never become a result.
+            self._remove_invalid(key)
             return None
         try:
             entry = _valid_entry(raw, key)
             if entry is None:
+                self._remove_invalid(key)
                 return None
             return _decode_response(entry, response_schema)
         except (ValueError, AppError, TypeError):
+            self._remove_invalid(key)
             return None
+
+    def _remove_invalid(self, key: LLMCacheKey) -> None:
+        """Remove a present invalid entry and surface cleanup failures."""
+        self.remove(key)
 
     def put(
         self,
@@ -158,8 +166,13 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non_finite_json_value:{value}")
 
 
-def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":
+def cache_directory_sync_supported(platform_name: str) -> bool:
+    """Return whether directory fsync is supported by the target platform."""
+    return platform_name != "nt"
+
+
+def _fsync_directory(path: Path, platform_name: str | None = None) -> None:
+    if not cache_directory_sync_supported(os.name if platform_name is None else platform_name):
         return
     descriptor = os.open(path, os.O_RDONLY)
     try:

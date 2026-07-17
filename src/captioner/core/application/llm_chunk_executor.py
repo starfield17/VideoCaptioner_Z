@@ -17,10 +17,18 @@ from captioner.core.domain.llm import (
     StructuredResponseBatch,
     response_batch_schema,
 )
-from captioner.core.domain.llm_cache import LLMCacheKey, build_llm_cache_key
+from captioner.core.domain.llm_cache import (
+    LLMCacheKey,
+    build_llm_cache_key_for_request,
+)
 from captioner.core.domain.result import JsonValue
-from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, LLMChunk
-from captioner.core.policies.llm_validation import validate_responses
+from captioner.core.policies.llm_chunking import (
+    ChunkingConfig,
+    ChunkItem,
+    LLMChunk,
+    SerializedRequestTokenEstimator,
+)
+from captioner.core.policies.llm_validation import validate_response_schema, validate_responses
 from captioner.core.ports.llm import LLMClient
 from captioner.core.ports.llm_cache import LLMCachePort
 
@@ -42,6 +50,13 @@ class ChunkPlannerPort(Protocol):
         config: ChunkingConfig | None = None,
         index: int = 0,
     ) -> LLMChunk: ...
+
+
+class _PlannerCounter:
+    """Conservative fallback for third-party planner doubles without a counter."""
+
+    def count(self, text: str) -> int:
+        return len(text)
 
 
 _ID_MISMATCH_ERRORS = frozenset(
@@ -82,6 +97,13 @@ class LLMChunkExecutionConfig:
     prompt_content: str = ""
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     response_schema_version: int = LLM_RESPONSE_SCHEMA_VERSION
+    repair_prompt_id: str = ""
+    repair_prompt_version: str = ""
+    repair_prompt_content_sha256: str = ""
+    repair_prompt_content: str = ""
+    context_payload_factory: Callable[[LLMChunk], Mapping[str, JsonValue]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def chunk_config(self) -> dict[str, JsonValue]:
         return {
@@ -110,17 +132,18 @@ class LLMChunkExecutor:
     ) -> tuple[T, ...]:
         execution = ExecutionContext() if context is None else context
         ordered = tuple(items)
-        chunks = self.planner.plan(ordered, self.config.chunking)
-        if not chunks:
-            return ()
         factory = request_factory or self._default_request
         batch_schema = response_batch_schema(response_schema)
+        chunks = self._plan(ordered, factory, batch_schema)
+        if not chunks:
+            return ()
         tasks = [
             asyncio.create_task(
                 self._execute_with_shrink(
                     chunk,
                     ordered,
                     batch_schema,
+                    response_schema,
                     factory,
                     execution,
                     validation_source_texts,
@@ -153,6 +176,7 @@ class LLMChunkExecutor:
         chunk: LLMChunk,
         all_items: tuple[ChunkItem, ...],
         batch_schema: type[StructuredResponseBatch],
+        item_schema: type[object],
         request_factory: ChunkRequestFactory,
         context: ExecutionContext,
         validation_source_texts: Mapping[str, str] | None,
@@ -161,6 +185,7 @@ class LLMChunkExecutor:
             return await self._execute_chunk(
                 chunk,
                 batch_schema,
+                item_schema,
                 request_factory,
                 context,
                 validation_source_texts,
@@ -173,20 +198,27 @@ class LLMChunkExecutor:
             if indexes != tuple(range(indexes[0], indexes[-1] + 1)):
                 raise AppError("llm.id_mismatch", {"reason": "non_contiguous_chunk"}) from exc
             midpoint = indexes[0] + len(indexes) // 2
-            left = self.planner.plan_range(
-                all_items, indexes[0], midpoint, self.config.chunking, index=chunk.index * 2
+            left = self._plan_range(
+                all_items,
+                indexes[0],
+                midpoint,
+                request_factory,
+                batch_schema,
+                chunk.index * 2,
             )
-            right = self.planner.plan_range(
+            right = self._plan_range(
                 all_items,
                 midpoint,
                 indexes[-1] + 1,
-                self.config.chunking,
-                index=chunk.index * 2 + 1,
+                request_factory,
+                batch_schema,
+                chunk.index * 2 + 1,
             )
             left_result = await self._execute_with_shrink(
                 left,
                 all_items,
                 batch_schema,
+                item_schema,
                 request_factory,
                 context,
                 validation_source_texts,
@@ -195,6 +227,7 @@ class LLMChunkExecutor:
                 right,
                 all_items,
                 batch_schema,
+                item_schema,
                 request_factory,
                 context,
                 validation_source_texts,
@@ -205,76 +238,169 @@ class LLMChunkExecutor:
         self,
         chunk: LLMChunk,
         batch_schema: type[StructuredResponseBatch],
+        item_schema: type[object],
         request_factory: ChunkRequestFactory,
         context: ExecutionContext,
         validation_source_texts: Mapping[str, str] | None,
     ) -> tuple[object, ...]:
         request = request_factory(chunk)
-        key = self._cache_key(chunk)
+        if request.item_ids != chunk.item_ids or request.context_ids != chunk.context_ids:
+            raise AppError("llm.request_factory_invalid", {"reason": "ids"})
+        context.raise_if_cancelled()
+        key = self._cache_key(request, batch_schema)
         cached = self.cache.get(key, batch_schema)
         if cached is not None:
             try:
-                return self._validate_and_order(cached, chunk, validation_source_texts)
+                return self._validate_and_order(cached, item_schema, chunk, validation_source_texts)
             except AppError:
-                # A cached value that fails the complete validator is a miss;
-                # never expose it as a successful response.
-                pass
-        generated = await self.client.generate_structured(request, batch_schema, context)
+                self.cache.remove(key)
         try:
-            responses = self._validate_and_order(generated, chunk, validation_source_texts)
+            generated = await self.client.generate_structured(request, batch_schema, context)
+            responses = self._validate_and_order(
+                generated, item_schema, chunk, validation_source_texts
+            )
         except AppError as exc:
             if exc.code not in _VALIDATION_REPAIR_ERRORS:
                 raise
+            context.raise_if_cancelled()
             repaired = await self.client.generate_structured(
-                structured_repair_request(request),
+                structured_repair_request(
+                    request,
+                    repair_prompt_id=self.config.repair_prompt_id,
+                    repair_prompt_version=self.config.repair_prompt_version,
+                    repair_prompt_content_sha256=self.config.repair_prompt_content_sha256,
+                    repair_prompt_content=self.config.repair_prompt_content,
+                ),
                 batch_schema,
                 context,
             )
-            responses = self._validate_and_order(repaired, chunk, validation_source_texts)
+            responses = self._validate_and_order(
+                repaired, item_schema, chunk, validation_source_texts
+            )
         cache_value = _batch_from_responses(batch_schema, responses)
+        context.raise_if_cancelled()
         self.cache.put(key, cache_value, batch_schema)
         return responses
 
-    def _cache_key(self, chunk: LLMChunk) -> LLMCacheKey:
-        return build_llm_cache_key(
-            task_kind=self.config.task_kind,
+    def _cache_key(
+        self, request: LLMRequest, response_schema: type[StructuredResponseBatch]
+    ) -> LLMCacheKey:
+        return build_llm_cache_key_for_request(
+            request,
             provider_kind=self.config.provider_kind,
             provider_identity=self.config.provider_identity,
             base_url_identity=self.config.base_url_identity,
             model=self.config.model,
             temperature=self.config.temperature,
-            source_language=self.config.source_language,
-            target_language=self.config.target_language,
             profile=self.config.profile,
-            prompt_id=self.config.prompt_id,
-            prompt_version=self.config.prompt_version,
-            prompt_content_sha256=self.config.prompt_content_sha256,
-            items=tuple(LLMItem(item.id, item.text) for item in chunk.items),
-            context=tuple(LLMItem(item.id, item.text) for item in chunk.context),
             chunk_config=self.config.chunk_config(),
             response_schema_version=self.config.response_schema_version,
+            response_schema=response_schema,
         )
 
     def _default_request(self, chunk: LLMChunk) -> LLMRequest:
+        context_payload = (
+            None
+            if self.config.context_payload_factory is None
+            else self.config.context_payload_factory(chunk)
+        )
         return LLMRequest(
-            self.config.task_kind,
-            tuple(LLMItem(item.id, item.text) for item in chunk.items),
-            tuple(LLMItem(item.id, item.text) for item in chunk.context),
-            self.config.source_language,
-            self.config.target_language,
-            self.config.prompt_id,
-            self.config.prompt_version,
-            self.config.prompt_content_sha256,
-            self.config.prompt_content,
+            task_kind=self.config.task_kind,
+            items=tuple(LLMItem(item.id, item.text) for item in chunk.items),
+            context=tuple(LLMItem(item.id, item.text) for item in chunk.context),
+            source_language=self.config.source_language,
+            target_language=self.config.target_language,
+            prompt_id=self.config.prompt_id,
+            prompt_version=self.config.prompt_version,
+            prompt_content_sha256=self.config.prompt_content_sha256,
+            prompt_content=self.config.prompt_content,
+            context_payload=context_payload,
+            repair_prompt_id=self.config.repair_prompt_id,
+            repair_prompt_version=self.config.repair_prompt_version,
+            repair_prompt_content_sha256=self.config.repair_prompt_content_sha256,
+            repair_prompt_content=self.config.repair_prompt_content,
+        )
+
+    def _plan(
+        self,
+        items: Sequence[ChunkItem],
+        request_factory: ChunkRequestFactory,
+        response_schema: type[StructuredResponseBatch],
+    ) -> tuple[LLMChunk, ...]:
+        estimator = SerializedRequestTokenEstimator(
+            getattr(self.planner, "token_counter", _PlannerCounter()),
+            self.config.model,
+            self.config.temperature,
+        )
+        method = getattr(self.planner, "plan_for_request", None)
+        if callable(method):
+            typed_method = cast(
+                Callable[
+                    [
+                        Sequence[ChunkItem],
+                        ChunkingConfig,
+                        ChunkRequestFactory,
+                        type[object],
+                        SerializedRequestTokenEstimator,
+                    ],
+                    tuple[LLMChunk, ...],
+                ],
+                method,
+            )
+            return typed_method(
+                items,
+                self.config.chunking,
+                request_factory,
+                response_schema,
+                estimator,
+            )
+        return self.planner.plan(items, self.config.chunking)
+
+    def _plan_range(
+        self,
+        items: Sequence[ChunkItem],
+        core_start: int,
+        core_end: int,
+        request_factory: ChunkRequestFactory,
+        response_schema: type[StructuredResponseBatch],
+        index: int,
+    ) -> LLMChunk:
+        estimator = SerializedRequestTokenEstimator(
+            getattr(self.planner, "token_counter", _PlannerCounter()),
+            self.config.model,
+            self.config.temperature,
+        )
+        method = getattr(self.planner, "plan_range_for_request", None)
+        if callable(method):
+            typed_method = cast(
+                Callable[..., LLMChunk],
+                method,
+            )
+            return typed_method(
+                items,
+                core_start,
+                core_end,
+                self.config.chunking,
+                request_factory,
+                response_schema,
+                estimator,
+                index,
+            )
+        return self.planner.plan_range(
+            items, core_start, core_end, self.config.chunking, index=index
         )
 
     def _validate_and_order(
         self,
         value: object,
+        item_schema: type[object],
         chunk: LLMChunk,
         validation_source_texts: Mapping[str, str] | None,
     ) -> tuple[object, ...]:
-        responses = _responses_from_batch(value)
+        responses = tuple(
+            validate_response_schema(_response_mapping(response), item_schema)
+            for response in _responses_from_batch(value)
+        )
         expected_ids = chunk.item_ids
         source_texts = {
             item.id: (
@@ -301,6 +427,13 @@ def _responses_from_batch(value: object) -> tuple[object, ...]:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return tuple(cast(Sequence[object], value))
     return (value,)
+
+
+def _response_mapping(response: object) -> object:
+    to_dict = getattr(response, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return response
 
 
 def _batch_from_responses(

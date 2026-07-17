@@ -2,20 +2,29 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, ClassVar, Self, cast
 
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.result import JsonValue
+from captioner.core.domain.result import (
+    FrozenJsonValue,
+    JsonValue,
+    freeze_json_value,
+    thaw_json_value,
+)
 from captioner.core.policies.unicode_metrics import normalize_text
 
 LLM_RESPONSE_SCHEMA_VERSION = 1
 _FORBIDDEN_SCHEMA_KEYS = frozenset(
     {"start_ms", "end_ms", "timestamp", "timestamps", "duration", "duration_ms"}
 )
+_CONTEXT_PAYLOAD_FIELDS = frozenset({"terminology", "anomalies", "nearby_cues"})
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class LLMTaskKind(StrEnum):
@@ -59,7 +68,11 @@ class LLMRequest:
     prompt_version: str = ""
     prompt_content_sha256: str = ""
     prompt_content: str = ""
-    metadata: Mapping[str, JsonValue] | None = None
+    context_payload: Mapping[str, JsonValue] | None = None
+    repair_prompt_id: str = ""
+    repair_prompt_version: str = ""
+    repair_prompt_content_sha256: str = ""
+    repair_prompt_content: str = ""
 
     def __post_init__(self) -> None:
         _canonical_nonempty(self.task_kind, "task_kind")
@@ -79,10 +92,85 @@ class LLMRequest:
             value = getattr(self, field)
             if value is not None:
                 _canonical_nonempty(value, field)
-        for field in ("prompt_id", "prompt_version", "prompt_content_sha256"):
+        for field in (
+            "prompt_id",
+            "prompt_version",
+            "prompt_content_sha256",
+            "prompt_content",
+            "repair_prompt_id",
+            "repair_prompt_version",
+            "repair_prompt_content_sha256",
+            "repair_prompt_content",
+        ):
+            value = getattr(self, field)
+            if not isinstance(value, str):
+                raise AppError("llm.request_invalid", {"field": field})
+        prompt_identity = (self.prompt_id, self.prompt_version, self.prompt_content_sha256)
+        if any(prompt_identity) and not all(prompt_identity):
+            raise AppError("llm.request_invalid", {"field": "prompt", "reason": "identity"})
+        if self.prompt_content and not all(prompt_identity):
+            raise AppError("llm.request_invalid", {"field": "prompt_content"})
+        for field in ("prompt_id", "prompt_version"):
             value = getattr(self, field)
             if value:
                 _canonical_nonempty(value, field)
+        if self.prompt_content_sha256 and _SHA256_RE.fullmatch(self.prompt_content_sha256) is None:
+            raise AppError("llm.request_invalid", {"field": "prompt_content_sha256"})
+        repair_identity = (
+            self.repair_prompt_id,
+            self.repair_prompt_version,
+            self.repair_prompt_content_sha256,
+        )
+        if any(repair_identity) and not all(repair_identity):
+            raise AppError("llm.request_invalid", {"field": "repair_prompt", "reason": "identity"})
+        for field, value in zip(
+            ("repair_prompt_id", "repair_prompt_version", "repair_prompt_content_sha256"),
+            repair_identity,
+            strict=True,
+        ):
+            if value:
+                _canonical_nonempty(value, field)
+        if (
+            self.repair_prompt_content_sha256
+            and _SHA256_RE.fullmatch(self.repair_prompt_content_sha256) is None
+        ):
+            raise AppError("llm.request_invalid", {"field": "repair_prompt_content_sha256"})
+        if (
+            self.prompt_content
+            and self.prompt_content_sha256
+            and hashlib.sha256(self.prompt_content.encode("utf-8")).hexdigest()
+            != self.prompt_content_sha256
+        ):
+            raise AppError("llm.request_invalid", {"field": "prompt_content_sha256"})
+        if (
+            self.repair_prompt_content
+            and self.repair_prompt_content_sha256
+            and hashlib.sha256(self.repair_prompt_content.encode("utf-8")).hexdigest()
+            != self.repair_prompt_content_sha256
+        ):
+            raise AppError("llm.request_invalid", {"field": "repair_prompt_content_sha256"})
+        if self.context_payload is not None:
+            try:
+                frozen_payload = freeze_json_value(self.context_payload)
+                if (
+                    not isinstance(frozen_payload, Mapping)
+                    or _contains_forbidden_context_key(frozen_payload)
+                    or _contains_secret_context_key(frozen_payload)
+                ):
+                    raise AppError("llm.request_invalid", {"field": "context_payload"})
+                validate_context_payload(frozen_payload)
+                # Validate finite JSON and detach the caller's mutable mapping.
+                json.dumps(
+                    thaw_json_value(cast(Mapping[str, FrozenJsonValue], frozen_payload)),
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError) as exc:
+                raise AppError("llm.request_invalid", {"field": "context_payload"}) from exc
+            object.__setattr__(
+                self,
+                "context_payload",
+                cast(Mapping[str, JsonValue], frozen_payload),
+            )
         object.__setattr__(self, "items", items)
         object.__setattr__(self, "context", context)
 
@@ -104,7 +192,14 @@ class LLMRequest:
             "prompt_id": self.prompt_id,
             "prompt_version": self.prompt_version,
             "prompt_content_sha256": self.prompt_content_sha256,
-            "prompt_content": self.prompt_content,
+            "context_payload": (
+                None
+                if self.context_payload is None
+                else thaw_json_value(cast(FrozenJsonValue, self.context_payload))
+            ),
+            "repair_prompt_id": self.repair_prompt_id,
+            "repair_prompt_version": self.repair_prompt_version,
+            "repair_prompt_content_sha256": self.repair_prompt_content_sha256,
         }
 
 
@@ -185,18 +280,112 @@ class SourceCorrectionResponse(_StrictResponse):
 
 
 @dataclass(frozen=True, slots=True)
-class TerminologyResponse(_StrictResponse):
-    id: str
+class TerminologyTerm:
     source_term: str
     target_term: str
 
-    _field_names: ClassVar[tuple[str, ...]] = ("id", "source_term", "target_term")
-    text_fields: ClassVar[tuple[str, ...]] = ("source_term", "target_term")
-
     def __post_init__(self) -> None:
-        _canonical_nonempty(self.id, "id")
         _canonical_nonempty(self.source_term, "source_term")
         _canonical_nonempty(self.target_term, "target_term")
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {"source_term": self.source_term, "target_term": self.target_term}
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class TerminologyResponse(_StrictResponse):
+    """Sparse terminology output; an input unit may contain no terms."""
+
+    id: str
+    terms: tuple[TerminologyTerm, ...]
+
+    _field_names: ClassVar[tuple[str, ...]] = ("id", "terms")
+    text_fields: ClassVar[tuple[str, ...]] = ()
+
+    def __init__(
+        self,
+        id: str,
+        terms: Sequence[TerminologyTerm | Mapping[str, object]],
+    ) -> None:
+        _canonical_nonempty(id, "id")
+        converted_terms: list[TerminologyTerm] = []
+        for term in terms:
+            if isinstance(term, TerminologyTerm):
+                converted_terms.append(term)
+            else:
+                raw_value = cast(object, term)
+                if not isinstance(raw_value, Mapping):
+                    raise AppError("llm.response_invalid", {"reason": "terms"})
+                raw = cast(Mapping[str, object], raw_value)
+                if set(raw) != {"source_term", "target_term"}:
+                    raise AppError("llm.response_invalid", {"reason": "terms"})
+                source = raw.get("source_term")
+                target = raw.get("target_term")
+                if not isinstance(source, str) or not isinstance(target, str):
+                    raise AppError("llm.response_invalid", {"reason": "terms"})
+                converted_terms.append(TerminologyTerm(source, target))
+        converted = tuple(converted_terms)
+        object.__setattr__(self, "id", id)
+        object.__setattr__(self, "terms", converted)
+
+    @classmethod
+    def from_mapping(cls, value: object) -> Self:
+        if not isinstance(value, Mapping):
+            raise AppError("llm.response_invalid", {"reason": "object"})
+        raw = cast(Mapping[str, object], value)
+        if set(raw) != {"id", "terms"}:
+            raise AppError("llm.response_invalid", {"reason": "fields"})
+        identifier = raw.get("id")
+        terms = raw.get("terms")
+        if (
+            not isinstance(identifier, str)
+            or not isinstance(terms, Sequence)
+            or isinstance(terms, (str, bytes, bytearray))
+        ):
+            raise AppError("llm.response_invalid", {"reason": "terms"})
+        return cls(identifier, cast(Sequence[Mapping[str, object]], terms))
+
+    @classmethod
+    def json_schema(cls) -> dict[str, JsonValue]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["id", "terms"],
+            "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "terms": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["source_term", "target_term"],
+                        "properties": {
+                            "source_term": {"type": "string", "minLength": 1},
+                            "target_term": {"type": "string", "minLength": 1},
+                        },
+                    },
+                },
+            },
+        }
+
+    @classmethod
+    def model_json_schema(cls) -> dict[str, JsonValue]:
+        return cls.json_schema()
+
+    @classmethod
+    def schema(cls) -> dict[str, JsonValue]:
+        return cls.json_schema()
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {"id": self.id, "terms": [term.to_dict() for term in self.terms]}
+
+    @property
+    def source_term(self) -> str:
+        return self.terms[0].source_term if self.terms else ""
+
+    @property
+    def target_term(self) -> str:
+        return self.terms[0].target_term if self.terms else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +535,56 @@ def response_schema_for(response_schema: type[object]) -> dict[str, JsonValue]:
     return schema
 
 
+def encode_llm_request(
+    request: LLMRequest,
+    model: str,
+    temperature: float,
+    response_schema: type[object],
+) -> bytes:
+    """Serialize the exact provider request shape used by the adapter.
+
+    Keeping this representation in Core lets the token-budget estimator and the
+    OpenAI-compatible adapter reason about the same complete request without
+    importing HTTP types into the domain.
+    """
+    schema = response_schema_for(response_schema)
+    payload: dict[str, JsonValue] = {
+        "model": model,
+        "temperature": temperature,
+        "messages": [
+            {
+                "role": "system",
+                "content": request.prompt_content or "Return only the requested JSON object.",
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    request.to_dict(),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": _response_schema_name(request.task_kind, response_schema),
+                "strict": True,
+                "schema": schema,
+            },
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def response_schema_name(response_schema: type[object], task_kind: str) -> str:
+    """Return a stable schema identity shared by cache and request encoding."""
+    return _response_schema_name(task_kind, response_schema)
+
+
 def _assert_no_timing_fields(value: object) -> None:
     if isinstance(value, Mapping):
         typed = cast(Mapping[object, object], value)
@@ -358,8 +597,107 @@ def _assert_no_timing_fields(value: object) -> None:
             _assert_no_timing_fields(item)
 
 
-def _canonical_nonempty(value: str, field: str) -> str:
-    if not value.strip():
+def _contains_forbidden_context_key(value: object) -> bool:
+    forbidden = {
+        "start_ms",
+        "end_ms",
+        "timestamp",
+        "timestamps",
+        "duration",
+        "duration_ms",
+        "source_word_ids",
+        "word_mapping",
+    }
+    if isinstance(value, Mapping):
+        typed = cast(Mapping[object, object], value)
+        return any(
+            (isinstance(key, str) and key.lower() in forbidden)
+            or _contains_forbidden_context_key(item)
+            for key, item in typed.items()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_forbidden_context_key(item) for item in cast(Sequence[object], value))
+    return False
+
+
+def _contains_secret_context_key(value: object) -> bool:
+    forbidden = {"api_key", "authorization", "access_token", "token", "secret", "password"}
+    if isinstance(value, Mapping):
+        typed = cast(Mapping[object, object], value)
+        return any(
+            (isinstance(key, str) and key.lower().replace("-", "_") in forbidden)
+            or _contains_secret_context_key(item)
+            for key, item in typed.items()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_secret_context_key(item) for item in cast(Sequence[object], value))
+    return False
+
+
+def validate_context_payload(value: object) -> None:
+    """Validate the finite dynamic context envelope shared by LLM stages."""
+    if not isinstance(value, Mapping):
+        raise AppError("llm.request_invalid", {"field": "context_payload"})
+    raw = cast(Mapping[object, object], value)
+    if any(not isinstance(key, str) or key not in _CONTEXT_PAYLOAD_FIELDS for key in raw):
+        raise AppError("llm.request_invalid", {"field": "context_payload"})
+    _validate_context_entries(
+        raw.get("terminology"),
+        {"source_term", "target_term"},
+        ("source_term", "target_term"),
+    )
+    _validate_context_entries(raw.get("anomalies"), {"cue_id", "reasons"}, ("cue_id",))
+    _validate_context_entries(
+        raw.get("nearby_cues"),
+        {"cue_id", "source_text", "translated_text"},
+        ("cue_id", "source_text", "translated_text"),
+    )
+
+
+def _validate_context_entries(
+    value: object,
+    fields: set[str],
+    text_fields: tuple[str, ...],
+) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise AppError("llm.request_invalid", {"field": "context_payload"})
+    for entry in cast(Sequence[object], value):
+        if not isinstance(entry, Mapping):
+            raise AppError("llm.request_invalid", {"field": "context_payload"})
+        raw = cast(Mapping[object, object], entry)
+        if set(raw) != fields:
+            raise AppError("llm.request_invalid", {"field": "context_payload"})
+        for field_name in text_fields:
+            field_value = raw.get(field_name)
+            if not isinstance(field_value, str):
+                raise AppError("llm.request_invalid", {"field": "context_payload"})
+            try:
+                _canonical_nonempty(field_value, field_name)
+            except AppError as exc:
+                raise AppError("llm.request_invalid", {"field": "context_payload"}) from exc
+        if fields == {"cue_id", "reasons"}:
+            reasons = raw.get("reasons")
+            if not isinstance(reasons, Sequence) or isinstance(reasons, (str, bytes, bytearray)):
+                raise AppError("llm.request_invalid", {"field": "context_payload"})
+            typed_reasons = cast(Sequence[object], reasons)
+            if not typed_reasons or any(not isinstance(reason, str) for reason in typed_reasons):
+                raise AppError("llm.request_invalid", {"field": "context_payload"})
+            for reason in typed_reasons:
+                try:
+                    _canonical_nonempty(reason, "reason")
+                except AppError as exc:
+                    raise AppError("llm.request_invalid", {"field": "context_payload"}) from exc
+
+
+def _response_schema_name(task_kind: str, response_schema: type[object]) -> str:
+    name = getattr(response_schema, "__qualname__", getattr(response_schema, "__name__", "schema"))
+    return f"{task_kind.replace('-', '_')}_{name.replace('.', '_')}"
+
+
+def _canonical_nonempty(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
         raise AppError("llm.response_invalid", {"field": field, "reason": "empty"})
     try:
         canonical = normalize_text(value)

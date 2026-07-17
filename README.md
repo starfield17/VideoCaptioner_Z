@@ -47,6 +47,13 @@ captioner run input.mp4 --output build/output --profile quality \
   --target-language zh-CN --llm-provider-profile default --json
 ```
 
+The durable Job stores the complete redacted public provider snapshot and
+profile-specific Prompt identities. Resume must match every public provider
+field before creating the HTTP client; only API-key rotation is allowed. All
+LLM Stages and Jobs share one provider client and Semaphore, and complete
+encoded requests (including Prompt, dynamic context, and response schema) are
+checked against the Chunk budget.
+
 See [docs/llm.md](docs/llm.md) for the plaintext `llm.toml` format, structured
 schemas, Cache identity, retry classification, recovery, and limitations.
 

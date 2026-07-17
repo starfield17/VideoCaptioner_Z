@@ -4,7 +4,13 @@ import json
 from pathlib import Path
 from typing import cast
 
-from captioner.adapters.persistence.filesystem_llm_cache import FilesystemLLMCache
+import pytest
+
+from captioner.adapters.persistence.filesystem_llm_cache import (
+    FilesystemLLMCache,
+    cache_directory_sync_supported,
+)
+from captioner.core.domain.errors import AppError
 from captioner.core.domain.llm import (
     LLMItem,
     QualityTranslationResponse,
@@ -27,7 +33,7 @@ def _key() -> LLMCacheKey:
         profile="quality",
         prompt_id="correct_source",
         prompt_version="v1",
-        prompt_content_sha256="content-hash",
+        prompt_content_sha256="a" * 64,
         items=(LLMItem("item-1", "source"),),
         chunk_config={"max_items": 1},
     )
@@ -46,6 +52,7 @@ def test_cache_round_trip_is_schema_bound_and_atomic(tmp_path: Path) -> None:
 
     path.write_text('{"schema_version": 999}', encoding="utf-8")
     assert cache.get(key, SourceCorrectionResponse) is None
+    assert not path.exists()
 
 
 def test_corrupt_duplicate_and_mismatched_entries_are_misses(tmp_path: Path) -> None:
@@ -65,6 +72,25 @@ def test_corrupt_duplicate_and_mismatched_entries_are_misses(tmp_path: Path) -> 
     assert cache.get(key, SourceCorrectionResponse) is None
 
 
+def test_schema_valid_cache_envelope_with_invalid_response_is_removed(tmp_path: Path) -> None:
+    cache = FilesystemLLMCache(tmp_path)
+    key = _key()
+    cache.put(key, SourceCorrectionResponse("item-1", "corrected"))
+    path = cache.path_for(key)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["response"] = {"id": "item-1", "corrected_source": ""}
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert cache.get(key, SourceCorrectionResponse) is None
+    assert not path.exists()
+
+
+def test_cache_rejects_response_without_a_schema_serializer(tmp_path: Path) -> None:
+    cache = FilesystemLLMCache(tmp_path)
+    with pytest.raises(AppError, match=r"llm\.cache_value_invalid"):
+        cache.put(_key(), object())
+
+
 def test_cache_supports_batch_response_schema(tmp_path: Path) -> None:
     cache = FilesystemLLMCache(tmp_path)
     key = build_llm_cache_key(
@@ -79,7 +105,7 @@ def test_cache_supports_batch_response_schema(tmp_path: Path) -> None:
         profile="quality",
         prompt_id="translate_quality",
         prompt_version="v1",
-        prompt_content_sha256="content-hash",
+        prompt_content_sha256="a" * 64,
         items=(LLMItem("item-1", "source"), LLMItem("item-2", "other")),
         chunk_config={"max_items": 2},
     )
@@ -95,3 +121,8 @@ def test_cache_supports_batch_response_schema(tmp_path: Path) -> None:
     assert loaded is not None
     responses = cast(tuple[QualityTranslationResponse, ...], loaded.responses)
     assert [item.id for item in responses] == ["item-1", "item-2"]
+
+
+def test_cache_directory_sync_platform_seam_is_explicit() -> None:
+    assert cache_directory_sync_supported("posix") is True
+    assert cache_directory_sync_supported("nt") is False

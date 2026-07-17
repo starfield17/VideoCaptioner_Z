@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import cast
@@ -13,6 +14,23 @@ from captioner.core.policies.unicode_metrics import normalize_text
 def normalize_term(value: str) -> str:
     """Normalize a source term for deterministic grouping."""
     return normalize_text(value).casefold()
+
+
+def contains_term(text: str, term: str) -> bool:
+    """Match a term on lexical token boundaries, including phrases."""
+    source_tokens = _lexical_tokens(text)
+    term_tokens = _lexical_tokens(term)
+    if not term_tokens or len(term_tokens) > len(source_tokens):
+        return False
+    width = len(term_tokens)
+    return any(
+        source_tokens[index : index + width] == term_tokens
+        for index in range(len(source_tokens) - width + 1)
+    )
+
+
+def _lexical_tokens(value: str) -> tuple[str, ...]:
+    return tuple(token.casefold() for token in re.findall(r"[^\W_]+", value, flags=re.UNICODE))
 
 
 @dataclass(frozen=True, slots=True)

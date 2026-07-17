@@ -16,6 +16,7 @@ from captioner.adapters.persistence.domain_codecs import (
 from captioner.core.application.anomaly_review import build_reviewed_track, review_report
 from captioner.core.application.source_correction import (
     build_corrected_transcript,
+    build_terminology_units,
     merge_terminology,
 )
 from captioner.core.domain.errors import AppError
@@ -92,25 +93,39 @@ def _terminology() -> Terminology:
 
 def test_terminology_merge_is_stable_round_trips_and_rejects_conflicts() -> None:
     transcript = make_transcript(("Alpha ", "Alpha"))
+    units = build_terminology_units(transcript)
     responses = (
-        TerminologyResponse("word-000001", "Alpha", "阿尔法"),
-        TerminologyResponse("word-000002", "Alpha", "阿尔法"),
+        TerminologyResponse(
+            units[0].id,
+            ({"source_term": "Alpha", "target_term": "阿尔法"},),
+        ),
     )
 
-    terminology = merge_terminology(transcript, "en", "zh-CN", responses)
+    terminology = merge_terminology(transcript, "en", "zh-CN", responses, units)
 
     assert len(terminology.entries) == 1
     assert terminology.entries[0].source_word_ids == ("word-000001", "word-000002")
     assert decode_terminology(encode_terminology(terminology)) == terminology
 
     conflicting = (
-        responses[0],
-        TerminologyResponse("word-000002", "Alpha", "字母甲"),
+        TerminologyResponse(
+            units[0].id,
+            (
+                {"source_term": "Alpha", "target_term": "阿尔法"},
+                {"source_term": "Alpha", "target_term": "字母甲"},
+            ),
+        ),
     )
     with pytest.raises(AppError, match=r"llm\.terminology_conflict"):
-        merge_terminology(transcript, "en", "zh-CN", conflicting)
+        merge_terminology(transcript, "en", "zh-CN", conflicting, units)
     with pytest.raises(AppError, match=r"llm\.terminology_units_invalid"):
-        merge_terminology(transcript, "en", "zh-CN", tuple(reversed(responses)))
+        merge_terminology(
+            transcript,
+            "en",
+            "zh-CN",
+            (TerminologyResponse("word-000001", ()),),
+            units,
+        )
 
 
 def test_terminology_rejects_numeric_loss_and_malformed_artifacts() -> None:
@@ -120,7 +135,39 @@ def test_terminology_rejects_numeric_loss_and_malformed_artifacts() -> None:
             transcript,
             "en",
             "zh-CN",
-            (TerminologyResponse("word-000001", "ten", "十"),),
+            (
+                TerminologyResponse(
+                    "term-unit-000001",
+                    ({"source_term": "10%", "target_term": "十"},),
+                ),
+            ),
+        )
+
+
+def test_sparse_terminology_allows_non_terms_and_uses_token_boundaries() -> None:
+    transcript = make_transcript(("the ", "artist"))
+    units = build_terminology_units(transcript)
+    empty = merge_terminology(
+        transcript,
+        "en",
+        "zh-CN",
+        (TerminologyResponse(units[0].id, ()),),
+        units,
+    )
+    assert empty.entries == ()
+
+    with pytest.raises(AppError, match=r"llm\.terminology_invalid"):
+        merge_terminology(
+            transcript,
+            "en",
+            "zh-CN",
+            (
+                TerminologyResponse(
+                    units[0].id,
+                    ({"source_term": "art", "target_term": "艺术"},),
+                ),
+            ),
+            units,
         )
     with pytest.raises(AppError, match=r"llm\.terminology_invalid"):
         TerminologyEntry("Alpha", "wrong", "阿尔法", ("word-000001",))
@@ -138,6 +185,38 @@ def test_terminology_rejects_numeric_loss_and_malformed_artifacts() -> None:
                     },
                 }
             )
+        )
+
+
+def test_multiword_term_maps_to_consecutive_application_owned_word_ids() -> None:
+    transcript = make_transcript(("New ", "York", "is ", "large"))
+    units = build_terminology_units(transcript)
+    terminology = merge_terminology(
+        transcript,
+        "en",
+        "de",
+        (
+            TerminologyResponse(
+                units[0].id,
+                ({"source_term": "New York", "target_term": "New York"},),
+            ),
+        ),
+        units,
+    )
+
+    assert terminology.entries[0].source_word_ids == ("word-000001", "word-000002")
+    with pytest.raises(AppError, match=r"llm\.terminology_invalid"):
+        merge_terminology(
+            transcript,
+            "en",
+            "de",
+            (
+                TerminologyResponse(
+                    units[0].id,
+                    ({"source_term": "Yorkshire", "target_term": "Yorkshire"},),
+                ),
+            ),
+            units,
         )
 
 
@@ -238,7 +317,7 @@ def test_review_preserves_mapping_and_rejects_residual_anomalies() -> None:
     assert [(cue.id, cue.start_ms, cue.end_ms, cue.source_word_ids) for cue in reviewed.cues] == [
         (cue.id, cue.start_ms, cue.end_ms, cue.source_word_ids) for cue in track.cues
     ]
-    assert review_report(track, anomalies)["source_track_id"] == track.id
+    assert review_report(track, anomalies)["input_track_id"] == track.id
 
     with pytest.raises(AppError, match=r"subtitle\.validation_failed"):
         build_reviewed_track(

@@ -4,7 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from tests.support import make_transcript
+from tests.support import llm_snapshot, make_transcript
 
 from captioner.adapters.llm.scripted import ScriptedLLMAdapter
 from captioner.adapters.persistence.content_addressed_artifact_store import (
@@ -54,21 +54,7 @@ def _config(tmp_path: Path) -> JobConfig:
         False,
         {stage.value: "1" for stage in stage_plan_for(profile)},
         pipeline_profile=profile,
-        llm={
-            "kind": "openai-compatible",
-            "provider_profile": "default",
-            "base_url": "https://provider.example/v1",
-            "model": "unit-test-model",
-            "temperature": 0.1,
-            "target_language": "zh-CN",
-            "chunk": {
-                "max_items": 32,
-                "max_input_tokens": 4096,
-                "context_before_items": 1,
-                "context_after_items": 1,
-                "max_audio_context_duration_ms": 120_000,
-            },
-        },
+        llm=llm_snapshot(profile),
     )
 
 

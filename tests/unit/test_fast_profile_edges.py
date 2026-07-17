@@ -6,11 +6,14 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from tests.support import llm_snapshot
 
 from captioner.bootstrap import create_job_config
 from captioner.core.domain.artifact import ArtifactRef
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.llm import FastTranslationResponse
+from captioner.core.domain.result import FrozenJsonValue
+from captioner.core.domain.stage import PipelineProfile
 from captioner.core.policies.llm_chunking import ChunkingConfig
 from captioner.infrastructure.prompts import PromptLoader
 
@@ -32,7 +35,28 @@ def _prompt():
     return PromptLoader(Path("resources/prompts")).load("translate_fast", "v1")
 
 
-def test_create_job_config_builds_a_redacted_llm_snapshot(tmp_path: Path) -> None:
+def test_create_job_config_requires_a_complete_redacted_llm_snapshot(tmp_path: Path) -> None:
+    with pytest.raises(AppError, match=r"llm\.config_invalid"):
+        create_job_config(
+            model_ref="tiny",
+            device="cpu",
+            compute_type="int8",
+            language="en",
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+            output_dir=tmp_path / "output",
+            overwrite=False,
+            target_language="zh-CN",
+            provider_profile="default",
+            llm_base_url="https://provider.example/v1",
+            llm_model="unit-test-model",
+            temperature=0.1,
+            timeout_sec=30,
+            max_retries=2,
+            chunk={"max_items": 2},
+            prompt_identity={"prompt_id": "translate_fast", "prompt_version": "v1"},
+        )
+
     config = create_job_config(
         model_ref="tiny",
         device="cpu",
@@ -42,15 +66,8 @@ def test_create_job_config_builds_a_redacted_llm_snapshot(tmp_path: Path) -> Non
         ffprobe_bin="ffprobe",
         output_dir=tmp_path / "output",
         overwrite=False,
-        target_language="zh-CN",
-        provider_profile="default",
-        llm_base_url="https://provider.example/v1",
-        llm_model="unit-test-model",
-        temperature=0.1,
-        timeout_sec=30,
-        max_retries=2,
-        chunk={"max_items": 2},
-        prompt_identity={"prompt_id": "translate_fast", "prompt_version": "v1"},
+        pipeline_profile=PipelineProfile.FAST,
+        llm=llm_snapshot(PipelineProfile.FAST),
     )
 
     assert config.schema_version == 2
@@ -58,6 +75,24 @@ def test_create_job_config_builds_a_redacted_llm_snapshot(tmp_path: Path) -> Non
     assert config.provider_profile == "default"
     assert config.llm_model == "unit-test-model"
     assert "api_key" not in repr(config.to_dict())
+
+    incomplete = dict(llm_snapshot(PipelineProfile.FAST))
+    prompts = dict(cast(Mapping[str, object], incomplete["prompts"]))
+    prompts.pop("repair_structured")
+    incomplete["prompts"] = cast(FrozenJsonValue, prompts)
+    with pytest.raises(AppError, match=r"llm\.snapshot_invalid"):
+        create_job_config(
+            model_ref="tiny",
+            device="cpu",
+            compute_type="int8",
+            language="en",
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+            output_dir=tmp_path / "invalid",
+            overwrite=False,
+            pipeline_profile=PipelineProfile.FAST,
+            llm=incomplete,
+        )
 
 
 @pytest.mark.parametrize(

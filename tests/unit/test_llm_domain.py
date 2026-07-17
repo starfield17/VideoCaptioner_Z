@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -14,8 +16,10 @@ from captioner.core.domain.llm import (
     ReviewResponse,
     SourceCorrectionResponse,
     TerminologyResponse,
+    encode_llm_request,
     response_schema_for,
 )
+from captioner.core.domain.result import JsonValue
 from captioner.core.domain.transcript import CorrectedSpan, CorrectedTranscript
 from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, ChunkPlanner
 from captioner.core.policies.llm_validation import (
@@ -35,7 +39,7 @@ def test_response_parsing_and_serialization_paths() -> None:
         FastTranslationResponse("unit", "corrected", "translated"),
         QualityTranslationResponse("unit", "translated"),
         ReviewResponse("unit", "translated"),
-        TerminologyResponse("unit", "source", "target"),
+        TerminologyResponse("unit", ({"source_term": "source", "target_term": "target"},)),
     )
     for response in responses:
         assert type(response).from_mapping(response.to_dict()) == response
@@ -70,9 +74,6 @@ def test_request_validation_and_response_schema_guard() -> None:
     request = LLMRequest(
         "translate",
         (LLMItem("unit", "text"),),
-        prompt_id="prompt",
-        prompt_version="v1",
-        prompt_content_sha256="hash",
     )
     assert request.item_ids == ("unit",)
     assert request.context_ids == ()
@@ -81,6 +82,99 @@ def test_request_validation_and_response_schema_guard() -> None:
         response_schema_for(object)
     with pytest.raises(AppError, match=r"llm\.schema_invalid"):
         validate_response_schema({"id": "unit"}, object)
+
+
+def test_request_serialization_sends_prompt_once_and_freezes_dynamic_context() -> None:
+    prompt = "Use the supplied source text."
+    request = LLMRequest(
+        "translate_quality",
+        (LLMItem("unit", "source"),),
+        context=(LLMItem("nearby", "nearby source"),),
+        source_language="en",
+        target_language="de",
+        prompt_id="translate_quality",
+        prompt_version="v1",
+        prompt_content_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        prompt_content=prompt,
+        context_payload={"terminology": [{"source_term": "source", "target_term": "Quelle"}]},
+    )
+
+    serialized = json.loads(
+        encode_llm_request(request, "unit-model", 0.1, QualityTranslationResponse)
+    )
+    messages = serialized["messages"]
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[0]["content"] == prompt
+    user_payload = json.loads(messages[1]["content"])
+    assert "prompt_content" not in user_payload
+    assert user_payload["prompt_content_sha256"] == request.prompt_content_sha256
+    assert user_payload["context_payload"]["terminology"][0]["target_term"] == "Quelle"
+
+    with pytest.raises(AppError, match=r"llm\.request_invalid"):
+        LLMRequest(
+            "translate_quality",
+            (LLMItem("unit", "source"),),
+            context_payload={"start_ms": 10},
+        )
+    with pytest.raises(AppError, match=r"llm\.request_invalid"):
+        LLMRequest(
+            "translate_quality",
+            (LLMItem("unit", "source"),),
+            context_payload={"authorization": "unit-test-key"},
+        )
+    payloads = cast(
+        tuple[object, ...],
+        (
+            {"unknown": []},
+            {"terminology": [{"source_term": "source"}]},
+            {"anomalies": [{"cue_id": "cue-1", "reasons": []}]},
+            {"nearby_cues": [{"cue_id": "cue-1", "source_text": "source"}]},
+        ),
+    )
+    for payload in payloads:
+        typed_payload = cast(dict[str, JsonValue], payload)
+        with pytest.raises(AppError, match=r"llm\.request_invalid"):
+            LLMRequest(
+                "translate_quality",
+                (LLMItem("unit", "source"),),
+                context_payload=typed_payload,
+            )
+    dynamic_context = cast(
+        dict[str, JsonValue],
+        {
+            "terminology": [{"source_term": "source", "target_term": "Quelle"}],
+            "anomalies": [{"cue_id": "cue-1", "reasons": ["wrong_language"]}],
+            "nearby_cues": [
+                {
+                    "cue_id": "cue-2",
+                    "source_text": "nearby",
+                    "translated_text": "nahe",
+                }
+            ],
+        },
+    )
+    dynamic_request = LLMRequest(
+        "review",
+        (LLMItem("cue-1", "source"),),
+        context_payload=dynamic_context,
+    )
+    assert dynamic_request.to_dict()["context_payload"] == dynamic_context
+    invalid_dynamic_context = (
+        {"terminology": ["bad"]},
+        {"terminology": [{"source_term": 1, "target_term": "Quelle"}]},
+        {"anomalies": "bad"},
+        {"anomalies": [{"cue_id": "cue-1", "reasons": "bad"}]},
+        {"anomalies": [{"cue_id": "cue-1", "reasons": [1]}]},
+        {"anomalies": [{"cue_id": "cue-1", "reasons": ["bad "]}]},
+        {"nearby_cues": [{"cue_id": "cue-1", "source_text": "source", "translated_text": None}]},
+    )
+    for payload in cast(tuple[object, ...], invalid_dynamic_context):
+        with pytest.raises(AppError, match=r"llm\.request_invalid"):
+            LLMRequest(
+                "review",
+                (LLMItem("cue-1", "source"),),
+                context_payload=cast(dict[str, JsonValue], payload),
+            )
 
 
 def test_corrected_transcript_is_ordered_and_complete() -> None:
@@ -156,3 +250,52 @@ def test_validation_language_and_id_failure_paths(tmp_path: Path) -> None:
     (tmp_path / "empty.v1.md").write_text(" ", encoding="utf-8")
     with pytest.raises(AppError, match=r"prompt\.invalid"):
         loader.load("empty", "v1")
+
+
+@pytest.mark.parametrize(
+    ("prompt_id", "prompt_version"),
+    [
+        ("../prompt", "v1"),
+        ("/absolute", "v1"),
+        ("C:\\prompt", "v1"),
+        ("prompt/name", "v1"),
+        ("prompt", "../v1"),
+        ("prompt", "v1/extra"),
+    ],
+)
+def test_prompt_loader_rejects_path_like_identity_components(
+    tmp_path: Path,
+    prompt_id: str,
+    prompt_version: str,
+) -> None:
+    with pytest.raises(AppError, match=r"prompt\.(invalid|identity_invalid)"):
+        PromptLoader(tmp_path).load(prompt_id, prompt_version)
+
+
+def test_validation_handles_sparse_terms_and_all_script_boundaries() -> None:
+    empty_terms = TerminologyResponse("unit", ())
+    assert validate_response(empty_terms, ("unit",)) == empty_terms
+    validated_mapping = validate_response(
+        {"id": "unit", "terms": [{"source_term": "10", "target_term": "10"}]},
+        ("unit",),
+        source_texts={"unit": "10"},
+    )
+    assert cast(dict[str, object], validated_mapping)["id"] == "unit"
+    with pytest.raises(AppError, match=r"llm\.response_invalid"):
+        validate_responses(({"id": "unit", "terms": "bad"},), ("unit",))
+    with pytest.raises(AppError, match=r"llm\.response_invalid"):
+        validate_responses(({"id": "unit", "terms": [{"source_term": 1}]},), ("unit",))
+    with pytest.raises(AppError, match=r"llm\.response_invalid"):
+        validate_responses((object(),), ("unit",))
+
+    assert script_heuristic("") == "other"
+    assert script_heuristic("hello 世界") == "mixed"
+    assert is_obvious_wrong_language("こんにちは", "ja-JP") is False
+    assert is_obvious_wrong_language("hello", "ja-JP") is True
+    assert is_obvious_wrong_language("안녕", "ko-KR") is False
+    assert is_obvious_wrong_language("hello", "ko-KR") is True
+    assert is_obvious_wrong_language("مرحبا", "ar-SA") is False
+    assert is_obvious_wrong_language("hello", "ar-SA") is True
+    assert is_obvious_wrong_language("Привет", "ru-RU") is False
+    assert is_obvious_wrong_language("hello", "ru-RU") is True
+    assert is_obvious_wrong_language("hello", "xx-XX") is False

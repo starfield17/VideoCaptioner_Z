@@ -75,6 +75,25 @@ def stage_plan_for(profile: PipelineProfile | str) -> tuple[StageName, ...]:
     }[selected]
 
 
+def stage_versions_for(profile: PipelineProfile | str) -> dict[str, str]:
+    """Return the complete version map for the selected durable plan."""
+    selected = PipelineProfile(profile)
+    versions = {
+        StageName.INSPECT: "inspect-v1",
+        StageName.NORMALIZE: "normalize-v1",
+        StageName.TRANSCRIBE: "transcribe-v1",
+        StageName.CORRECT_SOURCE: "correct-source-v1",
+        StageName.SEGMENT: "segment-v2",
+        StageName.TRANSLATE: "translate-quality-v1"
+        if selected is PipelineProfile.QUALITY
+        else "translate-v1",
+        StageName.REVIEW: "review-v1",
+        StageName.EXPORT: "export-v3",
+        StageName.PUBLISH: "publish-v3",
+    }
+    return {stage.value: versions[stage] for stage in stage_plan_for(selected)}
+
+
 class StageState(StrEnum):
     PENDING = "pending"
     RUNNING = "running"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -21,8 +22,11 @@ from captioner.core.domain.llm import (
     LLMRequest,
     SourceCorrectionResponse,
     StructuredResponseBatch,
+    response_batch_schema,
 )
-from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, ChunkPlanner
+from captioner.core.domain.llm_cache import LLMCacheKey
+from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, ChunkPlanner, LLMChunk
+from captioner.infrastructure.prompts import PromptLoader
 
 
 class FakeCounter:
@@ -35,6 +39,7 @@ def _items(count: int = 4) -> tuple[ChunkItem, ...]:
 
 
 def _config(*, max_items: int = 2, context_after_items: int = 0) -> LLMChunkExecutionConfig:
+    repair = PromptLoader(Path("resources/prompts")).load("repair_structured", "v1")
     return LLMChunkExecutionConfig(
         task_kind="correct_source",
         provider_kind="openai-compatible",
@@ -47,13 +52,17 @@ def _config(*, max_items: int = 2, context_after_items: int = 0) -> LLMChunkExec
         profile="quality",
         prompt_id="correct_source",
         prompt_version="v1",
-        prompt_content_sha256="content-hash",
+        prompt_content_sha256="a" * 64,
         chunking=ChunkingConfig(
             max_items=max_items,
             max_input_tokens=100,
             context_before_items=1,
             context_after_items=context_after_items,
         ),
+        repair_prompt_id=repair.prompt_id,
+        repair_prompt_version=repair.prompt_version,
+        repair_prompt_content_sha256=repair.content_sha256,
+        repair_prompt_content=repair.content,
     )
 
 
@@ -214,3 +223,28 @@ def test_failed_validation_repair_is_not_cached(tmp_path: Path) -> None:
         "repair_structured",
     ]
     assert not list(cache.root.rglob("*.json"))
+
+
+def test_semantically_invalid_cache_entry_is_removed_before_re_request(tmp_path: Path) -> None:
+    cache = FilesystemLLMCache(tmp_path)
+    item = ChunkItem("item-0", "source 10")
+    config = _config(max_items=1)
+    executor = _executor(cache, ScriptedLLMAdapter(), config)
+    chunk = ChunkPlanner(FakeCounter(), config.chunking).plan((item,))[0]
+    default_request = cast(
+        Callable[[LLMChunk], LLMRequest], getattr(executor, "_default_" + "request")
+    )
+    request = default_request(chunk)
+    batch_schema = response_batch_schema(SourceCorrectionResponse)
+    invalid = batch_schema.from_mapping([{"id": "item-0", "corrected_source": "corrected"}])
+    cache_key = cast(
+        Callable[[LLMRequest, type[StructuredResponseBatch]], LLMCacheKey],
+        getattr(executor, "_cache_" + "key"),
+    )
+    key = cache_key(request, batch_schema)
+    cache.put(key, invalid, batch_schema)
+    adapter = ScriptedLLMAdapter(structured_responses=[AppError("llm.request_rejected")])
+    with pytest.raises(AppError, match=r"llm\.request_rejected"):
+        asyncio.run(_executor(cache, adapter, config).execute((item,), SourceCorrectionResponse))
+    assert adapter.structured_calls
+    assert not cache.path_for(key).exists()

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from captioner.core.domain.errors import AppError
+from captioner.core.domain.llm import LLMRequest, encode_llm_request
 from captioner.core.policies.unicode_metrics import normalize_text
-from captioner.core.ports.token_counter import TokenCounter
+from captioner.core.ports.token_counter import LLMRequestEstimator, TokenCounter
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,12 +90,36 @@ class LLMChunk:
 ChunkPlan = LLMChunk
 
 
+@dataclass(frozen=True, slots=True)
+class SerializedRequestTokenEstimator:
+    """Count the complete serialized request using an injected token counter."""
+
+    token_counter: TokenCounter
+    model: str
+    temperature: float
+
+    def estimate_input_tokens(
+        self,
+        request: LLMRequest,
+        response_schema: type[object],
+    ) -> int:
+        encoded = encode_llm_request(request, self.model, self.temperature, response_schema)
+        count = self.token_counter.count(encoded.decode("utf-8"))
+        if type(count) is not int or count < 0:
+            raise AppError("llm.token_count_invalid", {"item_id": request.item_ids[0]})
+        return count
+
+
 class ChunkPlanner:
     """Greedy, forward-only planner with deterministic context trimming."""
 
     def __init__(self, token_counter: TokenCounter, config: ChunkingConfig | None = None) -> None:
         self._token_counter = token_counter
         self._config = config or ChunkingConfig()
+
+    @property
+    def token_counter(self) -> TokenCounter:
+        return self._token_counter
 
     def plan(
         self,
@@ -103,6 +128,23 @@ class ChunkPlanner:
     ) -> tuple[LLMChunk, ...]:
         selected = self._config if config is None else config
         return plan_chunks(items, selected, self._token_counter)
+
+    def plan_for_request(
+        self,
+        items: Sequence[ChunkItem],
+        config: ChunkingConfig,
+        request_factory: Callable[[LLMChunk], LLMRequest],
+        response_schema: type[object],
+        estimator: LLMRequestEstimator,
+    ) -> tuple[LLMChunk, ...]:
+        return plan_chunks(
+            items,
+            config,
+            self._token_counter,
+            request_factory=request_factory,
+            response_schema=response_schema,
+            request_estimator=estimator,
+        )
 
     def plan_range(
         self,
@@ -117,11 +159,38 @@ class ChunkPlanner:
             items, core_start, core_end, selected, self._token_counter, index=index
         )
 
+    def plan_range_for_request(
+        self,
+        items: Sequence[ChunkItem],
+        core_start: int,
+        core_end: int,
+        config: ChunkingConfig,
+        request_factory: Callable[[LLMChunk], LLMRequest],
+        response_schema: type[object],
+        estimator: LLMRequestEstimator,
+        index: int = 0,
+    ) -> LLMChunk:
+        return plan_chunk_range(
+            items,
+            core_start,
+            core_end,
+            config,
+            self._token_counter,
+            index=index,
+            request_factory=request_factory,
+            response_schema=response_schema,
+            request_estimator=estimator,
+        )
+
 
 def plan_chunks(
     items: Sequence[ChunkItem],
     config: ChunkingConfig,
     token_counter: TokenCounter,
+    *,
+    request_factory: Callable[[LLMChunk], LLMRequest] | None = None,
+    response_schema: type[object] | None = None,
+    request_estimator: LLMRequestEstimator | None = None,
 ) -> tuple[LLMChunk, ...]:
     """Plan chunks without ever placing context IDs in the output set."""
     ordered = tuple(items)
@@ -156,6 +225,9 @@ def plan_chunks(
                 core_end=end,
                 token_counts=token_counts,
                 config=config,
+                request_factory=request_factory,
+                response_schema=response_schema,
+                request_estimator=request_estimator,
             )
             if candidate is None:
                 break
@@ -179,6 +251,9 @@ def plan_chunk_range(
     token_counter: TokenCounter,
     *,
     index: int = 0,
+    request_factory: Callable[[LLMChunk], LLMRequest] | None = None,
+    response_schema: type[object] | None = None,
+    request_estimator: LLMRequestEstimator | None = None,
 ) -> LLMChunk:
     """Replan one contiguous core range with freshly computed context."""
     ordered = tuple(items)
@@ -195,6 +270,9 @@ def plan_chunk_range(
         core_end=core_end,
         token_counts=token_counts,
         config=config,
+        request_factory=request_factory,
+        response_schema=response_schema,
+        request_estimator=request_estimator,
     )
     if candidate is None:
         raise AppError("llm.item_too_large", {"item_id": ordered[core_start].id})
@@ -227,6 +305,9 @@ def _fit_window(
     core_end: int,
     token_counts: tuple[int, ...],
     config: ChunkingConfig,
+    request_factory: Callable[[LLMChunk], LLMRequest] | None = None,
+    response_schema: type[object] | None = None,
+    request_estimator: LLMRequestEstimator | None = None,
 ) -> tuple[tuple[ChunkItem, ...], tuple[ChunkItem, ...]] | None:
     core = ordered[core_start:core_end]
     if sum(token_counts[core_start:core_end]) > config.max_input_tokens:
@@ -239,7 +320,16 @@ def _fit_window(
             token_counts[index]
             for index in _context_indexes(ordered, core_start, core_end, context, token_counts)
         )
-        if total_tokens <= config.max_input_tokens and _within_audio_budget(core, context, config):
+        complete_tokens = total_tokens
+        if request_factory is not None:
+            if response_schema is None or request_estimator is None:
+                raise AppError("llm.chunk_config_invalid", {"reason": "request_budget"})
+            candidate_chunk = LLMChunk(0, tuple(core), context)
+            request = request_factory(candidate_chunk)
+            complete_tokens = request_estimator.estimate_input_tokens(request, response_schema)
+        if complete_tokens <= config.max_input_tokens and _within_audio_budget(
+            core, context, config
+        ):
             return tuple(core), context
         if not before and not after:
             return None
