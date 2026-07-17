@@ -137,6 +137,33 @@ _CURRENCY_WORD_ALIASES = MappingProxyType(
         "renminbi": "word:CNY",
     }
 )
+_CURRENCY_FREE_PREFIX_ALIASES = MappingProxyType(
+    {
+        "$": _CURRENCY_SYMBOL_ALIASES["$"],
+        "€": _CURRENCY_SYMBOL_ALIASES["€"],
+        "£": _CURRENCY_SYMBOL_ALIASES["£"],
+        "¥": _CURRENCY_SYMBOL_ALIASES["¥"],
+        "₹": _CURRENCY_SYMBOL_ALIASES["₹"],
+        "元": _CURRENCY_SYMBOL_ALIASES["元"],
+        "人民币": _CURRENCY_SYMBOL_ALIASES["人民币"],
+        "円": _CURRENCY_SYMBOL_ALIASES["円"],
+        "ドル": _CURRENCY_SYMBOL_ALIASES["ドル"],
+    }
+)
+_CURRENCY_BOUNDARY_PREFIX_ALIASES = MappingProxyType(
+    {
+        "US$": _CURRENCY_SYMBOL_ALIASES["US$"],
+        "A$": _CURRENCY_SYMBOL_ALIASES["A$"],
+        "C$": _CURRENCY_SYMBOL_ALIASES["C$"],
+        "NZ$": _CURRENCY_SYMBOL_ALIASES["NZ$"],
+        "USD": _CURRENCY_SYMBOL_ALIASES["USD"],
+        "EUR": _CURRENCY_SYMBOL_ALIASES["EUR"],
+        "GBP": _CURRENCY_SYMBOL_ALIASES["GBP"],
+        "JPY": _CURRENCY_SYMBOL_ALIASES["JPY"],
+        "CNY": _CURRENCY_SYMBOL_ALIASES["CNY"],
+        "RMB": _CURRENCY_SYMBOL_ALIASES["RMB"],
+    }
+)
 _PERCENTAGE_WORD_ALIASES = MappingProxyType({"percent": "%", "percentage": "%", "per cent": "%"})
 _UNIT_COMPACT_ALIASES = MappingProxyType(
     {
@@ -239,6 +266,12 @@ class _SlashTailMatch:
 
 
 @dataclass(frozen=True, slots=True)
+class _AttachedTailMatch:
+    end: int
+    identity: str
+
+
+@dataclass(frozen=True, slots=True)
 class _ProtectedItem:
     span: ProtectedSpan
     token: ProtectedToken
@@ -247,12 +280,13 @@ class _ProtectedItem:
 class _ContinuationKind(StrEnum):
     END = "end"
     PUNCTUATION = "punctuation"
-    WORD_SUFFIX = "word_suffix"
+    SEPARATED_WORD = "separated_word"
+    ATTACHED_WORD_SUFFIX = "attached_word_suffix"
     SLASH_SUFFIX = "slash_suffix"
 
 
 _INLINE_SPACES = " \t"
-_MAX_SLASH_TAIL_LENGTH = 128
+_MAX_UNSUPPORTED_TAIL_LENGTH = 128
 
 
 def _is_word_character(character: str) -> bool:
@@ -296,7 +330,12 @@ _LONGEST_CURRENCY_PREFIX_ALIASES = tuple(
     sorted(
         (
             *_sorted_alias_specs(
-                _CURRENCY_SYMBOL_ALIASES,
+                _CURRENCY_FREE_PREFIX_ALIASES,
+                boundary_before=False,
+                boundary_after=False,
+            ),
+            *_sorted_alias_specs(
+                _CURRENCY_BOUNDARY_PREFIX_ALIASES,
                 boundary_before=True,
                 boundary_after=False,
             ),
@@ -423,6 +462,25 @@ def _match_alias(
     return None
 
 
+def _is_embedded_currency_code_suffix(
+    text: str,
+    position: int,
+    alias_text: str,
+) -> bool:
+    alias_end = position + len(alias_text)
+    for boundary_alias in _CURRENCY_BOUNDARY_PREFIX_ALIASES:
+        if not boundary_alias.endswith(alias_text):
+            continue
+        boundary_start = alias_end - len(boundary_alias)
+        if boundary_start < 0:
+            continue
+        if text[boundary_start:alias_end].casefold() != boundary_alias.casefold():
+            continue
+        if boundary_start > 0 and _is_word_character(text[boundary_start - 1]):
+            return True
+    return False
+
+
 def _match_suffix_alias(
     text: str,
     position: int,
@@ -463,13 +521,17 @@ def _classify_fact_continuation(
     text: str,
     position: int,
 ) -> tuple[_ContinuationKind, int]:
+    if position >= len(text):
+        return _ContinuationKind.END, position
+    if _is_word_character(text[position]):
+        return _ContinuationKind.ATTACHED_WORD_SUFFIX, position
     candidate = _skip_inline_spaces(text, position)
     if candidate >= len(text):
         return _ContinuationKind.END, candidate
     if text[candidate] == "/":
         return _ContinuationKind.SLASH_SUFFIX, candidate
     if _is_word_character(text[candidate]):
-        return _ContinuationKind.WORD_SUFFIX, candidate
+        return _ContinuationKind.SEPARATED_WORD, candidate
     return _ContinuationKind.PUNCTUATION, candidate
 
 
@@ -481,7 +543,7 @@ def _scan_slash_tail(text: str, position: int) -> _SlashTailMatch | None:
     slash_position = _skip_inline_spaces(text, position)
     if slash_position >= len(text) or text[slash_position] != "/":
         return None
-    limit = min(len(text), slash_position + _MAX_SLASH_TAIL_LENGTH)
+    limit = min(len(text), slash_position + _MAX_UNSUPPORTED_TAIL_LENGTH)
     cursor = slash_position
     components: list[str] = []
     last_end = slash_position + 1
@@ -509,6 +571,19 @@ def _scan_slash_tail(text: str, position: int) -> _SlashTailMatch | None:
     return _SlashTailMatch(max(last_end, slash_position + 1), identity)
 
 
+def _scan_attached_word_tail(text: str, position: int) -> _AttachedTailMatch | None:
+    if position >= len(text) or not _is_word_character(text[position]):
+        return None
+
+    limit = min(len(text), position + _MAX_UNSUPPORTED_TAIL_LENGTH)
+    cursor = position
+    while cursor < limit and _is_word_character(text[cursor]):
+        cursor += 1
+    overflow = cursor == limit and cursor < len(text) and _is_word_character(text[cursor])
+    identity = "overflow" if overflow else text[position:cursor].casefold()
+    return _AttachedTailMatch(cursor, identity)
+
+
 def _quantity_item(
     text: str,
     start: int,
@@ -532,16 +607,31 @@ def _finish_quantity_fact(
     sign: str,
     marker: str,
 ) -> _ProtectedItem:
-    continuation, _ = _classify_fact_continuation(text, base_end)
+    continuation, continuation_position = _classify_fact_continuation(text, base_end)
     if continuation is _ContinuationKind.SLASH_SUFFIX:
         tail = _scan_slash_tail(text, base_end)
         if tail is not None:
-            unsupported_marker = f"unsupported:{kind}:{marker}/{tail.identity}"
+            base_marker = marker or "none"
+            unsupported_marker = f"unsupported:{kind}:{base_marker}/{tail.identity}"
             return _quantity_item(
                 text,
                 start,
                 tail.end,
                 "unsupported-compound",
+                numeric_value,
+                sign,
+                unsupported_marker,
+            )
+    if continuation is _ContinuationKind.ATTACHED_WORD_SUFFIX:
+        tail = _scan_attached_word_tail(text, continuation_position)
+        if tail is not None:
+            base_marker = marker or "none"
+            unsupported_marker = f"unsupported:{kind}:{base_marker}+{tail.identity}"
+            return _quantity_item(
+                text,
+                start,
+                tail.end,
+                "unsupported-attached",
                 numeric_value,
                 sign,
                 unsupported_marker,
@@ -556,6 +646,8 @@ def _scan_currency_prefix_fact_at(
     sign = _scan_sign(text, position)
     alias = _match_alias(text, sign.end, _LONGEST_CURRENCY_PREFIX_ALIASES)
     if alias is None:
+        return None
+    if _is_embedded_currency_code_suffix(text, sign.end, alias.text):
         return None
     number_position = alias.end
     number_position = _skip_inline_spaces(text, number_position)

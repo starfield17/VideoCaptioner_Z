@@ -189,6 +189,123 @@ def test_currency_prefix_scanner_preserves_unsupported_slash_suffix(text: str) -
     assert "/kg" in item.token.marker
 
 
+@pytest.mark.parametrize(
+    ("text", "numeric_value"),
+    [
+        ("$100USD", "100"),
+        ("$100kg", "100"),
+        ("USD 100kg", "100"),
+        ("10/20kg", "10|20"),
+        ("100\u00d7200kg", "100|200"),
+        ("100kgx", "100"),
+    ],
+)
+def test_attached_quantity_tail_is_one_unsupported_fact(text: str, numeric_value: str) -> None:
+    tokens = protected_tokens(text)
+
+    assert len(tokens) == 1
+    assert tokens[0].kind == "unsupported-attached"
+    assert tokens[0].numeric_value == numeric_value
+    assert tokens[0].text == text
+
+
+@pytest.mark.parametrize(
+    ("source", "output"),
+    [
+        ("$100", "$100USD"),
+        ("$100", "$100kg"),
+        ("USD 100", "USD 100kg"),
+        ("10/20", "10/20kg"),
+        ("100\u00d7200", "100\u00d7200kg"),
+        ("100", "100kgx"),
+    ],
+)
+def test_attached_quantity_tail_cannot_be_ignored(source: str, output: str) -> None:
+    assert protected_tokens_preserved(source, output) is False
+
+
+@pytest.mark.parametrize(
+    ("source", "output"),
+    [
+        ("$100USD", "$100kg"),
+        ("10/20kg", "10/20items"),
+        ("100\u00d7200kg", "100\u00d7200cm"),
+        ("100kgx", "100kgy"),
+    ],
+)
+def test_attached_quantity_tail_identity_is_distinct(source: str, output: str) -> None:
+    assert protected_tokens_preserved(source, output) is False
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_kind"),
+    [
+        ("100 people", "number"),
+        ("$100 total", "currency"),
+        ("10/20 ratio", "number"),
+        ("100\u00d7200 pixels", "unit"),
+    ],
+)
+def test_separated_prose_is_not_an_attached_tail(text: str, expected_kind: str) -> None:
+    tokens = protected_tokens(text)
+
+    assert len(tokens) == 1
+    assert tokens[0].kind == expected_kind
+    assert tokens[0].kind != "unsupported-attached"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x$100",
+        "foo€100",
+        "price£100",
+        "cost¥100",
+        "约人民币100",
+    ],
+)
+def test_free_currency_prefix_can_follow_ordinary_text(text: str) -> None:
+    tokens = protected_tokens(text)
+
+    assert len(tokens) == 1
+    assert tokens[0].kind == "currency"
+    assert tokens[0].numeric_value == "100"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "x$100",
+        "foo€100",
+        "price£100",
+        "cost¥100",
+        "约人民币100",
+    ],
+)
+def test_free_currency_prefix_is_not_reduced_to_bare_number(output: str) -> None:
+    assert protected_tokens_preserved("100", output) is False
+
+
+@pytest.mark.parametrize("text", ["xUSD 100", "myEUR 100", "abcUS$100"])
+def test_currency_code_prefix_still_requires_word_boundary(text: str) -> None:
+    tokens = protected_tokens(text)
+
+    assert all(token.kind != "currency" for token in tokens)
+
+
+def test_attached_tail_is_bounded() -> None:
+    text = "$100" + ("a" * 256)
+    tokens = protected_tokens(text)
+    spans = find_protected_spans(text)
+
+    assert len(tokens) == 1
+    assert tokens[0].kind == "unsupported-attached"
+    assert "overflow" in tokens[0].marker
+    assert len(spans) == 1
+    assert spans[0].end > spans[0].start
+    assert spans[0].end <= len(text)
+
+
 @pytest.mark.parametrize("text", ["10/20", "100/200", "١٢/٣"])
 def test_numeric_ratio_consumes_both_numbers(text: str) -> None:
     token = protected_tokens(text)[0]
