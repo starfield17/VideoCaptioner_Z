@@ -1,0 +1,285 @@
+name: Release Full Gate
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  full-checks:
+    name: ubuntu-24.04-full-checks
+    runs-on: ubuntu-24.04
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            ffmpeg \
+            libegl1 \
+            libgl1 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Full quality and coverage gate
+        run: uv run python scripts/check.py --full
+      - name: Real FFmpeg and local integration checks
+        run: uv run pytest tests/integration -q -m integration
+      - name: Golden checks
+        run: uv run pytest tests/golden -q
+      - name: Credential leakage scan
+        run: uv run python scripts/check_forbidden_patterns.py
+
+  package-ubuntu:
+    name: ubuntu-24.04-package
+    needs: full-checks
+    runs-on: ubuntu-24.04
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+      NUITKA_CACHE_DIR: ${{ github.workspace }}/.cache/nuitka
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            ccache \
+            libegl1 \
+            libgl1 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0
+          ccache --max-size=1G
+          ccache --set-config=compression=true
+      - name: Restore Nuitka compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/nuitka
+          key: >-
+            nuitka-${{ runner.os }}-py313-${{ hashFiles('uv.lock', 'scripts/build_nuitka.py') }}-${{ github.sha }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-py313-${{ hashFiles('uv.lock', 'scripts/build_nuitka.py') }}-
+            nuitka-${{ runner.os }}-py313-
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Nuitka standalone build
+        run: uv run python scripts/build_nuitka.py --clean --version 0.0.0
+      - name: Verify staged Ubuntu distribution
+        run: |
+          test -x dist/captioner/captioner
+          test -f dist/captioner/THIRD_PARTY_NOTICES.md
+          test -f dist/captioner/resources/tokenizers/cl100k_base.tiktoken
+          test -f dist/captioner/resources/tokenizers/o200k_base.tiktoken
+      - name: Pre-archive Ubuntu compiled smoke
+        run: |
+          set -euo pipefail
+          SMOKE_ROOT="$(mktemp -d)"
+          cd "$SMOKE_ROOT"
+          "$GITHUB_WORKSPACE/dist/captioner/captioner" --cli --help
+          "$GITHUB_WORKSPACE/dist/captioner/captioner" --cli doctor --tokenizer-smoke --json
+          "$GITHUB_WORKSPACE/dist/captioner/captioner" \
+            --cli subtitle-corpus \
+            "$GITHUB_WORKSPACE/tests/fixtures/transcripts" \
+            --json
+          "$GITHUB_WORKSPACE/dist/captioner/captioner" --gui --smoke-test
+      - name: Archive Ubuntu distribution
+        run: tar -C dist -czf dist/captioner-linux.tar.gz captioner
+      - name: Extract Ubuntu archive
+        run: |
+          EXTRACT_ROOT="$(mktemp -d)"
+          tar -xzf dist/captioner-linux.tar.gz -C "$EXTRACT_ROOT"
+          echo "CAPTIONER_EXTRACT_ROOT=$EXTRACT_ROOT" >> "$GITHUB_ENV"
+      - name: Post-extraction Ubuntu compiled smoke
+        run: |
+          set -euo pipefail
+          EXTRACTED="$CAPTIONER_EXTRACT_ROOT/captioner/captioner"
+          test -x "$EXTRACTED"
+          test -f "$CAPTIONER_EXTRACT_ROOT/captioner/THIRD_PARTY_NOTICES.md"
+          SMOKE_ROOT="$(mktemp -d)"
+          cd "$SMOKE_ROOT"
+          "$EXTRACTED" --cli --help
+          "$EXTRACTED" --cli doctor --tokenizer-smoke --json
+          "$EXTRACTED" --cli subtitle-corpus \
+            "$GITHUB_WORKSPACE/tests/fixtures/transcripts" \
+            --json
+          "$EXTRACTED" --gui --smoke-test
+      - name: Upload Ubuntu archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: captioner-ubuntu-${{ github.ref_name }}
+          path: dist/captioner-linux.tar.gz
+          if-no-files-found: error
+
+  package-windows:
+    name: windows-2022-package
+    needs: full-checks
+    runs-on: windows-2022
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Nuitka standalone build
+        run: uv run python scripts/build_nuitka.py --clean --version 0.0.0
+      - name: Verify staged Windows distribution
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\captioner\captioner.exe")) { throw "missing executable" }
+          if (-not (Test-Path "dist\captioner\THIRD_PARTY_NOTICES.md")) { throw "missing notices" }
+          if (-not (Test-Path "dist\captioner\resources\tokenizers\cl100k_base.tiktoken")) { throw "missing cl100k_base" }
+          if (-not (Test-Path "dist\captioner\resources\tokenizers\o200k_base.tiktoken")) { throw "missing o200k_base" }
+      - name: Pre-archive Windows compiled smoke
+        shell: pwsh
+        run: |
+          $SmokeRoot = Join-Path $env:RUNNER_TEMP ("captioner-prearchive-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Force -Path $SmokeRoot | Out-Null
+          Set-Location $SmokeRoot
+          & "$env:GITHUB_WORKSPACE\dist\captioner\captioner.exe" --cli --help
+          & "$env:GITHUB_WORKSPACE\dist\captioner\captioner.exe" --cli doctor --tokenizer-smoke --json
+          & "$env:GITHUB_WORKSPACE\dist\captioner\captioner.exe" --cli subtitle-corpus "$env:GITHUB_WORKSPACE\tests\fixtures\transcripts" --json
+          & "$env:GITHUB_WORKSPACE\dist\captioner\captioner.exe" --gui --smoke-test
+      - name: Archive Windows distribution
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path dist\captioner `
+            -DestinationPath dist\captioner-windows.zip `
+            -Force
+      - name: Extract Windows archive
+        shell: pwsh
+        run: |
+          $ExtractRoot = Join-Path $env:RUNNER_TEMP ("captioner-windows-extracted-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Force -Path $ExtractRoot | Out-Null
+          Expand-Archive -Path dist\captioner-windows.zip -DestinationPath $ExtractRoot -Force
+          "CAPTIONER_EXTRACT_ROOT=$ExtractRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Post-extraction Windows compiled smoke
+        shell: pwsh
+        run: |
+          $ExtractedRoot = Join-Path $env:CAPTIONER_EXTRACT_ROOT "captioner"
+          $Extracted = Join-Path $ExtractedRoot "captioner.exe"
+          if (-not (Test-Path $Extracted)) { throw "missing extracted executable" }
+          if (-not (Test-Path (Join-Path $ExtractedRoot "THIRD_PARTY_NOTICES.md"))) { throw "missing extracted notices" }
+          if (-not (Test-Path (Join-Path $ExtractedRoot "resources\tokenizers\tokenizer-manifest.json"))) { throw "missing extracted tokenizer manifest" }
+          if (-not (Test-Path (Join-Path $ExtractedRoot "resources\tokenizers\cl100k_base.tiktoken"))) { throw "missing extracted cl100k_base" }
+          if (-not (Test-Path (Join-Path $ExtractedRoot "resources\tokenizers\o200k_base.tiktoken"))) { throw "missing extracted o200k_base" }
+          $SmokeRoot = Join-Path $env:RUNNER_TEMP ("captioner-postarchive-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Force -Path $SmokeRoot | Out-Null
+          Set-Location $SmokeRoot
+          & $Extracted --cli --help
+          & $Extracted --cli doctor --tokenizer-smoke --json
+          & $Extracted --cli subtitle-corpus "$env:GITHUB_WORKSPACE\tests\fixtures\transcripts" --json
+          & $Extracted --gui --smoke-test
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: captioner-windows-${{ github.ref_name }}
+          path: dist/captioner-windows.zip
+          if-no-files-found: error
+
+  package-macos:
+    name: macos-15-package
+    needs: full-checks
+    runs-on: macos-15
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Nuitka standalone build
+        run: uv run python scripts/build_nuitka.py --clean --version 0.0.0
+      - name: Verify staged macOS distribution
+        run: |
+          test -x dist/Captioner.app/Contents/MacOS/captioner
+          test -f dist/Captioner.app/Contents/Resources/THIRD_PARTY_NOTICES.md
+          test -f dist/Captioner.app/Contents/Resources/resources/tokenizers/cl100k_base.tiktoken
+          test -f dist/Captioner.app/Contents/Resources/resources/tokenizers/o200k_base.tiktoken
+      - name: Pre-archive macOS compiled smoke
+        run: |
+          set -euo pipefail
+          SMOKE_ROOT="$(mktemp -d)"
+          cd "$SMOKE_ROOT"
+          "$GITHUB_WORKSPACE/dist/Captioner.app/Contents/MacOS/captioner" --cli --help
+          "$GITHUB_WORKSPACE/dist/Captioner.app/Contents/MacOS/captioner" --cli doctor --tokenizer-smoke --json
+          "$GITHUB_WORKSPACE/dist/Captioner.app/Contents/MacOS/captioner" \
+            --cli subtitle-corpus \
+            "$GITHUB_WORKSPACE/tests/fixtures/transcripts" \
+            --json
+          "$GITHUB_WORKSPACE/dist/Captioner.app/Contents/MacOS/captioner" --gui --smoke-test
+      - name: Archive macOS distribution
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            dist/Captioner.app \
+            dist/Captioner-macos.zip
+      - name: Extract macOS archive
+        run: |
+          EXTRACT_ROOT="$(mktemp -d)"
+          ditto -x -k dist/Captioner-macos.zip "$EXTRACT_ROOT"
+          echo "CAPTIONER_EXTRACT_ROOT=$EXTRACT_ROOT" >> "$GITHUB_ENV"
+      - name: Post-extraction macOS compiled smoke
+        run: |
+          set -euo pipefail
+          EXTRACTED="$CAPTIONER_EXTRACT_ROOT/Captioner.app/Contents/MacOS/captioner"
+          test -x "$EXTRACTED"
+          test -f "$CAPTIONER_EXTRACT_ROOT/Captioner.app/Contents/Resources/THIRD_PARTY_NOTICES.md"
+          SMOKE_ROOT="$(mktemp -d)"
+          cd "$SMOKE_ROOT"
+          "$EXTRACTED" --cli --help
+          "$EXTRACTED" --cli doctor --tokenizer-smoke --json
+          "$EXTRACTED" --cli subtitle-corpus \
+            "$GITHUB_WORKSPACE/tests/fixtures/transcripts" \
+            --json
+          "$EXTRACTED" --gui --smoke-test
+      - name: Upload macOS archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: captioner-macos-${{ github.ref_name }}
+          path: dist/Captioner-macos.zip
+          if-no-files-found: error

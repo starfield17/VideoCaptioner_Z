@@ -1,4 +1,4 @@
-"""Durable Phase 2/3 Batch CLI command boundaries."""
+"""Profile-aware durable Batch CLI command boundaries."""
 
 from __future__ import annotations
 
@@ -6,8 +6,10 @@ import asyncio
 import json
 import os
 import socket
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 from captioner.adapters.persistence.json_manifest_store import JsonManifestStore
 from captioner.adapters.persistence.jsonl_journal import JsonlJournal
@@ -16,15 +18,30 @@ from captioner.bootstrap import (
     build_durable_service,
     create_batch_lease,
     create_job_config,
+    create_llm_job_snapshot,
 )
 from captioner.core.application.durable_pipeline import BatchStatus, write_cancel_marker
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobState, validate_identifier
 from captioner.core.domain.journal import replay
-from captioner.core.domain.stage import STAGE_PLAN, StageName
+from captioner.core.domain.llm_job_config import LLMJobSnapshot
+from captioner.core.domain.result import FrozenJsonValue, freeze_json_value, thaw_json_value
+from captioner.core.domain.stage import (
+    PipelineProfile,
+    StageName,
+    stage_plan_for,
+    stage_versions_for,
+)
 from captioner.infrastructure.app_paths import AppPaths, resolve_safe_child
 from captioner.infrastructure.ids import new_id
+
+
+class _LanguageUnset:
+    __slots__ = ()
+
+
+LANGUAGE_UNSET = _LanguageUnset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +55,9 @@ class BatchRunOptions:
     ffmpeg_bin: str
     ffprobe_bin: str
     overwrite: bool
+    pipeline_profile: PipelineProfile = PipelineProfile.DETERMINISTIC
+    target_language: str | None = None
+    llm_provider_profile: str = "default"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,8 +65,16 @@ class ResumeOverrides:
     model_ref: str | None = None
     device: str | None = None
     compute_type: str | None = None
-    language: str | None = None
+    language: str | None | _LanguageUnset = LANGUAGE_UNSET
     output_dir: Path | None = None
+    pipeline_profile: PipelineProfile | None = None
+    llm: Mapping[str, object] | None = None
+    target_language: str | None = None
+    llm_provider_profile: str | None = None
+
+    @property
+    def has_language_override(self) -> bool:
+        return not isinstance(self.language, _LanguageUnset)
 
 
 def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
@@ -54,6 +82,17 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
     batch_id = new_id("batch-")
     output_dir = options.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    llm_snapshot = None
+    if options.pipeline_profile in {PipelineProfile.FAST, PipelineProfile.QUALITY}:
+        if options.target_language is None:
+            raise AppError("llm.target_language_missing")
+        llm_snapshot = create_llm_job_snapshot(
+            target_language=options.target_language,
+            provider_profile=options.llm_provider_profile,
+            source_language=options.language,
+            paths=paths,
+            pipeline_profile=options.pipeline_profile,
+        )
     config = create_job_config(
         model_ref=options.model_ref,
         device=options.device,
@@ -63,6 +102,8 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
         ffprobe_bin=options.ffprobe_bin,
         output_dir=output_dir,
         overwrite=options.overwrite,
+        pipeline_profile=options.pipeline_profile,
+        llm=llm_snapshot,
     )
     bundle = build_durable_service(
         batch_id,
@@ -73,6 +114,8 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
         ffmpeg_bin=options.ffmpeg_bin,
         ffprobe_bin=options.ffprobe_bin,
         paths=paths,
+        pipeline_profile=options.pipeline_profile,
+        llm=config.llm,
     )
     lease = create_batch_lease(bundle.batch_dir)
     lease.acquire()
@@ -82,7 +125,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
             for index, source in enumerate(options.inputs, 1)
         )
         projection = bundle.service.create(batch_id, jobs)
-        return asyncio.run(bundle.service.run(projection))
+        return asyncio.run(_run_and_close(bundle, lambda: bundle.service.run(projection)))
     finally:
         lease.release()
 
@@ -111,19 +154,19 @@ def resume(
             overrides = replace(overrides, output_dir=output_dir)
         projection = _read_projection(batch_id, paths=paths, repair=True)
         config = _common_config(projection)
-        selected = config if overrides is None else _apply_overrides(config, overrides)
+        selected = config if overrides is None else _apply_overrides(config, overrides, paths)
         bundle = _bundle(batch_id, selected, paths)
         if selected != config:
             earliest = min(
                 (_earliest_change(job.config, selected) for job in projection.jobs),
-                key=STAGE_PLAN.index,
+                key=lambda stage: stage_plan_for(selected.pipeline_profile).index(stage),
             )
             projection = bundle.service.update_config(
                 projection,
                 config=selected,
                 earliest_stage=earliest,
             )
-        return asyncio.run(bundle.service.resume())
+        return asyncio.run(_run_and_close(bundle, bundle.service.resume))
     finally:
         lease.release()
 
@@ -136,7 +179,7 @@ def retry(batch_id: str, job_id: str, stage: StageName, *, paths: AppPaths) -> B
         projection = _read_projection(batch_id, paths=paths, repair=True)
         config = _common_config(projection)
         bundle = _bundle(batch_id, config, paths)
-        return asyncio.run(bundle.service.retry(job_id, stage))
+        return asyncio.run(_run_and_close(bundle, lambda: bundle.service.retry(job_id, stage)))
     finally:
         lease.release()
 
@@ -306,6 +349,8 @@ def _bundle(
         ffprobe_bin=config.ffprobe_bin,
         paths=paths,
         segmentation=config.segmentation,
+        pipeline_profile=config.pipeline_profile,
+        llm=config.llm,
         initialize_runtime=initialize_runtime,
     )
 
@@ -364,19 +409,32 @@ def _read_projection(batch_id: str, *, paths: AppPaths, repair: bool) -> BatchPr
     return replay(events)
 
 
-def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig:
+def _apply_overrides(
+    config: JobConfig,
+    overrides: ResumeOverrides,
+    paths: AppPaths | None = None,
+) -> JobConfig:
+    selected_profile = (
+        config.pipeline_profile
+        if overrides.pipeline_profile is None
+        else PipelineProfile(overrides.pipeline_profile)
+    )
+    llm = _llm_for_resume(config, overrides, selected_profile, paths)
+    effective_language = _effective_language(config, overrides)
     if overrides.model_ref is not None:
         candidate = create_job_config(
             model_ref=overrides.model_ref,
             device=overrides.device or config.device,
             compute_type=overrides.compute_type or config.compute_type,
-            language=config.language if overrides.language is None else overrides.language,
+            language=effective_language,
             ffmpeg_bin=config.ffmpeg_bin,
             ffprobe_bin=config.ffprobe_bin,
             output_dir=Path(config.output_dir)
             if overrides.output_dir is None
             else overrides.output_dir,
             overwrite=config.overwrite,
+            pipeline_profile=selected_profile,
+            llm=llm,
         )
         return replace(
             candidate,
@@ -385,20 +443,105 @@ def _apply_overrides(config: JobConfig, overrides: ResumeOverrides) -> JobConfig
             ffprobe_bin=config.ffprobe_bin,
             normalization=config.normalization,
             segmentation=config.segmentation,
-            stage_versions=config.stage_versions,
+            stage_versions=stage_versions_for(selected_profile),
+            pipeline_profile=candidate.pipeline_profile,
+            llm=candidate.llm,
         )
     return replace(
         config,
         device=overrides.device or config.device,
         compute_type=overrides.compute_type or config.compute_type,
-        language=config.language if overrides.language is None else overrides.language,
+        language=effective_language,
         output_dir=config.output_dir
         if overrides.output_dir is None
         else str(overrides.output_dir.resolve()),
+        pipeline_profile=selected_profile,
+        stage_versions=stage_versions_for(selected_profile),
+        llm=llm,
     )
 
 
+def _llm_for_resume(
+    config: JobConfig,
+    overrides: ResumeOverrides,
+    selected_profile: PipelineProfile,
+    paths: AppPaths | None,
+) -> Mapping[str, FrozenJsonValue] | None:
+    if selected_profile is PipelineProfile.DETERMINISTIC:
+        if overrides.llm is not None:
+            raise AppError("llm.snapshot_invalid", {"reason": "profile"})
+        return None
+    # Compute effective values first so snapshot identity never reads stale config.
+    effective_language = _effective_language(config, overrides)
+    effective_target_language = (
+        config.target_language if overrides.target_language is None else overrides.target_language
+    )
+    if effective_target_language is None:
+        raise AppError("llm.target_language_missing")
+    effective_provider_profile = (
+        config.provider_profile or "default"
+        if overrides.llm_provider_profile is None
+        else overrides.llm_provider_profile
+    )
+    if overrides.llm is not None:
+        snapshot = LLMJobSnapshot.from_mapping(thaw_json_value(_frozen_llm(overrides.llm)))
+        if snapshot.profile is not selected_profile:
+            raise AppError("llm.snapshot_invalid", {"reason": "profile"})
+        if snapshot.source_language != effective_language:
+            raise AppError("llm.snapshot_invalid", {"reason": "source_language"})
+        if snapshot.target_language != effective_target_language:
+            raise AppError("llm.snapshot_invalid", {"reason": "target_language"})
+        if snapshot.provider.provider_profile != effective_provider_profile:
+            raise AppError("llm.snapshot_invalid", {"reason": "provider_profile"})
+        return snapshot.to_mapping()
+    profile_changed = selected_profile is not config.pipeline_profile
+    snapshot_source = None if config.llm is None else config.llm.get("source_language")
+    if snapshot_source is not None and not isinstance(snapshot_source, str):
+        raise AppError("llm.snapshot_invalid", {"reason": "source_language"})
+    identity_changed = (
+        overrides.target_language is not None
+        or overrides.llm_provider_profile is not None
+        or overrides.has_language_override
+        or profile_changed
+        or effective_language != snapshot_source
+    )
+    if not identity_changed:
+        if config.llm is None:
+            raise AppError("llm.config_missing", {"reason": "job_snapshot"})
+        return config.llm
+    if paths is None:
+        raise AppError("llm.config_missing", {"reason": "paths"})
+    snapshot = create_llm_job_snapshot(
+        target_language=effective_target_language,
+        provider_profile=effective_provider_profile,
+        source_language=effective_language,
+        paths=paths,
+        pipeline_profile=selected_profile,
+    )
+    return snapshot
+
+
+def _effective_language(config: JobConfig, overrides: ResumeOverrides) -> str | None:
+    if not overrides.has_language_override:
+        return config.language
+    language = overrides.language
+    if isinstance(language, _LanguageUnset):
+        raise AppError("job.config_invalid", {"field": "language"})
+    return language
+
+
+async def _run_and_close(
+    bundle: DurableServiceBundle,
+    operation: Callable[[], Awaitable[BatchProjection]],
+) -> BatchProjection:
+    try:
+        return await operation()
+    finally:
+        await bundle.close()
+
+
 def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:
+    plan = stage_plan_for(new.pipeline_profile)
     if old.ffprobe_bin != new.ffprobe_bin:
         return StageName.INSPECT
     if old.ffmpeg_bin != new.ffmpeg_bin or old.normalization != new.normalization:
@@ -419,15 +562,120 @@ def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:
         new.vad_filter,
     ):
         return StageName.TRANSCRIBE
+    candidates: list[StageName] = []
     if old.segmentation != new.segmentation:
-        return StageName.SEGMENT
+        candidates.append(StageName.SEGMENT)
+    if old.pipeline_profile != new.pipeline_profile:
+        if new.pipeline_profile is PipelineProfile.QUALITY:
+            candidates.append(StageName.CORRECT_SOURCE)
+        elif old.pipeline_profile is PipelineProfile.QUALITY:
+            candidates.append(StageName.SEGMENT)
+        elif new.pipeline_profile is PipelineProfile.FAST:
+            candidates.append(StageName.TRANSLATE)
+        else:
+            candidates.append(StageName.SEGMENT)
+    if old.llm != new.llm:
+        candidates.extend(_changed_llm_stages(old, new, plan))
     if old.stage_versions != new.stage_versions:
-        for stage in STAGE_PLAN:
+        for stage in plan:
             if old.stage_versions.get(stage.value) != new.stage_versions.get(stage.value):
-                return stage
-        raise AppError("batch.config_inconsistent", {"reason": "stage_versions"})
+                candidates.append(stage)
+                break
+        else:
+            if old.pipeline_profile is new.pipeline_profile:
+                raise AppError("batch.config_inconsistent", {"reason": "stage_versions"})
     if old.output_dir != new.output_dir or old.overwrite != new.overwrite:
-        return StageName.PUBLISH
+        candidates.append(StageName.PUBLISH)
+    if candidates:
+        return min(candidates, key=plan.index)
     if old != new:
         raise AppError("batch.config_inconsistent", {"reason": "unknown_config_change"})
     return StageName.PUBLISH
+
+
+def _available_stage(
+    preferred: StageName,
+    plan: tuple[StageName, ...],
+    *,
+    fallback: StageName | None = None,
+) -> StageName:
+    if preferred in plan:
+        return preferred
+    if fallback is not None and fallback in plan:
+        return fallback
+    for candidate in (StageName.SEGMENT, StageName.EXPORT, StageName.PUBLISH):
+        if candidate in plan:
+            return candidate
+    raise AppError("batch.config_inconsistent", {"reason": "empty_stage_plan"})
+
+
+def _changed_prompt_stages(
+    old_snapshot: LLMJobSnapshot,
+    new_snapshot: LLMJobSnapshot,
+    plan: tuple[StageName, ...],
+) -> tuple[StageName, ...]:
+    changed_ids = {
+        prompt_id
+        for prompt_id in set(old_snapshot.prompts) | set(new_snapshot.prompts)
+        if old_snapshot.prompts.get(prompt_id) != new_snapshot.prompts.get(prompt_id)
+    }
+    stages: list[StageName] = []
+    if changed_ids & {"terminology", "correct_source"}:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    if changed_ids & {"translate_fast", "translate_quality"}:
+        stages.append(_available_stage(StageName.TRANSLATE, plan))
+    if "review_anomalies" in changed_ids and StageName.REVIEW in plan:
+        stages.append(StageName.REVIEW)
+    known_ids = {
+        "terminology",
+        "correct_source",
+        "translate_fast",
+        "translate_quality",
+        "review_anomalies",
+    }
+    if changed_ids - known_ids:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    return tuple(stages)
+
+
+def _changed_llm_stages(
+    old: JobConfig,
+    new: JobConfig,
+    plan: tuple[StageName, ...],
+) -> tuple[StageName, ...]:
+    if old.llm is None or new.llm is None:
+        return ()
+    old_snapshot = LLMJobSnapshot.from_mapping(thaw_json_value(old.llm))
+    new_snapshot = LLMJobSnapshot.from_mapping(thaw_json_value(new.llm))
+    stages: list[StageName] = []
+    if old_snapshot.provider != new_snapshot.provider:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    if old_snapshot.source_language != new_snapshot.source_language:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    if old_snapshot.target_language != new_snapshot.target_language:
+        stages.append(_available_stage(StageName.TRANSLATE, plan))
+    if old_snapshot.chunk != new_snapshot.chunk:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    if old_snapshot.response_schema_version != new_snapshot.response_schema_version:
+        stages.append(
+            _available_stage(StageName.CORRECT_SOURCE, plan, fallback=StageName.TRANSLATE)
+        )
+    stages.extend(_changed_prompt_stages(old_snapshot, new_snapshot, plan))
+    return tuple(stages)
+
+
+def _frozen_llm(value: Mapping[str, object]) -> Mapping[str, FrozenJsonValue]:
+    frozen = freeze_json_value(value)
+    if not isinstance(frozen, Mapping):
+        raise AppError("job.config_invalid", {"field": "llm"})
+    return cast(Mapping[str, FrozenJsonValue], frozen)

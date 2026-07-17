@@ -18,6 +18,7 @@ class DoctorOptions:
     locale: str
     as_json: bool
     paths: AppPaths | None = None
+    tokenizer_smoke: bool = False
 
 
 def run(options: DoctorOptions, *, service: I18nService | None = None) -> dict[str, JsonValue]:
@@ -38,7 +39,7 @@ def run(options: DoctorOptions, *, service: I18nService | None = None) -> dict[s
     except AppError:
         catalog_valid = False
 
-    return {
+    payload: dict[str, JsonValue] = {
         "version": __version__,
         "python_version": platform.python_version(),
         "platform": platform.platform(),
@@ -51,3 +52,15 @@ def run(options: DoctorOptions, *, service: I18nService | None = None) -> dict[s
         "locale": message_service.locale,
         "catalog_valid": catalog_valid,
     }
+    if options.tokenizer_smoke:
+        from captioner.adapters.llm.token_counter import ModelTokenCounter
+
+        fixture = "ASCII 中文 日本語 👩🏽‍💻 123"
+        payload["tokenizers"] = {
+            tokenizer_id: ModelTokenCounter(
+                tokenizer_id,
+                resource_dir=paths.tokenizer_resource_dir,
+            ).count(fixture)
+            for tokenizer_id in ("cl100k_base", "o200k_base")
+        }
+    return payload

@@ -65,6 +65,7 @@ def segment_transcript(
     transcript: Transcript,
     config: SimpleSegmentationConfig | SegmentationPolicyConfig | None = None,
     progress: Callable[[], None] | None = None,
+    corrected_text_by_word_id: Mapping[str, str] | None = None,
 ) -> SubtitleTrack:
     if config is None:
         settings = SegmentationPolicyConfig()
@@ -72,4 +73,9 @@ def segment_transcript(
         settings = config.to_policy_config()
     else:
         settings = config
-    return segment_transcript_dp(transcript, settings, progress)
+    return segment_transcript_dp(
+        transcript,
+        settings,
+        progress,
+        corrected_text_by_word_id,
+    )

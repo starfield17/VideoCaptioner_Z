@@ -12,6 +12,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from captioner.core.domain.errors import AppError
+from captioner.infrastructure.app_paths import validate_resource_root
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DIST_ROOT = PROJECT_ROOT / "dist"
 VERSION_PATTERN = re.compile(
@@ -48,6 +51,7 @@ class BuildLayout:
     final_root: Path
     executable_path: Path
     resource_root: Path
+    notice_path: Path
 
 
 def validate_version(value: str) -> str:
@@ -102,11 +106,13 @@ def layout_for_platform(
         final_root = root / "Captioner.app"
         executable = final_root / "Contents" / "MacOS" / "captioner"
         resource_root = final_root / "Contents" / "Resources" / "resources"
+        notice_path = final_root / "Contents" / "Resources" / "THIRD_PARTY_NOTICES.md"
     else:
         final_root = root / "captioner"
         executable_name = "captioner.exe" if normalized == "windows" else "captioner"
         executable = final_root / executable_name
         resource_root = final_root / "resources"
+        notice_path = final_root / "THIRD_PARTY_NOTICES.md"
     return BuildLayout(
         platform_name=normalized,
         dist_root=root,
@@ -114,6 +120,7 @@ def layout_for_platform(
         final_root=final_root,
         executable_path=executable,
         resource_root=resource_root,
+        notice_path=notice_path,
     )
 
 
@@ -151,6 +158,7 @@ def build_command(
     python = str(sys.executable if python_executable is None else python_executable)
     resources = project_root / "resources"
     readme = project_root / "README.md"
+    notices = project_root / "THIRD_PARTY_NOTICES.md"
     command = [
         python,
         "-m",
@@ -161,6 +169,7 @@ def build_command(
         "--include-package=captioner",
         f"--include-data-dir={resources}=resources",
         f"--include-data-files={readme}=README.md",
+        f"--include-data-files={notices}=THIRD_PARTY_NOTICES.md",
         "--nofollow-import-to=tests",
         "--nofollow-import-to=faster_whisper",
         "--nofollow-import-to=ctranslate2",
@@ -196,12 +205,15 @@ def find_unique_artifact(work_root: Path, suffix: str) -> Path:
 
 
 def stage_artifact(layout: BuildLayout, artifact: Path) -> None:
-    """Copy one Nuitka artifact into the standardized final location."""
+    """Stage one Nuitka artifact into the standardized final location.
+
+    Prefer a same-filesystem move over a full tree copy so standalone builds do
+    not pay a second multi-hundred-megabyte directory walk. Cross-device failures
+    fall back to ``shutil.move``'s copy-and-remove path.
+    """
     safe_remove_owned(layout.final_root, (layout.work_root, layout.final_root))
-    if layout.platform_name == "macos":
-        shutil.copytree(artifact, layout.final_root)
-    else:
-        shutil.copytree(artifact, layout.final_root)
+    layout.final_root.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(artifact), str(layout.final_root))
     verify_layout(layout)
 
 
@@ -209,12 +221,16 @@ def verify_layout(layout: BuildLayout) -> None:
     """Verify the executable and staged resources needed by smoke tests."""
     required = (
         layout.executable_path,
-        layout.resource_root / "i18n" / "en.json",
         layout.final_root / "README.md",
+        layout.notice_path,
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise BuildError.missing_files(", ".join(missing))
+    try:
+        validate_resource_root(layout.resource_root)
+    except AppError as exc:
+        raise BuildError.missing_files(str(exc)) from exc
 
 
 def build(version: str, *, clean: bool = False, platform_name: str | None = None) -> BuildLayout:

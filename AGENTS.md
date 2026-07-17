@@ -5,12 +5,19 @@ This file is the repository-local contract for humans and coding agents.
 - CLI commands do not call another CLI command's `run()` function.
 - GUI code does not directly import ASR, media, model, or LLM SDKs.
 - Domain code does not import adapters, CLI, GUI, or external SDKs.
-- A future Stage must not mutate its input in place.
-- An LLM must never modify timestamps.
+- A Stage must not mutate its input in place.
+- An LLM must never modify timestamps or source Word mapping.
+- API keys are plaintext credentials in the OS config directory and must never
+  enter JobConfig, Journal, Manifest, Artifact, Cache metadata, logs, errors, or
+  CLI JSON output.
+- Every LLM Stage and Job shares the single application-level provider client
+  and Semaphore created by the composition root.
+- Prompt content changes require a new prompt version; an existing prompt file
+  must not be silently replaced.
 - Exceptions must not be silently swallowed.
 - `# type: ignore` and `# noqa` require a specific rule and an explanation.
-- Unit tests must not call real APIs, real networks, models, or FFmpeg; use
-  injected process and model fakes.
+- Unit, contract, and recovery tests must not call real APIs, real networks,
+  models, or FFmpeg; use injected process and model fakes.
 - FFprobe and FFmpeg subprocesses must use argument arrays and never a shell.
 - Faster Whisper is an optional lazy-loaded adapter; it must not be imported by
   CLI help, GUI startup, Core, or the default Nuitka Core App.
@@ -32,13 +39,33 @@ This file is the repository-local contract for humans and coding agents.
 - Coding agents must not lower strictness, coverage, or lint standards to make CI pass.
 - Coding agents must not automatically batch-update golden files.
 - Every patch must report the tests run and known limitations.
+- LLM responses can never change timestamps, Cue boundaries, Cue IDs, or source
+  Word mapping; application code copies those values from the source Track.
+- API keys are plaintext runtime credentials in the OS config directory. Only
+  the credential may rotate on Resume; public provider snapshot drift fails
+  before client creation and never enters durable Job data.
+- Every LLM Stage and Job uses the one provider client and one Semaphore made by
+  the composition root; no Stage or Chunk planner owns another concurrency gate.
+- Complete serialized requests, including system Prompt, user envelope,
+  dynamic context, and response schema, must fit the configured token budget.
+- Terminology is sparse: an input unit may return an empty `terms` list;
+  application code resolves source Word IDs with token-boundary matching.
+- Structured repair has one owner (`LLMChunkExecutor`) and one repair per
+  logical Chunk; transport retries do not consume that repair budget.
+- In-flight HTTP requests must be cancellable, and cancellation is never
+  retried or cached.
+- Cache identity is derived from the final actual `LLMRequest`, including
+  dynamic context and repair Prompt identity; invalid validated entries are
+  removed before re-request.
+- Prompt content changes require a version bump. Unit, contract, recovery, and
+  default integration tests never use real credentials or external providers.
 
-Phase 2 has a fixed sequential six-Stage durable pipeline. Phase 3 adds only
-deterministic subtitle policies, validation, and SRT/WebVTT/ASS/JSON export.
-Journal is authoritative, Manifest is rebuildable, and Stage commit cannot
-precede durable artifact verification. The repository still has no GUI
-workflow, parallel execution, LLM, translation, alignment, distributed
-workers, runtime installation, muxing, or release behavior.
+Phase 4 has profile-specific sequential plans. Deterministic keeps the original
+six Stages; Fast adds Translate; Quality adds CorrectSource, Translate, and
+Review. Journal is authoritative, Manifest is rebuildable, and Stage commit
+cannot precede durable artifact verification. The repository still has no GUI
+workflow, parallel Job scheduler, provider fallback/routing, alignment,
+distributed workers, runtime installation, muxing, or release behavior.
 
 Phase 3 subtitle processing is deterministic and has no legacy greedy runtime
 path: all supported segmentation configurations execute the same bounded DP
@@ -47,6 +74,12 @@ active policy, a verified Track ID, canonical Word order, and contiguous Cue
 spans. ASS serialization quantizes the complete ordered track and rejects
 timings that cannot be represented within its 10 ms tolerance. The strict
 `publish-v2` receipt contains exactly the five transcript/subtitle targets.
+
+LLM responses can provide only stable IDs and text. Application code copies all
+Cue IDs, timestamps, and Word IDs, and deterministic policies retain exclusive
+ownership of Cue boundaries and line breaking. Only fully validated Chunk
+responses enter the LLM Cache. Prompt versions and content hashes both
+participate in Cache identity.
 
 The `subtitle-corpus` command is a normal application command that performs
 the deterministic subtitle pipeline through source or Nuitka builds without

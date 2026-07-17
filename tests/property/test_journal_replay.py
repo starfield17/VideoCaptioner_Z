@@ -9,7 +9,7 @@ from hypothesis import strategies as st
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.journal import JournalEvent, apply_event, replay
-from captioner.core.domain.stage import STAGE_PLAN
+from captioner.core.domain.stage import STAGE_PLAN, PipelineProfile
 
 
 def _event(seq: int, event_type: str, payload: dict[str, object]) -> JournalEvent:
@@ -289,3 +289,73 @@ def test_interrupted_job_can_be_cancelled_without_rewriting_stage_history() -> N
 
     assert projection.jobs[0].state.value == "cancelled"
     assert projection.jobs[0].stage(STAGE_PLAN[0]).state.value == "interrupted"
+
+
+def test_schema_v1_success_replays_as_the_legacy_six_stage_job() -> None:
+    root = (Path.cwd() / "captioner-property").resolve()
+    config = JobConfig(
+        "tiny",
+        "faster-whisper:tiny",
+        "cpu",
+        "int8",
+        "en",
+        True,
+        "ffmpeg",
+        "ffprobe",
+        {"sample_rate": 16000},
+        {"max_duration_ms": 7000},
+        str(root),
+        False,
+        {stage.value: "1" for stage in STAGE_PLAN},
+    ).to_dict()
+    config["schema_version"] = 1
+    config.pop("pipeline_profile")
+    config.pop("llm")
+    events = [
+        _event(1, "batch.created", {}),
+        _event(
+            2,
+            "job.created",
+            {"job_id": "job-000001", "input_path": str(root / "input.wav"), "config": config},
+        ),
+    ]
+    sequence = 2
+    for stage in STAGE_PLAN:
+        sequence += 1
+        events.append(
+            _event(
+                sequence,
+                "stage.started",
+                {"job_id": "job-000001", "stage_name": stage.value, "attempt": 1},
+            )
+        )
+        sequence += 1
+        events.append(
+            _event(
+                sequence,
+                "stage.committed",
+                {
+                    "job_id": "job-000001",
+                    "stage_name": stage.value,
+                    "attempt": 1,
+                    "cache_key": f"sha256:{'a' * 64}",
+                    "artifacts": [
+                        {
+                            "sha256": "b" * 64,
+                            "size_bytes": 1,
+                            "kind": "test",
+                            "media_type": "application/octet-stream",
+                            "logical_name": f"{stage.value}.bin",
+                        }
+                    ],
+                },
+            )
+        )
+    events.append(_event(sequence + 1, "job.succeeded", {"job_id": "job-000001"}))
+
+    projection = replay(events)
+    job = projection.job("job-000001")
+    assert job.state.value == "succeeded"
+    assert job.config.schema_version == 1
+    assert job.config.pipeline_profile is PipelineProfile.DETERMINISTIC
+    assert tuple(stage.name for stage in job.stages) == STAGE_PLAN

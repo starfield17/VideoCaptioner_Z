@@ -1,10 +1,11 @@
 # Captioner
 
-Captioner is a durable batch subtitle-generation application. The Phase 2
-pipeline runs one or more inputs through inspect, normalize, transcribe,
-segment, export, and publish Stages. Phase 3 makes segmentation, line breaking,
-validation, and subtitle export deterministic without an LLM. An fsynced
-Journal is the source of truth; a rebuildable Manifest and verified
+Captioner is a durable batch subtitle-generation application. The deterministic
+profile runs inspect, normalize, transcribe, segment, export, and publish.
+Phase 4 adds Fast translation and Quality terminology/correction/translation/
+anomaly-review profiles while keeping timestamps, Word mapping, segmentation,
+validation, and publication under deterministic application control. An
+fsynced Journal is the source of truth; a rebuildable Manifest and verified
 content-addressed artifacts support resume and retry.
 
 ## Local commands
@@ -22,6 +23,14 @@ QT_QPA_PLATFORM=offscreen uv run python main.py --gui --smoke-test
 uv run python scripts/build_nuitka.py --clean --version 0.0.0
 ```
 
+Compiled smoke tests must run from a temporary working directory outside the
+repository so a broken resource resolver cannot use `resources/` from the
+source tree. The Release Full Gate archives and then extracts the exact tested
+outputs: Linux `captioner-linux.tar.gz`, Windows `captioner-windows.zip`, and
+macOS `Captioner-macos.zip` containing `Captioner.app`. These are portable
+artifacts; the project does not sign or notarize them, create an installer, or
+publish a GitHub Release automatically.
+
 FFmpeg and FFprobe must be available on `PATH` for a real run. Faster Whisper
 is optional and is installed separately:
 
@@ -35,6 +44,26 @@ captioner resume batch-... --json
 captioner retry batch-... --job job-000001 --stage transcribe --json
 captioner cancel batch-... --job job-000001 --json
 ```
+
+Fast and Quality use an OpenAI-compatible provider profile from the OS config
+directory; credentials are never accepted on the CLI or persisted in Job data:
+
+```bash
+captioner run input.mp4 --output build/output --profile fast \
+  --target-language zh-CN --llm-provider-profile default --json
+captioner run input.mp4 --output build/output --profile quality \
+  --target-language zh-CN --llm-provider-profile default --json
+```
+
+The durable Job stores the complete redacted public provider snapshot and
+profile-specific Prompt identities. Resume must match every public provider
+field before creating the HTTP client; only API-key rotation is allowed. All
+LLM Stages and Jobs share one provider client and Semaphore, and complete
+encoded requests (including Prompt, dynamic context, and response schema) are
+checked against the Chunk budget.
+
+See [docs/llm.md](docs/llm.md) for the plaintext `llm.toml` format, structured
+schemas, Cache identity, retry classification, recovery, and limitations.
 
 Phase 3's deterministic fixture command runs without ASR, FFmpeg, models or
 network access. It performs DP segmentation, Track validation, canonical JSON
@@ -83,9 +112,10 @@ Domain JSON metadata is recursively immutable, and public model identities do
 not contain machine-specific local model paths.
 
 CLI exit codes are stable: `0` success, `2` usage/configuration, `3`
-media/FFmpeg, `4` ASR/runtime/model, `5` output/export, and `130` cancellation.
-Phase 1 loads one Faster Whisper model per adapter instance and keeps active
-ASR concurrency at one. Unit tests and default CI never download models.
+media/FFmpeg, `4` ASR/runtime/model, `5` output/export, `7` LLM/provider, and
+`130` cancellation. One shared application-level Semaphore bounds all LLM
+Stages and Jobs. Unit tests and default CI never download models or call real
+providers.
 
 Durable state lives under the platformdirs data directory in `batches/` and
 `artifacts/`; workspaces are attempt-scoped and disposable. Built-in resources

@@ -1,4 +1,4 @@
-"""Generic six-stage execution and durable commit protocol."""
+"""Profile-aware Stage execution and durable commit protocol."""
 
 from __future__ import annotations
 

@@ -17,10 +17,17 @@ from captioner.core.domain.subtitle import (
     SubtitleCue,
     SubtitleTrack,
 )
-from captioner.core.domain.transcript import Transcript, TranscriptSegment, WordToken
+from captioner.core.domain.terminology import Terminology
+from captioner.core.domain.transcript import (
+    CorrectedTranscript,
+    Transcript,
+    TranscriptSegment,
+    WordToken,
+)
 
 SCHEMA_VERSION = 1
-TRACK_SCHEMA_VERSION = 2
+SOURCE_TRACK_SCHEMA_VERSION = 2
+TRACK_SCHEMA_VERSION = 3
 _POLICY_SIGNATURE = re.compile(r"^policy-[0-9a-f]{64}$")
 
 
@@ -182,12 +189,39 @@ def decode_transcript(data: bytes) -> Transcript:
     )
 
 
+def encode_corrected_transcript(corrected: CorrectedTranscript) -> bytes:
+    return encode_json({"schema_version": 1, "corrected_transcript": corrected.to_dict()})
+
+
+def decode_corrected_transcript(data: bytes) -> CorrectedTranscript:
+    root = decode_json(data)
+    raw = _object(root, "corrected_transcript", {"schema_version", "corrected_transcript"})
+    if set(raw) != {"schema_version", "transcript_id", "source_word_ids", "spans"}:
+        raise AppError("artifact.codec_invalid", {"reason": "corrected_transcript_fields"})
+    return CorrectedTranscript.from_mapping(raw)
+
+
+def encode_terminology(terminology: Terminology) -> bytes:
+    return encode_json({"schema_version": 1, "terminology": terminology.to_dict()})
+
+
+def decode_terminology(data: bytes) -> Terminology:
+    root = decode_json(data)
+    raw = _object(root, "terminology", {"schema_version", "terminology"})
+    return Terminology.from_mapping(raw)
+
+
 def encode_track(track: SubtitleTrack) -> bytes:
     if _POLICY_SIGNATURE.fullmatch(track.policy_signature) is None:
         raise AppError("artifact.codec_invalid", {"reason": "policy_signature"})
+    schema_version = (
+        TRACK_SCHEMA_VERSION
+        if track.revision > 0 or any(cue.translated_text is not None for cue in track.cues)
+        else SOURCE_TRACK_SCHEMA_VERSION
+    )
     return encode_json(
         {
-            "schema_version": TRACK_SCHEMA_VERSION,
+            "schema_version": schema_version,
             "subtitle_track": {
                 "id": track.id,
                 "source_transcript_id": track.source_transcript_id,
@@ -218,7 +252,7 @@ def decode_track(data: bytes) -> SubtitleTrack:
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version not in {1, TRACK_SCHEMA_VERSION}
+        or schema_version not in {1, SOURCE_TRACK_SCHEMA_VERSION, TRACK_SCHEMA_VERSION}
         or not isinstance(root.get("subtitle_track"), dict)
     ):
         raise AppError("artifact.codec_invalid", {"reason": "subtitle_track"})

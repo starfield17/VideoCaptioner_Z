@@ -11,7 +11,38 @@ from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.journal import JournalEvent, apply_event, replay
 from captioner.core.domain.result import FrozenJsonValue, freeze_json_value
-from captioner.core.domain.stage import STAGE_PLAN
+from captioner.core.domain.stage import STAGE_PLAN, PipelineProfile, stage_plan_for
+
+
+def test_profiles_have_only_their_declared_stages() -> None:
+    assert tuple(stage.value for stage in stage_plan_for(PipelineProfile.DETERMINISTIC)) == (
+        "inspect",
+        "normalize",
+        "transcribe",
+        "segment",
+        "export",
+        "publish",
+    )
+    assert tuple(stage.value for stage in stage_plan_for(PipelineProfile.FAST)) == (
+        "inspect",
+        "normalize",
+        "transcribe",
+        "segment",
+        "translate",
+        "export",
+        "publish",
+    )
+    assert tuple(stage.value for stage in stage_plan_for(PipelineProfile.QUALITY)) == (
+        "inspect",
+        "normalize",
+        "transcribe",
+        "correct_source",
+        "segment",
+        "translate",
+        "review",
+        "export",
+        "publish",
+    )
 
 
 @given(attempt=st.integers(min_value=1, max_value=100))

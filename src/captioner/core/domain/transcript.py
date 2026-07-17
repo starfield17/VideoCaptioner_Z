@@ -17,6 +17,7 @@ from captioner.core.domain.result import (
     freeze_json_value,
     thaw_json_value,
 )
+from captioner.core.policies.unicode_metrics import normalize_text
 
 
 def _text(value: str, field: str) -> None:
@@ -155,6 +156,151 @@ class Transcript:
         object.__setattr__(self, "words", words)
         object.__setattr__(self, "segments", segments)
         object.__setattr__(self, "metadata", _metadata(self.metadata))
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectedSpan:
+    """A source correction that preserves the original Word-to-time unit."""
+
+    source_word_ids: tuple[str, ...]
+    corrected_text: str
+
+    def __post_init__(self) -> None:
+        word_ids = tuple(self.source_word_ids)
+        if (
+            not word_ids
+            or len(set(word_ids)) != len(word_ids)
+            or any(not word_id.strip() for word_id in word_ids)
+        ):
+            raise AppError(
+                "transcript.correction_invalid",
+                {"field": "source_word_ids", "reason": "duplicate_or_empty"},
+            )
+        if not self.corrected_text.strip():
+            raise AppError("transcript.correction_invalid", {"field": "corrected_text"})
+        try:
+            canonical = normalize_text(self.corrected_text)
+        except AppError as exc:
+            raise AppError(
+                "transcript.correction_invalid", {"field": "corrected_text", "reason": "control"}
+            ) from exc
+        if canonical != self.corrected_text:
+            raise AppError(
+                "transcript.correction_invalid",
+                {"field": "corrected_text", "reason": "not_canonical"},
+            )
+        object.__setattr__(self, "source_word_ids", word_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectedTranscript:
+    """Immutable, complete and ordered source correction projection."""
+
+    transcript_id: str
+    spans: tuple[CorrectedSpan, ...]
+    source_word_ids: tuple[str, ...] = ()
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        _text(self.transcript_id, "transcript_id")
+        if self.schema_version != 1:
+            raise AppError("transcript.correction_invalid", {"field": "schema_version"})
+        spans = tuple(self.spans)
+        if not spans:
+            raise AppError("transcript.correction_invalid", {"field": "spans", "reason": "empty"})
+        span_ids = tuple(word_id for span in spans for word_id in span.source_word_ids)
+        expected = tuple(self.source_word_ids) or span_ids
+        if not expected or len(set(expected)) != len(expected):
+            raise AppError(
+                "transcript.correction_invalid", {"field": "source_word_ids", "reason": "order"}
+            )
+        if span_ids != expected:
+            reason = "missing_or_extra" if set(span_ids) != set(expected) else "order"
+            raise AppError("transcript.correction_invalid", {"field": "spans", "reason": reason})
+        object.__setattr__(self, "spans", spans)
+        object.__setattr__(self, "source_word_ids", expected)
+
+    @property
+    def corrected_text_by_word_id(self) -> Mapping[str, str]:
+        return {
+            word_id: span.corrected_text for span in self.spans for word_id in span.source_word_ids
+        }
+
+    @property
+    def corrections(self) -> tuple[CorrectedSpan, ...]:
+        return self.spans
+
+    @property
+    def word_ids(self) -> tuple[str, ...]:
+        return self.source_word_ids
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "schema_version": self.schema_version,
+            "transcript_id": self.transcript_id,
+            "source_word_ids": list(self.source_word_ids),
+            "spans": [
+                {
+                    "source_word_ids": list(span.source_word_ids),
+                    "corrected_text": span.corrected_text,
+                }
+                for span in self.spans
+            ],
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> CorrectedTranscript:
+        if not isinstance(value, Mapping):
+            raise AppError("transcript.correction_invalid", {"reason": "object"})
+        raw = cast(Mapping[str, object], value)
+        if set(raw) != {"schema_version", "transcript_id", "source_word_ids", "spans"}:
+            raise AppError("transcript.correction_invalid", {"reason": "fields"})
+        raw_transcript_id = raw["transcript_id"]
+        raw_schema_version = raw["schema_version"]
+        if not isinstance(raw_transcript_id, str) or type(raw_schema_version) is not int:
+            raise AppError("transcript.correction_invalid", {"reason": "types"})
+        raw_spans = raw["spans"]
+        if not isinstance(raw_spans, Sequence) or isinstance(raw_spans, (str, bytes, bytearray)):
+            raise AppError("transcript.correction_invalid", {"field": "spans"})
+        spans: list[CorrectedSpan] = []
+        for raw_item in cast(Sequence[object], raw_spans):
+            if not isinstance(raw_item, Mapping):
+                raise AppError("transcript.correction_invalid", {"field": "spans"})
+            item = cast(Mapping[str, object], raw_item)
+            if set(item) != {"source_word_ids", "corrected_text"}:
+                raise AppError("transcript.correction_invalid", {"reason": "span_fields"})
+            word_ids = item["source_word_ids"]
+            if not isinstance(word_ids, Sequence) or isinstance(word_ids, (str, bytes, bytearray)):
+                raise AppError("transcript.correction_invalid", {"field": "source_word_ids"})
+            corrected_text = item["corrected_text"]
+            if not isinstance(corrected_text, str):
+                raise AppError("transcript.correction_invalid", {"field": "corrected_text"})
+            spans.append(
+                CorrectedSpan(
+                    _required_string_sequence(cast(Sequence[object], word_ids), "source_word_ids"),
+                    corrected_text,
+                )
+            )
+        source_word_ids = raw["source_word_ids"]
+        if not isinstance(source_word_ids, Sequence) or isinstance(
+            source_word_ids, (str, bytes, bytearray)
+        ):
+            raise AppError("transcript.correction_invalid", {"field": "source_word_ids"})
+        return cls(
+            raw_transcript_id,
+            tuple(spans),
+            _required_string_sequence(cast(Sequence[object], source_word_ids), "source_word_ids"),
+            raw_schema_version,
+        )
+
+
+def _required_string_sequence(value: Sequence[object], field: str) -> tuple[str, ...]:
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise AppError("transcript.correction_invalid", {"field": field})
+        result.append(item)
+    return tuple(result)
 
 
 def derive_transcript_id(

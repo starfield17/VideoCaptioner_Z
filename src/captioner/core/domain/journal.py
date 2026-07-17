@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Never, cast
@@ -18,11 +18,12 @@ from captioner.core.domain.result import (
     thaw_json_value,
 )
 from captioner.core.domain.stage import (
-    STAGE_PLAN,
+    PipelineProfile,
     StageName,
     StageProjection,
     StageState,
     dependencies,
+    stage_plan_for,
     stage_suffix,
 )
 
@@ -191,7 +192,8 @@ def _apply_payload(projection: BatchProjection, event: JournalEvent) -> BatchPro
     job_id = _required_str(event.payload, "job_id")
     job_index, job = _find_job(projection, job_id)
     if event.type == "job.config_updated":
-        job = replace(job, config=_config_from_value(event.payload.get("config")))
+        config = _config_from_value(event.payload.get("config"))
+        job = replace(job, config=config, stages=_reconfigure_stages(job, config))
     elif event.type == "job.retry_requested":
         job = _retry_job(job, event.payload)
     elif event.type.startswith("stage."):
@@ -214,9 +216,12 @@ def _update_batch_config(
         earliest_stage = StageName(_required_str(payload, "earliest_stage"))
     except ValueError as exc:
         raise AppError("journal.transition_invalid", {"reason": "stage_name"}) from exc
+    plan = stage_plan_for(config.pipeline_profile)
+    if earliest_stage not in plan:
+        raise AppError("journal.transition_invalid", {"reason": "stage_name"})
     jobs: list[JobProjection] = []
     for job in projection.jobs:
-        stages = _invalidate_suffix(list(job.stages), earliest_stage)
+        stages = _reconfigure_stages(job, config, earliest_stage)
         state = job.state
         if state not in {JobState.FAILED, JobState.CANCELLED}:
             state = JobState.PENDING
@@ -246,13 +251,18 @@ def _apply_stage_event(
     except ValueError as exc:
         raise AppError("journal.transition_invalid", {"reason": "stage_name"}) from exc
     attempt = _required_int(payload, "attempt")
-    current = job.stage(stage_name)
+    try:
+        current = job.stage(stage_name)
+    except AppError as exc:
+        raise AppError("journal.transition_invalid", {"reason": "stage_unavailable"}) from exc
+    plan = tuple(stage.name for stage in job.stages)
     stages = list(job.stages)
     if event_type == "stage.started":
         if attempt <= current.attempt or current.state is StageState.RUNNING:
             raise AppError("journal.transition_invalid", {"reason": "attempt_reused"})
         if any(
-            job.stage(dep).state is not StageState.COMMITTED for dep in dependencies(stage_name)
+            job.stage(dep).state is not StageState.COMMITTED
+            for dep in dependencies(stage_name, plan)
         ):
             raise AppError("journal.transition_invalid", {"reason": "dependency_not_committed"})
         replacement = StageProjection(stage_name, StageState.RUNNING, attempt)
@@ -260,13 +270,13 @@ def _apply_stage_event(
     elif event_type == "stage.invalidated":
         if attempt != current.attempt or current.state is not StageState.COMMITTED:
             raise AppError("journal.transition_invalid", {"reason": "not_committed"})
-        stages = _invalidate_suffix(stages, stage_name)
+        stages = _invalidate_suffix(stages, stage_name, plan)
         return replace(job, state=JobState.PENDING, stages=tuple(stages))
     else:
         if current.state is not StageState.RUNNING or current.attempt != attempt:
             raise AppError("journal.transition_invalid", {"reason": "attempt_not_running"})
         replacement, job_state = _terminal_stage(event_type, current, payload)
-    stages[STAGE_PLAN.index(stage_name)] = replacement
+    stages[plan.index(stage_name)] = replacement
     return replace(job, state=job_state, stages=tuple(stages))
 
 
@@ -275,18 +285,24 @@ def _retry_job(job: JobProjection, payload: Mapping[str, FrozenJsonValue]) -> Jo
         stage_name = StageName(_required_str(payload, "stage_name"))
     except ValueError as exc:
         raise AppError("journal.transition_invalid", {"reason": "stage_name"}) from exc
-    current = job.stage(stage_name)
+    try:
+        current = job.stage(stage_name)
+    except AppError as exc:
+        raise AppError("journal.transition_invalid", {"reason": "stage_unavailable"}) from exc
+    plan = tuple(stage.name for stage in job.stages)
     if current.state is StageState.PENDING and job.state not in {
         JobState.FAILED,
         JobState.CANCELLED,
     }:
         raise AppError("journal.transition_invalid", {"reason": "retry_pending"})
-    if any(job.stage(dep).state is not StageState.COMMITTED for dep in dependencies(stage_name)):
+    if any(
+        job.stage(dep).state is not StageState.COMMITTED for dep in dependencies(stage_name, plan)
+    ):
         raise AppError("journal.transition_invalid", {"reason": "retry_dependency"})
     stages = list(job.stages)
-    for name in stage_suffix(stage_name):
-        prior = stages[STAGE_PLAN.index(name)]
-        stages[STAGE_PLAN.index(name)] = StageProjection(name, StageState.PENDING, prior.attempt)
+    for name in stage_suffix(stage_name, plan):
+        prior = stages[plan.index(name)]
+        stages[plan.index(name)] = StageProjection(name, StageState.PENDING, prior.attempt)
     return replace(job, state=JobState.PENDING, stages=tuple(stages))
 
 
@@ -325,12 +341,40 @@ def _terminal_stage(
 def _invalidate_suffix(
     stages: list[StageProjection],
     stage_name: StageName,
+    plan: Sequence[StageName] | None = None,
 ) -> list[StageProjection]:
-    for name in stage_suffix(stage_name):
-        current = stages[STAGE_PLAN.index(name)]
+    actual_plan = tuple(stage.name for stage in stages) if plan is None else plan
+    for name in stage_suffix(stage_name, actual_plan):
+        current = stages[actual_plan.index(name)]
         if current.state is StageState.COMMITTED:
-            stages[STAGE_PLAN.index(name)] = replace(current, state=StageState.INVALIDATED)
+            stages[actual_plan.index(name)] = replace(current, state=StageState.INVALIDATED)
     return stages
+
+
+def _reconfigure_stages(
+    job: JobProjection,
+    config: JobConfig,
+    earliest_stage: StageName | None = None,
+) -> tuple[StageProjection, ...]:
+    """Project a Job onto a new profile without creating placeholder stages."""
+    plan = stage_plan_for(config.pipeline_profile)
+    previous = {stage.name: stage for stage in job.stages}
+    boundary = None if earliest_stage is None else plan.index(earliest_stage)
+    projected: list[StageProjection] = []
+    for index, name in enumerate(plan):
+        prior = previous.get(name)
+        if prior is None:
+            projected.append(StageProjection(name))
+        elif boundary is not None and index >= boundary:
+            state = (
+                StageState.INVALIDATED
+                if prior.state is StageState.COMMITTED
+                else StageState.PENDING
+            )
+            projected.append(StageProjection(name, state, prior.attempt))
+        else:
+            projected.append(prior)
+    return tuple(projected)
 
 
 def _apply_job_terminal(job: JobProjection, event_type: str) -> JobProjection:
@@ -387,7 +431,7 @@ def _config_from_value(value: FrozenJsonValue | None) -> JobConfig:
     raw = thaw_json_value(value)
     if not isinstance(raw, dict):
         raise AppError("journal.transition_invalid", {"reason": "config"})
-    expected = {
+    base_fields = {
         "schema_version",
         "model_ref",
         "model_identity",
@@ -403,6 +447,13 @@ def _config_from_value(value: FrozenJsonValue | None) -> JobConfig:
         "overwrite",
         "stage_versions",
     }
+    schema_version = raw.get("schema_version")
+    if schema_version == 1:
+        expected = base_fields
+    elif schema_version == 2:
+        expected = base_fields | {"pipeline_profile", "llm"}
+    else:
+        raise AppError("journal.transition_invalid", {"reason": "config_fields"})
     if set(raw) != expected:
         raise AppError("journal.transition_invalid", {"reason": "config_fields"})
     try:
@@ -420,7 +471,12 @@ def _config_from_value(value: FrozenJsonValue | None) -> JobConfig:
             output_dir=cast(str, raw["output_dir"]),
             overwrite=cast(bool, raw["overwrite"]),
             stage_versions=cast(Mapping[str, FrozenJsonValue], raw["stage_versions"]),
-            schema_version=cast(int, raw["schema_version"]),
+            schema_version=cast(int, schema_version),
+            pipeline_profile=cast(
+                PipelineProfile,
+                raw.get("pipeline_profile", PipelineProfile.DETERMINISTIC),
+            ),
+            llm=cast(Mapping[str, FrozenJsonValue] | None, raw.get("llm")),
         )
     except (TypeError, ValueError) as exc:
         raise AppError("journal.transition_invalid", {"reason": "config_types"}) from exc

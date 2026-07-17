@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from threading import Event
@@ -43,6 +44,13 @@ class ExecutionContext:
 
     def raise_if_cancelled(self) -> None:
         self.cancellation.raise_if_cancelled()
+
+    async def wait_cancelled(self, poll_interval_sec: float = 0.02) -> None:
+        """Wait cooperatively until the thread-safe cancellation marker is set."""
+        if poll_interval_sec <= 0:
+            raise ValueError
+        while not self.is_cancelled:
+            await asyncio.sleep(poll_interval_sec)
 
     def checkpoint(self, point: str) -> None:
         self.raise_if_cancelled()

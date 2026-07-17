@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from tests.support import llm_snapshot
+
 from captioner.adapters.persistence.content_addressed_artifact_store import (
     ContentAddressedArtifactStore,
 )
@@ -13,7 +15,11 @@ from captioner.adapters.testing.fault_injector import ScriptedFaultInjector
 from captioner.core.application.durable_pipeline import DurablePipelineService
 from captioner.core.application.stage_executor import EventFactory, StageExecutor
 from captioner.core.domain.job import JobConfig
-from captioner.core.domain.stage import STAGE_PLAN, StageName
+from captioner.core.domain.stage import (
+    PipelineProfile,
+    StageName,
+    stage_plan_for,
+)
 from captioner.core.ports.stage_runner import (
     ProducedArtifact,
     StageExecutionContext,
@@ -45,7 +51,13 @@ class FakeStage:
         )
 
 
-def config(root: Path, *, model: str = "tiny", output: Path | None = None) -> JobConfig:
+def config(
+    root: Path,
+    *,
+    model: str = "tiny",
+    output: Path | None = None,
+    profile: PipelineProfile = PipelineProfile.DETERMINISTIC,
+) -> JobConfig:
     return JobConfig(
         model,
         f"faster-whisper:{model}",
@@ -59,12 +71,17 @@ def config(root: Path, *, model: str = "tiny", output: Path | None = None) -> Jo
         {"limit": 84},
         str((output or root / "output").resolve()),
         False,
-        {stage.value: "fake-v1" for stage in STAGE_PLAN},
+        {stage.value: "fake-v1" for stage in stage_plan_for(profile)},
+        pipeline_profile=profile,
+        llm=None if profile is PipelineProfile.DETERMINISTIC else llm_snapshot(profile),
     )
 
 
 def service(
-    root: Path, counts: dict[StageName, int], fault: ScriptedFaultInjector | None = None
+    root: Path,
+    counts: dict[StageName, int],
+    fault: ScriptedFaultInjector | None = None,
+    profile: PipelineProfile = PipelineProfile.DETERMINISTIC,
 ) -> DurablePipelineService:
     (root / "input.wav").write_bytes(b"source")
     batch_dir = root / "batch"
@@ -83,7 +100,7 @@ def service(
     if fault is not None:
         executor.fault_injector = fault
     runners: Mapping[StageName, FakeStage] = {
-        stage: FakeStage(stage, counts) for stage in STAGE_PLAN
+        stage: FakeStage(stage, counts) for stage in stage_plan_for(profile)
     }
     return DurablePipelineService(
         journal, manifest, executor, factory, runners, batch_dir / "control"

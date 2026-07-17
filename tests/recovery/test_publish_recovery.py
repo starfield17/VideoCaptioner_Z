@@ -21,7 +21,7 @@ from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobProjection
 from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
-from captioner.core.domain.stage import STAGE_PLAN, StageName, StageProjection
+from captioner.core.domain.stage import STAGE_PLAN, StageName, StageProjection, stage_plan_for
 from captioner.core.ports.stage_runner import (
     ProducedArtifact,
     StageExecutionContext,
@@ -213,7 +213,9 @@ def test_publication_receipt_recovery_reruns_publish_only(tmp_path: Path, corrup
 
     assert job.state.value == "succeeded"
     assert all(
-        job.stage(stage).attempt == 1 for stage in StageName if stage is not StageName.PUBLISH
+        job.stage(stage).attempt == 1
+        for stage in stage_plan_for(job.config.pipeline_profile)
+        if stage is not StageName.PUBLISH
     )
     assert job.stage(StageName.PUBLISH).attempt == 2
     assert all(

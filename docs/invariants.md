@@ -7,8 +7,14 @@
 - Writable data uses OS-standard `platformdirs` locations.
 - External SDKs may appear only behind adapter/runtime boundaries.
 - Future ASR concurrency defaults to one.
-- Future LLM calls use one global provider concurrency gate.
-- LLMs never modify timestamps.
+- All LLM calls use one application-wide provider concurrency gate.
+- LLMs never modify timestamps, Cue IDs, Cue boundaries, or source Word mapping.
+- Provider API keys exist only in runtime credential objects loaded from the OS
+  config directory. They never enter durable Job data, artifacts, Cache
+  metadata, errors, logs, or CLI JSON.
+- LLM Cache entries contain only responses that passed schema, ID, canonical
+  text, language, and protected-token validation applicable to that Stage.
+- Prompt identity binds both an immutable version and its content SHA-256.
 - Future stages must not mutate their input in place.
 - FFprobe and FFmpeg never invoke a shell; process arguments remain separate.
 - Domain timestamps are integer milliseconds; SDK float seconds are converted at
@@ -32,7 +38,8 @@
   produce deterministic cue IDs, Track IDs and all exported bytes. Simple
   segmentation is only a legacy compatibility facade; Phase 3 uses bounded
   dynamic programming.
-- Phase 1 has no LLM; Faster Whisper is optional and loaded once per engine.
+- The deterministic profile has no LLM; Faster Whisper is optional and loaded
+  once per engine.
 - Journal is the durable source of truth; Manifest is only a rebuildable projection.
 - `stage.committed` is the linearization point and references only verified CAS artifacts.
 - Manifest projection never precedes the corresponding Journal commit.
@@ -89,3 +96,20 @@ Phase 3 subtitle invariants:
 - `publish-v2` receipts contain the exact five published target formats.
 - Source and packaged `subtitle-corpus` execution performs actual JSON, SRT,
   WebVTT and ASS round trips without ASR, models or network access.
+
+Phase 4 LLM invariants:
+
+- Correction units cover every source Word exactly once and retain the original
+  Word order and IDs.
+- Deterministic segmentation alone chooses Cue boundaries, including when it
+  consumes corrected source text.
+- Fast translation may replace source display text and translated display text;
+  Quality translation and Review may replace translated display text only.
+- Translated and reviewed Cues preserve source Cue ID, start/end milliseconds,
+  and source Word IDs byte-for-byte in their domain values.
+- Review sends only deterministic anomaly IDs as output items; neighboring Cues
+  are context-only. An anomaly-free track performs no Review LLM call.
+- Validated Chunk Cache hits precede Semaphore acquisition and network access.
+- Cancellation is never retried; valid atomically committed Cache entries may
+  survive cancellation, but partial Cache files may not.
+- Publish still commits exactly five targets transactionally.

@@ -39,6 +39,12 @@ def test_platform_output_paths(
     assert layout.final_root.name == final_name
     assert layout.executable_path.name == executable_name
     assert layout.work_root.parent == layout.dist_root
+    expected_notice = (
+        layout.final_root / "Contents" / "Resources" / "THIRD_PARTY_NOTICES.md"
+        if platform_name == "macos"
+        else layout.final_root / "THIRD_PARTY_NOTICES.md"
+    )
+    assert layout.notice_path == expected_notice
 
 
 def test_build_command_contains_plugin_package_and_resources(tmp_path: Path) -> None:
@@ -51,6 +57,10 @@ def test_build_command_contains_plugin_package_and_resources(tmp_path: Path) -> 
     assert "--include-package=captioner" in command
     assert f"--include-data-dir={tmp_path / 'resources'}=resources" in command
     assert f"--include-data-files={tmp_path / 'README.md'}=README.md" in command
+    assert (
+        f"--include-data-files={tmp_path / 'THIRD_PARTY_NOTICES.md'}=THIRD_PARTY_NOTICES.md"
+        in command
+    )
     assert "--nofollow-import-to=faster_whisper" in command
     assert "--nofollow-import-to=ctranslate2" in command
     assert "--nofollow-import-to=torch" in command
@@ -104,6 +114,18 @@ def test_clean_does_not_follow_owned_output_symlink(tmp_path: Path) -> None:
 def test_unique_artifact_detection(tmp_path: Path) -> None:
     with pytest.raises(BuildError, match="exactly one"):
         find_unique_artifact(tmp_path, ".dist")
+
+
+def test_macos_build_command_keeps_app_bundle_resource_destination(tmp_path: Path) -> None:
+    layout = layout_for_platform("macos", dist_root=tmp_path / "dist")
+    command = build_command(
+        "0.0.0", layout, python_executable=Path("python"), project_root=tmp_path
+    )
+    assert "--macos-create-app-bundle" in command
+    assert (
+        f"--include-data-files={tmp_path / 'THIRD_PARTY_NOTICES.md'}=THIRD_PARTY_NOTICES.md"
+        in command
+    )
     (tmp_path / "one.dist").mkdir()
     assert find_unique_artifact(tmp_path, ".dist").name == "one.dist"
     (tmp_path / "two.dist").mkdir()

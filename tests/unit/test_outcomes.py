@@ -6,6 +6,7 @@ from captioner.cli.outcomes import (
     ASR_ERROR,
     CANCELLED,
     CLI_ERROR,
+    LLM_ERROR,
     MEDIA_ERROR,
     OUTPUT_ERROR,
     exit_code_for_error,
@@ -26,6 +27,7 @@ from captioner.core.domain.errors import AppError
         ("output.write_failed", OUTPUT_ERROR),
         ("export.srt_invalid", OUTPUT_ERROR),
         ("subtitle.invalid", OUTPUT_ERROR),
+        ("llm.timeout", LLM_ERROR),
         ("unexpected.code", CLI_ERROR),
     ],
 )

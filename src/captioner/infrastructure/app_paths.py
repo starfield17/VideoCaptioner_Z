@@ -5,13 +5,38 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from platformdirs import user_cache_dir, user_config_dir, user_data_dir, user_log_dir
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import validate_identifier
+from captioner.core.domain.result import JsonValue
 
 APP_NAME = "Captioner"
+
+# Nuitka exposes this module attribute when this module is compiled.
+try:
+    _nuitka_compiled = cast(object, __compiled__)  # type: ignore[name-defined]
+except NameError:
+    _nuitka_compiled: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledRuntime:
+    """The runtime identity needed to resolve read-only bundled resources."""
+
+    compiled: bool
+    containing_dir: Path | None
+
+
+_REQUIRED_RESOURCE_DIRECTORIES = ("i18n", "prompts", "runtime", "tokenizers")
+_REQUIRED_RESOURCE_FILES = (
+    Path("i18n") / "en.json",
+    Path("tokenizers") / "tokenizer-manifest.json",
+    Path("tokenizers") / "cl100k_base.tiktoken",
+    Path("tokenizers") / "o200k_base.tiktoken",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +63,14 @@ class AppPaths:
         return self.data_dir / "artifacts"
 
     @property
+    def tokenizer_resource_dir(self) -> Path:
+        return self.resource_root / "tokenizers"
+
+    @property
+    def tokenizer_manifest_path(self) -> Path:
+        return self.tokenizer_resource_dir / "tokenizer-manifest.json"
+
+    @property
     def writable_directories(self) -> tuple[Path, ...]:
         return (self.config_dir, self.data_dir, self.cache_dir, self.log_dir, self.temp_dir)
 
@@ -50,6 +83,7 @@ def resolve_app_paths(
     base_dir: Path | None = None,
     executable_path: Path | None = None,
     compiled: bool | None = None,
+    compiled_runtime: CompiledRuntime | None = None,
     resource_root_override: Path | None = None,
 ) -> AppPaths:
     """Resolve bundle resources and writable directories.
@@ -59,11 +93,13 @@ def resolve_app_paths(
     """
     normalized_platform = _normalize_platform(platform_name or sys.platform)
     executable = (executable_path or Path(sys.executable)).expanduser().resolve()
-    is_compiled = _is_compiled() if compiled is None else compiled
+    runtime = _compiled_runtime() if compiled_runtime is None else compiled_runtime
+    if compiled is not None:
+        runtime = CompiledRuntime(compiled, executable.parent if compiled else None)
     resource_root = _resolve_resource_root(
         normalized_platform,
         executable,
-        is_compiled,
+        runtime,
         resource_root_override,
     )
     writable = _resolve_writable_dirs(
@@ -80,6 +116,14 @@ def resolve_app_paths(
         runtime_manifest_resource_dir=resource_root / "runtime",
         **writable,
     )
+
+
+def compiled_runtime_from_descriptor(value: object) -> CompiledRuntime:
+    """Convert Nuitka's injected descriptor at the compiled entry boundary."""
+    containing_dir = getattr(value, "containing_dir", None)
+    if not isinstance(containing_dir, str) or not containing_dir:
+        raise AppError("runtime.resource_root_invalid", {"reason": "compiled_containing_dir"})
+    return CompiledRuntime(True, Path(containing_dir).expanduser().resolve())
 
 
 def ensure_runtime_layout(paths: AppPaths) -> None:
@@ -110,29 +154,71 @@ def _normalize_platform(value: str) -> str:
     return "linux"
 
 
-def _is_compiled() -> bool:
-    return bool(getattr(sys, "frozen", False) or getattr(sys, "_MEIPASS", None))
+def _compiled_runtime() -> CompiledRuntime:
+    """Read Nuitka's compile-time descriptor without importing Nuitka."""
+    compiled = _nuitka_compiled
+    if compiled is None:
+        main_module = sys.modules.get("__main__")
+        compiled = None if main_module is None else getattr(main_module, "__compiled__", None)
+    if compiled is None:
+        return CompiledRuntime(False, None)
+    return compiled_runtime_from_descriptor(compiled)
+
+
+def validate_resource_root(root: Path) -> Path:
+    """Require the complete immutable resource layout used by the application."""
+    resolved = root.expanduser().resolve()
+    missing: list[JsonValue] = []
+    for directory in _REQUIRED_RESOURCE_DIRECTORIES:
+        if not (resolved / directory).is_dir():
+            missing.append(directory)
+    for relative_path in _REQUIRED_RESOURCE_FILES:
+        if not (resolved / relative_path).is_file():
+            missing.append(str(relative_path))
+    if missing:
+        raise AppError(
+            "runtime.resource_root_invalid",
+            {"missing": missing},
+        )
+    return resolved
 
 
 def _resolve_resource_root(
     platform_name: str,
     executable: Path,
-    compiled: bool,
+    runtime: CompiledRuntime,
     override: Path | None,
 ) -> Path:
     if override is not None:
-        return override.expanduser().resolve()
+        return validate_resource_root(override)
 
     candidates: list[Path] = []
-    if compiled:
-        executable_dir = executable.parent
-        candidates.append(executable_dir / "resources")
-        candidates.append(executable_dir / "Resources" / "resources")
+    if runtime.compiled:
+        containing_dir = runtime.containing_dir
+        if containing_dir is None:
+            raise AppError("runtime.resource_root_invalid", {"reason": "compiled_containing_dir"})
+        if platform_name != "darwin" and containing_dir == executable.parent:
+            candidates.append(containing_dir / "resources")
         if platform_name == "darwin":
-            contents_dir = executable_dir.parent
-            candidates.append(contents_dir / "Resources" / "resources")
-            candidates.append(contents_dir / "Resources")
-            candidates.append(contents_dir.parent / "Resources" / "resources")
+            candidates.extend(
+                (
+                    containing_dir / "Resources" / "resources",
+                    containing_dir.parent / "Resources" / "resources",
+                    containing_dir / ".." / "Resources" / "resources",
+                    containing_dir.parent / "Contents" / "Resources" / "resources",
+                )
+            )
+        candidates.append(executable.parent / "resources")
+        candidates.append(executable.parent.parent / "resources")
+        if platform_name == "darwin":
+            candidates.extend(
+                (
+                    executable.parent / "Resources" / "resources",
+                    executable.parent.parent / "Resources" / "resources",
+                    executable.parent / ".." / "Resources" / "resources",
+                    executable.parent.parent / "Contents" / "Resources" / "resources",
+                )
+            )
     else:
         module_path = Path(__file__).resolve()
         candidates.extend(parent / "resources" for parent in module_path.parents)
@@ -140,9 +226,15 @@ def _resolve_resource_root(
 
     unique_candidates = list(dict.fromkeys(candidate.resolve() for candidate in candidates))
     for candidate in unique_candidates:
-        if (candidate / "i18n").is_dir():
-            return candidate
-    return unique_candidates[0]
+        try:
+            return validate_resource_root(candidate)
+        except AppError:
+            # Candidate probing is explicit; only a complete root is accepted.
+            continue
+    raise AppError(
+        "runtime.resource_root_invalid",
+        {"reason": "no_complete_candidate", "compiled": runtime.compiled},
+    )
 
 
 def _resolve_writable_dirs(
