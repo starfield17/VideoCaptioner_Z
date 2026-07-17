@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from importlib import import_module
@@ -509,13 +510,30 @@ def test_projection_payload_reports_stale_execution_and_cancel_markers(tmp_path:
     assert payload["state"] == "interrupted"
 
 
+def _lease_document(*, pid: int, hostname: str) -> str:
+    return (
+        json.dumps(
+            {
+                "token": "token-a",
+                "pid": pid,
+                "hostname": hostname,
+                "created_timestamp": "2026-01-01T00:00:00Z",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
         (None, True),
         ("{", True),
-        (json.dumps({"pid": os.getpid(), "hostname": "other"}), False),
-        (json.dumps({"pid": os.getpid(), "hostname": ""}), True),
+        (_lease_document(pid=os.getpid(), hostname="other-host"), False),
+        (_lease_document(pid=os.getpid(), hostname=""), True),
+        (_lease_document(pid=os.getpid(), hostname=socket.gethostname()), False),
     ],
 )
 def test_lease_staleness_classification(tmp_path: Path, value: str | None, expected: bool) -> None:
@@ -524,6 +542,46 @@ def test_lease_staleness_classification(tmp_path: Path, value: str | None, expec
     if value is not None:
         path.write_text(value, encoding="utf-8")
     assert lease_is_stale(path) is expected
+
+
+def test_projection_payload_running_lease_states(tmp_path: Path) -> None:
+    paths = resolve_app_paths(base_dir=tmp_path / "runtime")
+    job_config = create_job_config(
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="en",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        output_dir=tmp_path / "output",
+        overwrite=False,
+    )
+    job = replace(
+        JobProjection("job-000001", str((tmp_path / "input.wav").resolve()), job_config),
+        state=JobState.RUNNING,
+    )
+    projection = BatchProjection("batch-a", (job,))
+    batch_dir = paths.batches_dir / "batch-a"
+    batch_dir.mkdir(parents=True)
+    lease_path = batch_dir / "lease.json"
+
+    lease_path.write_text(
+        _lease_document(pid=os.getpid(), hostname=socket.gethostname()),
+        encoding="utf-8",
+    )
+    assert batch.projection_payload(projection, paths=paths)["state"] == "running"
+
+    lease_path.write_text(
+        _lease_document(pid=os.getpid(), hostname="remote-host"),
+        encoding="utf-8",
+    )
+    assert batch.projection_payload(projection, paths=paths)["state"] == "running"
+
+    lease_path.write_text("{", encoding="utf-8")
+    assert batch.projection_payload(projection, paths=paths)["state"] == "interrupted"
+
+    lease_path.unlink()
+    assert batch.projection_payload(projection, paths=paths)["state"] == "interrupted"
 
 
 def test_language_override_rebuilds_llm_snapshot(tmp_path: Path) -> None:

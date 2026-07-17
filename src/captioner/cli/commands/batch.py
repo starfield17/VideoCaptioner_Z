@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import socket
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
+from captioner.adapters.persistence.batch_lease import inspect_batch_lease
 from captioner.adapters.persistence.json_manifest_store import JsonManifestStore
 from captioner.adapters.persistence.jsonl_journal import JsonlJournal
 from captioner.bootstrap import (
@@ -273,25 +273,11 @@ def projection_payload(
 
 
 def _lease_is_stale(path: Path) -> bool:
-    if not path.is_file():
-        return True
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        pid = value["pid"]
-        hostname = value["hostname"]
-        if (
-            not isinstance(pid, int)
-            or isinstance(pid, bool)
-            or not isinstance(hostname, str)
-            or not hostname
-        ):
-            return True
-        if hostname != socket.gethostname():
-            return False
-        os.kill(pid, 0)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
-        return True
-    return False
+    return inspect_batch_lease(path) in {
+        "missing",
+        "stale",
+        "invalid",
+    }
 
 
 def _success_fields(input_path: str, output_dir: str) -> dict[str, object]:

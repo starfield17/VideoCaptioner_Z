@@ -14,6 +14,7 @@ from typing import cast
 from filelock import FileLock, Timeout
 
 from captioner.core.domain.errors import AppError
+from captioner.core.ports.batch_catalog import LeaseExecutionState
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +123,39 @@ def default_batch_lease(path: Path, *, token: str, created_timestamp: str) -> Ba
         created_timestamp,
         _pid_is_alive,
     )
+
+
+def inspect_batch_lease(
+    path: Path,
+    *,
+    hostname: str | None = None,
+    pid_is_alive: Callable[[int], bool] | None = None,
+) -> LeaseExecutionState:
+    """Classify a lease without acquiring, reclaiming, or rewriting it."""
+    if not path.is_file():
+        return "missing"
+    probe = BatchLease(
+        path,
+        token="inspect",
+        pid=1,
+        hostname="inspect",
+        created_timestamp="inspect",
+        pid_is_alive=_pid_is_alive if pid_is_alive is None else pid_is_alive,
+    )
+    try:
+        owner = probe.read_owner()
+    except AppError:
+        return "invalid"
+    local_hostname = socket.gethostname() if hostname is None else hostname
+    if owner.hostname != local_hostname:
+        return "active_remote"
+    try:
+        alive = probe.pid_is_alive(owner.pid)
+    except PermissionError:
+        alive = True
+    if alive:
+        return "active_local"
+    return "stale"
 
 
 def _lease_bytes(owner: LeaseOwner) -> bytes:
