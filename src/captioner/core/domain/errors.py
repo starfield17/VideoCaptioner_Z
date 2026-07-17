@@ -56,3 +56,21 @@ class AppError(RuntimeError):
             "params": thaw_json_value(self.params),
             "retryable": self.retryable,
         }
+
+
+class LLMStructuredDecodeError(AppError):
+    """Ephemeral structured-output failure retaining an unsafe raw candidate.
+
+    The candidate stays outside ``AppError.params`` so the single repair owner
+    can use it without entering exception strings, logs, or durable records.
+    """
+
+    raw_content: str
+
+    def __init__(self, raw_content: str, *, reason: str = "structured_content") -> None:
+        if not raw_content:
+            raise ValueError
+        if len(raw_content.encode("utf-8")) > 2 * 1024 * 1024:
+            raise AppError("llm.response_too_large")
+        self.raw_content = raw_content
+        super().__init__("llm.schema_invalid", {"reason": reason})

@@ -111,10 +111,12 @@ def test_cache_supports_batch_response_schema(tmp_path: Path) -> None:
     )
     schema = response_batch_schema(QualityTranslationResponse)
     value = schema.from_mapping(
-        [
-            {"id": "item-1", "translated_text": "eins"},
-            {"id": "item-2", "translated_text": "zwei"},
-        ]
+        {
+            "responses": [
+                {"id": "item-1", "translated_text": "eins"},
+                {"id": "item-2", "translated_text": "zwei"},
+            ]
+        }
     )
     cache.put(key, value, schema)
     loaded = cache.get(key, schema)

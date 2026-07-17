@@ -101,17 +101,49 @@ def test_protected_spans_preserve_numeric_semantics(
         ("January 5, 2024", "2024-01-05", True),
         ("10:00 AM", "10:00 PM", False),
         ("10:00 AM", "22:00", False),
+        ("10:00", "10:00 AM", False),
         ("\u22125", "5", False),
         ("\u22125", "-5", True),
         ("100元", "100円", False),
         ("$100", "US$100", False),
         ("$100", "$100", True),
+        ("See you soon", "See you in 2027", False),
+        ("There are 100", "There are 100", True),
+        ("There are 100", "It costs $100", False),
+        ("Value 100", "Weight 100 kg", False),
+        ("Score 10", "Score 10%", False),
+        ("100 kg", "100 kg", True),
+        ("100 kg", "100 g", False),
+        ("10 kg", "10 kg and 20 pieces", False),
     ],
 )
 def test_protected_token_exact_sequence_and_semantic_facts(
     source: str, output: str, preserved: bool
 ) -> None:
     assert protected_tokens_preserved(source, output) is preserved
+
+
+@given(
+    numbers=st.lists(st.integers(min_value=-9999, max_value=9999), min_size=1, max_size=6),
+    extra=st.integers(min_value=-9999, max_value=9999),
+)
+def test_protected_sequences_reject_added_and_removed_facts(numbers: list[int], extra: int) -> None:
+    source = " ".join(str(number) for number in numbers)
+    assert protected_tokens_preserved(source, f"{source} {extra}") is False
+    assert (
+        protected_tokens_preserved(source, " ".join(str(number) for number in numbers[:-1]))
+        is False
+    )
+
+
+@given(
+    first=st.integers(min_value=-9999, max_value=9999),
+    second=st.integers(min_value=-9999, max_value=9999),
+)
+def test_protected_sequences_reject_reordering(first: int, second: int) -> None:
+    if first == second:
+        return
+    assert protected_tokens_preserved(f"{first} {second}", f"{second} {first}") is False
 
 
 def test_fast_fields_are_validated_independently() -> None:

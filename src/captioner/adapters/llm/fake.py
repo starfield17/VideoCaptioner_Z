@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import cast
 
 from captioner.adapters._probe import empty_details, probe_result
-from captioner.core.domain.errors import AppError
+from captioner.core.domain.errors import AppError, LLMStructuredDecodeError
 from captioner.core.domain.execution import ExecutionContext
 from captioner.core.domain.llm import LLMRequest
 from captioner.core.domain.result import JsonValue
@@ -96,7 +96,17 @@ def resolve_structured_outcome(
         parser = getattr(response_schema, "from_json", None)
         if not callable(parser):
             raise AppError("llm.schema_invalid", {"reason": "scripted_schema"})
-        return parser(outcome.payload)
+        try:
+            return parser(outcome.payload)
+        except LLMStructuredDecodeError:
+            raise
+        except AppError as exc:
+            raw = (
+                outcome.payload.decode("utf-8", errors="replace")
+                if isinstance(outcome.payload, bytes)
+                else outcome.payload
+            )
+            raise LLMStructuredDecodeError(raw) from exc
     if isinstance(outcome, ScriptedCancellation):
         context.cancel()
         context.checkpoint(outcome.checkpoint)

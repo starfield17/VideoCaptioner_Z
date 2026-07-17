@@ -118,7 +118,7 @@ def _encode_response[T](response: T, response_schema: type[T]) -> JsonValue:
     if not callable(to_dict):
         raise AppError("llm.cache_value_invalid", {"reason": "to_dict"})
     value_object = to_dict()
-    if not isinstance(value_object, (dict, list)):
+    if not isinstance(value_object, dict):
         raise AppError("llm.cache_value_invalid", {"reason": "to_dict"})
     value = cast(JsonValue, value_object)
     try:

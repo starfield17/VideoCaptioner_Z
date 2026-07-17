@@ -108,22 +108,28 @@ def _terminology_and_correction(
     _context: ExecutionContext,
 ) -> object:
     if request.task_kind == "terminology":
-        payload = [
-            {
-                "id": item.id,
-                "terms": (
-                    [
-                        {"source_term": "hello 10", "target_term": "你好 10"},
-                        {"source_term": "world", "target_term": "世界"},
-                    ]
-                    if "hello 10" in item.source
-                    else []
-                ),
-            }
-            for item in request.items
-        ]
+        payload = {
+            "responses": [
+                {
+                    "id": item.id,
+                    "terms": (
+                        [
+                            {"source_term": "hello 10", "target_term": "你好 10"},
+                            {"source_term": "world", "target_term": "世界"},
+                        ]
+                        if "hello 10" in item.source
+                        else []
+                    ),
+                }
+                for item in request.items
+            ]
+        }
     else:
-        payload = [{"id": item.id, "corrected_source": item.source} for item in request.items]
+        payload = {
+            "responses": [
+                {"id": item.id, "corrected_source": item.source} for item in request.items
+            ]
+        }
     return _parse(response_schema, payload)
 
 
@@ -143,7 +149,7 @@ def _translation_response(
                 else ("你好 10" if item.id == "cue-000001" else "世界")
             )
             payload.append({"id": item.id, "translated_text": text})
-        return _parse(response_schema, payload)
+        return _parse(response_schema, {"responses": payload})
 
     return respond
 
@@ -154,7 +160,8 @@ def _review_response(
     _context: ExecutionContext,
 ) -> object:
     return _parse(
-        response_schema, [{"id": item.id, "translated_text": "你好 10"} for item in request.items]
+        response_schema,
+        {"responses": [{"id": item.id, "translated_text": "你好 10"} for item in request.items]},
     )
 
 
@@ -165,13 +172,15 @@ def _number_loss_translation_response(
 ) -> object:
     return _parse(
         response_schema,
-        [
-            {
-                "id": item.id,
-                "translated_text": "你好" if item.id == "cue-000001" else "世界",
-            }
-            for item in request.items
-        ],
+        {
+            "responses": [
+                {
+                    "id": item.id,
+                    "translated_text": "你好" if item.id == "cue-000001" else "世界",
+                }
+                for item in request.items
+            ]
+        },
     )
 
 
@@ -200,7 +209,7 @@ def _correct_and_segment(
         prompt_loader.load("terminology", "v2"),
         prompt_loader.load("correct_source", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
-        repair_prompt=prompt_loader.load("repair_structured", "v1"),
+        repair_prompt=prompt_loader.load("repair_structured", "v2"),
     )
     produced = asyncio.run(
         correct_stage.execute(
@@ -273,7 +282,7 @@ def test_quality_translation_and_anomaly_free_review_do_not_call_review_llm(
         CharacterCounter(),
         prompt_loader.load("translate_quality", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
-        repair_prompt=prompt_loader.load("repair_structured", "v1"),
+        repair_prompt=prompt_loader.load("repair_structured", "v2"),
     )
     translated = asyncio.run(
         translate.execute(
@@ -299,7 +308,7 @@ def test_quality_translation_and_anomaly_free_review_do_not_call_review_llm(
         CharacterCounter(),
         prompt_loader.load("review_anomalies", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
-        repair_prompt=prompt_loader.load("repair_structured", "v1"),
+        repair_prompt=prompt_loader.load("repair_structured", "v2"),
     )
     reviewed = asyncio.run(
         review.execute(
@@ -334,7 +343,7 @@ def test_quality_review_sends_only_anomalies_and_adjacent_context(tmp_path: Path
         CharacterCounter(),
         prompt_loader.load("translate_quality", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
-        repair_prompt=prompt_loader.load("repair_structured", "v1"),
+        repair_prompt=prompt_loader.load("repair_structured", "v2"),
     )
     translated = asyncio.run(
         translate.execute(_request(tmp_path, config, refs), _context(tmp_path, "translate-bad"))
@@ -348,7 +357,7 @@ def test_quality_review_sends_only_anomalies_and_adjacent_context(tmp_path: Path
         CharacterCounter(),
         prompt_loader.load("review_anomalies", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
-        repair_prompt=prompt_loader.load("repair_structured", "v1"),
+        repair_prompt=prompt_loader.load("repair_structured", "v2"),
     )
     reviewed = asyncio.run(
         review.execute(
@@ -383,7 +392,7 @@ def test_quality_number_loss_is_rejected_before_cache_write(tmp_path: Path) -> N
         CharacterCounter(),
         prompt_loader.load("translate_quality", "v1"),
         SegmentationPolicyConfig(hard_gap_ms=100, preferred_gap_ms=100),
-        repair_prompt=prompt_loader.load("repair_structured", "v1"),
+        repair_prompt=prompt_loader.load("repair_structured", "v2"),
     )
     with pytest.raises(AppError, match=r"llm\.protected_token_lost"):
         asyncio.run(

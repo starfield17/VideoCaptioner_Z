@@ -19,6 +19,7 @@ from captioner.infrastructure.prompts import PromptLoader
 def _key(
     *,
     model: str = "model-a",
+    source_language: str | None = "en",
     target_language: str | None = "de",
     prompt_version: str = "v1",
     api_marker: str = "ignored",
@@ -31,7 +32,7 @@ def _key(
         base_url_identity="https://provider.example/v1",
         model=model,
         temperature=0.1,
-        source_language="en",
+        source_language=source_language,
         target_language=target_language,
         profile="fast",
         prompt_id="translate_fast",
@@ -57,6 +58,7 @@ def test_same_descriptor_is_deterministic(model: str) -> None:
 def test_result_configuration_changes_key_and_api_key_does_not_exist_in_payload() -> None:
     base = _key()
     assert base != _key(model="model-b")
+    assert base != _key(source_language="ja")
     assert base != _key(target_language="fr")
     assert base != _key(prompt_version="v2")
     assert "unit-test-key" not in _key(api_marker="unit-test-key")
@@ -90,7 +92,7 @@ def test_cache_key_is_derived_from_final_request_semantics() -> None:
             temperature=0.1,
             profile="fast",
             chunk_config={"max_items": 1, "max_input_tokens": 100},
-            response_schema_version=1,
+            response_schema_version=2,
             response_schema=FastTranslationResponse,
         )
 

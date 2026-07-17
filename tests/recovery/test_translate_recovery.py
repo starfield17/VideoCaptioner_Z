@@ -125,7 +125,7 @@ def _response(request: LLMRequest, _schema: type[object], _context: ExecutionCon
         }
         for item in request.items
     ]
-    return response_batch_schema(FastTranslationResponse).from_mapping(payload)
+    return response_batch_schema(FastTranslationResponse).from_mapping({"responses": payload})
 
 
 def _run(
@@ -142,7 +142,7 @@ def _run(
     return asyncio.run(stage.execute(request, StageExecutionContext(ExecutionContext(), workspace)))
 
 
-def test_translate_retry_reuses_successful_chunk_cache(tmp_path: Path) -> None:
+def test_translate_retry_cleans_partial_chunk_cache(tmp_path: Path) -> None:
     store, config, refs = _fixture(tmp_path)
     prompt = PromptLoader(Path("resources/prompts")).load("translate_fast", "v1")
     cache = FilesystemLLMCache(tmp_path / "cache")
@@ -154,13 +154,16 @@ def test_translate_retry_reuses_successful_chunk_cache(tmp_path: Path) -> None:
         _run(stage, tmp_path, config, refs)
     assert len(first.structured_calls) == 2
 
-    second = ScriptedLLMAdapter(structured_responses=(_response,))
+    second = ScriptedLLMAdapter(structured_responses=(_response, _response))
     result = _run(
         TranslateStage(store, second, cache, CharacterCounter(), prompt),
         tmp_path,
         config,
         refs,
     )
-    assert len(second.structured_calls) == 1
-    assert second.structured_calls[0].items[0].id == "cue-000002"
+    assert len(second.structured_calls) == 2
+    assert [call.items[0].id for call in second.structured_calls] == [
+        "cue-000001",
+        "cue-000002",
+    ]
     assert result[0].data is not None

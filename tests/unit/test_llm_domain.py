@@ -8,10 +8,12 @@ from typing import cast
 
 import pytest
 
-from captioner.core.domain.errors import AppError
+from captioner.core.application.llm_chunk_executor import LLMChunkExecutionConfig
+from captioner.core.domain.errors import AppError, LLMStructuredDecodeError
 from captioner.core.domain.llm import (
     FastTranslationResponse,
     LLMItem,
+    LLMRepairDiagnostic,
     LLMRequest,
     QualityTranslationResponse,
     ReviewResponse,
@@ -63,6 +65,35 @@ def test_response_parsing_and_serialization_paths() -> None:
         SourceCorrectionResponse("unit", "not canonical ")
 
 
+def test_structured_response_batch_is_a_strict_root_object() -> None:
+    from captioner.core.domain.llm import response_batch_schema
+
+    batch_schema = response_batch_schema(SourceCorrectionResponse)
+    schema = batch_schema.json_schema()
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["responses"]
+    responses_schema = cast(Mapping[str, object], schema["properties"])["responses"]
+    assert cast(Mapping[str, object], responses_schema)["type"] == "array"
+    assert cast(Mapping[str, object], responses_schema)["minItems"] == 1
+    batch = batch_schema.from_mapping(
+        {"responses": [{"id": "unit", "corrected_source": "corrected"}]}
+    )
+    assert batch.to_dict() == {"responses": [{"id": "unit", "corrected_source": "corrected"}]}
+    with pytest.raises(AppError, match=r"llm\.response_invalid"):
+        batch_schema.from_mapping([{"id": "unit", "corrected_source": "corrected"}])
+    with pytest.raises(AppError, match=r"llm\.response_invalid"):
+        batch_schema.from_mapping({"responses": []})
+    with pytest.raises(AppError, match=r"llm\.response_invalid"):
+        batch_schema.from_mapping(
+            {"responses": [{"id": "unit", "corrected_source": "corrected"}], "extra": 1}
+        )
+    with pytest.raises(AppError, match=r"llm\.response_invalid"):
+        batch_schema.from_json('{"responses":[{"id":"unit","id":"other","corrected_source":"x"}]}')
+    with pytest.raises(AppError, match=r"llm\.response_invalid"):
+        batch_schema.from_json('{"responses":[{"id":"unit","corrected_source":NaN}]}')
+
+
 def test_request_validation_and_response_schema_guard() -> None:
     with pytest.raises(AppError, match=r"llm\.request_invalid"):
         LLMRequest("translate", ())
@@ -83,6 +114,26 @@ def test_request_validation_and_response_schema_guard() -> None:
         response_schema_for(object)
     with pytest.raises(AppError, match=r"llm\.schema_invalid"):
         validate_response_schema({"id": "unit"}, object)
+
+
+def test_llm_chunk_identity_contains_stage_and_protected_fact_versions() -> None:
+    config = LLMChunkExecutionConfig(
+        task_kind="translate_fast",
+        provider_kind="openai-compatible",
+        provider_identity="default",
+        base_url_identity="https://provider.example/v1",
+        model="unit-model",
+        temperature=0.1,
+        source_language="en",
+        target_language="de",
+        profile="fast",
+        prompt_id="translate_fast",
+        prompt_version="v1",
+        prompt_content_sha256="a" * 64,
+    )
+    identity = config.chunk_config()
+    assert identity["stage_version"] == "translate-v2"
+    assert identity["protected_fact_policy_version"] == "protected-facts-v2"
 
 
 def test_request_serialization_sends_prompt_once_and_freezes_dynamic_context() -> None:
@@ -306,12 +357,11 @@ def test_provider_schema_name_is_stable() -> None:
     from captioner.core.domain.llm import LLMTaskKind, provider_response_schema_name
 
     expected = {
-        LLMTaskKind.CORRECT_SOURCE.value: "captioner_correct_source_batch_v1",
-        LLMTaskKind.TRANSLATE_FAST.value: "captioner_translate_fast_batch_v1",
-        LLMTaskKind.TRANSLATE_QUALITY.value: "captioner_translate_quality_batch_v1",
-        LLMTaskKind.REVIEW.value: "captioner_review_batch_v1",
-        LLMTaskKind.TERMINOLOGY.value: "captioner_terminology_batch_v1",
-        LLMTaskKind.REPAIR_STRUCTURED.value: "captioner_repair_structured_batch_v1",
+        LLMTaskKind.CORRECT_SOURCE.value: "captioner_correct_source_batch_v2",
+        LLMTaskKind.TRANSLATE_FAST.value: "captioner_translate_fast_batch_v2",
+        LLMTaskKind.TRANSLATE_QUALITY.value: "captioner_translate_quality_batch_v2",
+        LLMTaskKind.REVIEW.value: "captioner_review_batch_v2",
+        LLMTaskKind.TERMINOLOGY.value: "captioner_terminology_batch_v2",
     }
     for task_kind, name in expected.items():
         assert provider_response_schema_name(task_kind) == name
@@ -329,7 +379,6 @@ def test_provider_schema_name_matches_allowed_pattern() -> None:
         "translate_quality",
         "review",
         "terminology",
-        "repair_structured",
     ):
         name = provider_response_schema_name(task_kind)
         assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
@@ -347,7 +396,6 @@ def test_provider_schema_name_is_at_most_64_characters() -> None:
         "translate_quality",
         "review",
         "terminology",
-        "repair_structured",
     ):
         assert len(provider_response_schema_name(task_kind)) <= 64
 
@@ -373,7 +421,7 @@ def test_dynamic_batch_class_qualname_never_reaches_wire() -> None:
     schema_name = payload["response_format"]["json_schema"]["name"]
     assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", schema_name)
     assert "<locals>" not in schema_name
-    assert schema_name == "captioner_translate_fast_batch_v1"
+    assert schema_name == "captioner_translate_fast_batch_v2"
 
 
 def test_cache_and_wire_use_same_schema_identity() -> None:
@@ -402,7 +450,7 @@ def test_cache_and_wire_use_same_schema_identity() -> None:
         temperature=0.1,
         profile="fast",
         chunk_config={"max_items": 1},
-        response_schema_version=1,
+        response_schema_version=2,
         response_schema=batch,
     )
     assert wire_name == provider_response_schema_name("correct_source")
@@ -427,14 +475,16 @@ def test_repair_request_uses_valid_schema_name() -> None:
         prompt_content_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
         prompt_content=prompt,
         repair_prompt_id="repair_structured",
-        repair_prompt_version="v1",
+        repair_prompt_version="v2",
         repair_prompt_content_sha256=hashlib.sha256(repair.encode()).hexdigest(),
         repair_prompt_content=repair,
     )
     repaired = structured_repair_request(
         request,
+        invalid_response='{"responses":[]}',
+        diagnostics=(LLMRepairDiagnostic("llm.schema_invalid", field="responses"),),
         repair_prompt_id="repair_structured",
-        repair_prompt_version="v1",
+        repair_prompt_version="v2",
         repair_prompt_content_sha256=hashlib.sha256(repair.encode()).hexdigest(),
         repair_prompt_content=repair,
     )
@@ -443,8 +493,66 @@ def test_repair_request_uses_valid_schema_name() -> None:
         "json_schema"
     ]["name"]
     assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
-    assert name == "captioner_repair_structured_batch_v1"
+    assert name == "captioner_translate_quality_batch_v2"
     with pytest.raises(AppError, match=r"llm\.schema_name_invalid"):
         from captioner.core.domain.llm import provider_response_schema_name
 
         provider_response_schema_name("not_a_real_task")
+
+
+def test_contextual_repair_preserves_original_prompt_and_request_envelope() -> None:
+    from captioner.core.application.structured_llm_service import structured_repair_request
+    from captioner.core.domain.llm import response_batch_schema
+
+    prompt = "Original task instruction."
+    repair_prompt = "Correct the candidate."
+    request = LLMRequest(
+        "translate_fast",
+        (LLMItem("unit", "source 10"),),
+        source_language="en",
+        target_language="zh-CN",
+        prompt_id="translate_fast",
+        prompt_version="v1",
+        prompt_content_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        prompt_content=prompt,
+    )
+    repaired = structured_repair_request(
+        request,
+        invalid_response='{"responses":[{"id":"unit","corrected_source":"source"}]}',
+        diagnostics=(LLMRepairDiagnostic("llm.protected_token_lost", item_id="unit"),),
+        repair_prompt_id="repair_structured",
+        repair_prompt_version="v2",
+        repair_prompt_content_sha256=hashlib.sha256(repair_prompt.encode()).hexdigest(),
+        repair_prompt_content=repair_prompt,
+    )
+    payload = json.loads(
+        encode_llm_request(
+            repaired,
+            "unit-model",
+            0.1,
+            response_batch_schema(FastTranslationResponse),
+        )
+    )
+    assert [message["role"] for message in payload["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert payload["messages"][0]["content"] == prompt
+    assert json.loads(payload["messages"][1]["content"]) == request.original_wire_envelope()
+    repair_context = repaired.repair_context
+    assert repair_context is not None
+    assert payload["messages"][2]["content"] == repair_context.invalid_response
+    assert "llm.protected_token_lost" in payload["messages"][3]["content"]
+    assert payload["response_format"]["json_schema"]["name"] == (
+        "captioner_translate_fast_batch_v2"
+    )
+
+
+def test_ephemeral_invalid_content_never_enters_error_details() -> None:
+    raw = '{"responses":[{"id":"secret-id","corrected_source":"private text"}]}'
+    error = LLMStructuredDecodeError(raw)
+    assert error.raw_content == raw
+    assert raw not in str(error)
+    assert raw not in json.dumps(error.to_dict(), ensure_ascii=False)

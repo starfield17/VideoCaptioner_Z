@@ -283,7 +283,7 @@ def test_tokenizer_changes_cache_key() -> None:
         temperature=0.1,
         profile="fast",
         chunk_config={"max_items": 1},
-        response_schema_version=1,
+        response_schema_version=2,
         response_schema=SourceCorrectionResponse,
     )
     b = build_llm_cache_key_for_request(
@@ -296,17 +296,26 @@ def test_tokenizer_changes_cache_key() -> None:
         temperature=0.1,
         profile="fast",
         chunk_config={"max_items": 1},
-        response_schema_version=1,
+        response_schema_version=2,
         response_schema=SourceCorrectionResponse,
     )
     assert a.digest != b.digest
 
 
 def test_auto_tokenizer_maps_known_models_and_rejects_unknown() -> None:
+    assert resolve_tokenizer_id("auto", "gpt-4.1") == "o200k_base"
+    assert resolve_tokenizer_id("auto", "gpt-4.1-mini") == "o200k_base"
+    assert resolve_tokenizer_id("auto", "gpt-4.1-2025-04-14") == "o200k_base"
     assert resolve_tokenizer_id("auto", "gpt-4o") == "o200k_base"
+    assert resolve_tokenizer_id("auto", "gpt-4o-mini") == "o200k_base"
+    assert resolve_tokenizer_id("auto", "gpt-4") == "cl100k_base"
+    assert resolve_tokenizer_id("auto", "gpt-4-0613") == "cl100k_base"
     assert resolve_tokenizer_id("auto", "gpt-4-turbo") == "cl100k_base"
     assert resolve_tokenizer_id("cl100k_base", "anything") == "cl100k_base"
     with pytest.raises(AppError, match=r"llm\.tokenizer_unknown"):
         resolve_tokenizer_id("auto", "totally-unknown-model-xyz")
+    for model in ("gpt-4xyz", "custom-local-model", "unknown-model"):
+        with pytest.raises(AppError, match=r"llm\.tokenizer_unknown"):
+            resolve_tokenizer_id("auto", model)
     with pytest.raises(AppError, match=r"llm\.tokenizer_unknown"):
         resolve_tokenizer_id("not_real", "gpt-4o")

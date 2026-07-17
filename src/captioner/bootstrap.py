@@ -57,7 +57,12 @@ from captioner.core.domain.llm_job_config import (
     ProviderPublicSnapshot,
     required_prompts_for,
 )
-from captioner.core.domain.result import FrozenJsonValue, freeze_json_value, thaw_json_value
+from captioner.core.domain.result import (
+    FrozenJsonValue,
+    JsonValue,
+    freeze_json_value,
+    thaw_json_value,
+)
 from captioner.core.domain.stage import (
     PipelineProfile,
     StageName,
@@ -208,10 +213,16 @@ def _validate_provider_snapshot(
         )
     except (KeyError, TypeError, AppError) as exc:
         raise AppError("llm.provider_snapshot_mismatch", {"fields": ["snapshot"]}) from exc
-    current = ProviderPublicSnapshot.from_mapping(provider.to_snapshot())
+    current = ProviderPublicSnapshot.from_mapping(_resolved_provider_snapshot(provider))
     changed = durable.changed_fields(current)
     if changed:
         raise AppError("llm.provider_snapshot_mismatch", {"fields": list(changed)})
+
+
+def _resolved_provider_snapshot(provider: OpenAICompatibleProvider) -> dict[str, JsonValue]:
+    values = provider.to_snapshot()
+    values["tokenizer"] = resolve_tokenizer_id(provider.tokenizer, provider.model)
+    return values
 
 
 def create_job_config(
@@ -298,14 +309,16 @@ def create_llm_job_snapshot(
         raise AppError("llm.config_invalid", {"field": "pipeline_profile"})
     prompt_versions = {
         "terminology": "v2",
+        "repair_structured": "v2",
     }
     prompts = {
         prompt_id: loader.load(prompt_id, prompt_versions.get(prompt_id, "v1"))
         for prompt_id in required_prompts_for(selected_profile)
     }
+    resolved_provider = _resolved_provider_snapshot(provider)
     snapshot = LLMJobSnapshot(
         profile=selected_profile,
-        provider=ProviderPublicSnapshot.from_mapping(provider.to_snapshot()),
+        provider=ProviderPublicSnapshot.from_mapping(resolved_provider),
         source_language=source_language,
         target_language=target_language.strip(),
         chunk={
@@ -323,7 +336,7 @@ def create_llm_job_snapshot(
             )
             for prompt_id, identity in prompts.items()
         },
-        response_schema_version=1,
+        response_schema_version=2,
     )
     return snapshot.to_mapping()
 
@@ -441,7 +454,10 @@ def build_durable_service(
                 tokenizer_id = resolve_tokenizer_id(
                     runtime.provider.tokenizer, runtime.provider.model
                 )
-                counter = ModelTokenCounter(tokenizer_id)
+                counter = ModelTokenCounter(
+                    tokenizer_id,
+                    resource_dir=application_paths.tokenizer_resource_dir,
+                )
             if selected_profile is PipelineProfile.FAST:
                 prompt = _prompt_for_snapshot(application_paths, llm, "translate_fast")
                 repair_prompt = _prompt_for_snapshot(application_paths, llm, "repair_structured")

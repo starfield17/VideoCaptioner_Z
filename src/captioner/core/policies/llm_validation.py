@@ -20,6 +20,7 @@ from captioner.core.domain.llm import (
 from captioner.core.domain.result import JsonValue
 from captioner.core.policies.protected_spans import (
     ProtectedToken,
+    protected_token_differences,
     protected_tokens,
     protected_tokens_preserved,
 )
@@ -334,10 +335,15 @@ def _validate_protected_fields(source: str, response: object) -> None:
 
 def _validate_protected_numbers(source: str, output: str) -> None:
     if not protected_tokens_preserved(source, output):
-        token = next(iter(protected_numeric_tokens(source)), None)
+        difference = protected_token_differences(source, output)[0]
         raise AppError(
             "llm.protected_token_lost",
-            {"token": "protected" if token is None else token.text},
+            {
+                "reason": difference.code,
+                "position": difference.position,
+                "expected_kind": difference.expected_kind,
+                "actual_kind": difference.actual_kind,
+            },
         )
 
 

@@ -14,9 +14,9 @@ from captioner.adapters.llm.http_transport import (
     HTTPTransportError,
     HttpxTransport,
 )
-from captioner.core.domain.errors import AppError
+from captioner.core.domain.errors import AppError, LLMStructuredDecodeError
 from captioner.core.domain.execution import ExecutionContext
-from captioner.core.domain.llm import LLMRequest, encode_llm_request
+from captioner.core.domain.llm import LLMRequest, StructuredResponseBatch, encode_llm_request
 from captioner.core.ports.llm import LLMClient
 from captioner.infrastructure.config import OpenAICompatibleProvider
 
@@ -125,7 +125,12 @@ class OpenAICompatibleClient(LLMClient):
             self._semaphore.release()
         if len(response.body) > self._max_response_bytes:
             raise AppError("llm.response_too_large")
-        return _decode_response(response.status_code, response.body, request, response_schema)
+        return _decode_response(
+            response.status_code,
+            response.body,
+            request,
+            response_schema,
+        )
 
     async def close(self) -> None:
         await self._transport.close()
@@ -188,29 +193,52 @@ def _decode_response[T](
     error = _http_status_error(status_code)
     if error is not None:
         raise error
-    parsed = _strict_json(body, "envelope")
+    try:
+        parsed = _strict_json(body, "envelope")
+    except AppError as exc:
+        raise AppError("llm.provider_response_invalid", {"reason": "envelope"}) from exc
     if not isinstance(parsed, Mapping):
-        raise AppError("llm.schema_invalid", {"reason": "envelope_object"})
+        raise AppError("llm.provider_response_invalid", {"reason": "envelope_object"})
     raw_choices = cast(Mapping[object, object], parsed).get("choices")
     if not isinstance(raw_choices, list) or not raw_choices:
-        raise AppError("llm.schema_invalid", {"reason": "choices"})
+        raise AppError("llm.provider_response_invalid", {"reason": "choices"})
     choices = cast(list[object], raw_choices)
     first = choices[0]
     if not isinstance(first, Mapping):
-        raise AppError("llm.schema_invalid", {"reason": "choice"})
-    message = cast(Mapping[object, object], first).get("message")
+        raise AppError("llm.provider_response_invalid", {"reason": "choice"})
+    first_mapping = cast(Mapping[object, object], first)
+    finish_reason = first_mapping.get("finish_reason")
+    if not isinstance(finish_reason, str) or finish_reason not in {
+        "stop",
+        "content_filter",
+        "length",
+    }:
+        raise AppError("llm.provider_response_invalid", {"reason": "finish_reason"})
+    message = first_mapping.get("message")
     if not isinstance(message, Mapping):
-        raise AppError("llm.schema_invalid", {"reason": "message"})
-    content = cast(Mapping[object, object], message).get("content")
-    if not isinstance(content, str):
-        raise AppError("llm.schema_invalid", {"reason": "content"})
+        raise AppError("llm.provider_response_invalid", {"reason": "message"})
+    message_mapping = cast(Mapping[object, object], message)
+    refusal = message_mapping.get("refusal")
+    if isinstance(refusal, str) and refusal:
+        raise AppError("llm.refused")
+    if refusal is not None and not isinstance(refusal, str):
+        raise AppError("llm.provider_response_invalid", {"reason": "refusal"})
+    if finish_reason == "content_filter":
+        raise AppError("llm.content_filtered")
+    if finish_reason == "length":
+        raise AppError("llm.output_truncated")
+    content = message_mapping.get("content")
+    if not isinstance(content, str) or not content:
+        raise AppError("llm.provider_response_invalid", {"reason": "content"})
     factory = cast(type[_ResponseFactory], response_schema)
     try:
         result = factory.from_json(content)
+    except LLMStructuredDecodeError:
+        raise
     except AppError as exc:
-        raise AppError("llm.schema_invalid", {"reason": "structured_content"}) from exc
+        raise LLMStructuredDecodeError(content) from exc
     except Exception as exc:
-        raise AppError("llm.schema_invalid", {"reason": "structured_content"}) from exc
+        raise LLMStructuredDecodeError(content) from exc
     if not isinstance(result, response_schema):
         raise AppError("llm.schema_invalid", {"reason": "response_type"})
     _validate_single_response_id(result, request)
@@ -242,6 +270,8 @@ def _reject_json_constant(value: str) -> None:
 
 
 def _validate_single_response_id(result: object, request: LLMRequest) -> None:
+    if isinstance(result, StructuredResponseBatch):
+        return
     if len(request.items) != 1:
         return
     response_id = getattr(result, "id", None)

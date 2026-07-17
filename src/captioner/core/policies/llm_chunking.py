@@ -6,7 +6,11 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.llm import LLMRequest, encode_llm_request
+from captioner.core.domain.llm import (
+    LLM_RESPONSE_SCHEMA_VERSION,
+    LLMRequest,
+    encode_llm_request,
+)
 from captioner.core.policies.unicode_metrics import normalize_text
 from captioner.core.ports.token_counter import LLMRequestEstimator, TokenCounter
 
@@ -97,7 +101,7 @@ class SerializedRequestTokenEstimator:
     token_counter: TokenCounter
     model: str
     temperature: float
-    response_schema_version: int = 1
+    response_schema_version: int = LLM_RESPONSE_SCHEMA_VERSION
 
     def estimate_input_tokens(
         self,

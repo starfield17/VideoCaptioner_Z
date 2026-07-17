@@ -36,11 +36,11 @@ def llm_snapshot(
     for index, prompt_id in enumerate(prompt_ids, start=1):
         prompts[prompt_id] = {
             "prompt_id": prompt_id,
-            "prompt_version": "v2" if prompt_id == "terminology" else "v1",
+            "prompt_version": "v2" if prompt_id in {"terminology", "repair_structured"} else "v1",
             "content_sha256": f"{index:x}" * 64,
         }
     snapshot: dict[str, object] = {
-        "snapshot_schema_version": 1,
+        "snapshot_schema_version": 2,
         "kind": "openai-compatible",
         "provider_profile": "default",
         "base_url": "https://provider.example/v1",
@@ -62,7 +62,7 @@ def llm_snapshot(
             "max_audio_context_duration_ms": 120_000,
         },
         "prompts": prompts,
-        "response_schema_version": 1,
+        "response_schema_version": 2,
     }
     return cast(Mapping[str, FrozenJsonValue], freeze_json_value(snapshot))
 

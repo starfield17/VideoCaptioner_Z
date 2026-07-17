@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import cast
 
 from captioner.core.domain.errors import AppError
+from captioner.core.domain.llm import LLM_RESPONSE_SCHEMA_VERSION
 from captioner.core.domain.result import (
     FrozenJsonValue,
     JsonValue,
@@ -18,7 +19,7 @@ from captioner.core.domain.result import (
 )
 from captioner.core.domain.stage import PipelineProfile
 
-LLM_JOB_SNAPSHOT_SCHEMA_VERSION = 1
+LLM_JOB_SNAPSHOT_SCHEMA_VERSION = 2
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _PROMPT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 _TARGET_LANGUAGE_RE = re.compile(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*")
@@ -33,7 +34,7 @@ PUBLIC_PROVIDER_FIELDS = (
     "temperature",
     "tokenizer",
 )
-_SUPPORTED_TOKENIZERS = frozenset({"cl100k_base", "o200k_base", "auto"})
+_SUPPORTED_TOKENIZERS = frozenset({"cl100k_base", "o200k_base"})
 
 _FAST_PROMPTS = ("translate_fast", "repair_structured")
 _QUALITY_PROMPTS = (
@@ -218,9 +219,11 @@ class LLMJobSnapshot:
         if not isinstance(cast(object, self.provider), ProviderPublicSnapshot):
             raise AppError("llm.snapshot_invalid", {"reason": "provider"})
         _target_language(self.target_language)
-        if self.source_language is not None:
-            _nonempty_string(self.source_language, "source_language")
-        if type(self.response_schema_version) is not int or self.response_schema_version < 1:
+        _source_language(self.source_language)
+        if (
+            type(self.response_schema_version) is not int
+            or self.response_schema_version != LLM_RESPONSE_SCHEMA_VERSION
+        ):
             raise AppError("llm.snapshot_invalid", {"reason": "response_schema_version"})
         try:
             chunk = freeze_json_value(self.chunk)
@@ -328,6 +331,14 @@ def _prompt_component(value: object, field_name: str) -> str:
 def _target_language(value: object) -> str:
     if not isinstance(value, str) or _TARGET_LANGUAGE_RE.fullmatch(value) is None:
         raise AppError("llm.target_language_invalid")
+    return value
+
+
+def _source_language(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or _TARGET_LANGUAGE_RE.fullmatch(value) is None:
+        raise AppError("llm.source_language_invalid")
     return value
 
 

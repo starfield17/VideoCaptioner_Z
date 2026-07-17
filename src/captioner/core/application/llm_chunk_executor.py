@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
 from captioner.core.application.structured_llm_service import structured_repair_request
-from captioner.core.domain.errors import AppError
+from captioner.core.domain.errors import AppError, LLMStructuredDecodeError
 from captioner.core.domain.execution import ExecutionContext
 from captioner.core.domain.llm import (
     LLM_RESPONSE_SCHEMA_VERSION,
     LLMItem,
+    LLMRepairDiagnostic,
     LLMRequest,
     StructuredResponseBatch,
     response_batch_schema,
@@ -21,7 +23,7 @@ from captioner.core.domain.llm_cache import (
     LLMCacheKey,
     build_llm_cache_key_for_request,
 )
-from captioner.core.domain.result import JsonValue
+from captioner.core.domain.result import JsonValue, thaw_json_value
 from captioner.core.policies.llm_chunking import (
     ChunkingConfig,
     ChunkItem,
@@ -55,13 +57,6 @@ class ChunkPlannerPort(Protocol):
     ) -> LLMChunk: ...
 
 
-class _PlannerCounter:
-    """Conservative fallback for third-party planner doubles without a counter."""
-
-    def count(self, text: str) -> int:
-        return len(text)
-
-
 _ID_MISMATCH_ERRORS = frozenset(
     {
         "llm.id_mismatch",
@@ -71,6 +66,7 @@ _ID_MISMATCH_ERRORS = frozenset(
         "llm.context_id_returned",
     }
 )
+_SHRINK_ERRORS = _ID_MISMATCH_ERRORS | frozenset({"llm.output_truncated"})
 _VALIDATION_REPAIR_ERRORS = frozenset(
     {
         "llm.schema_invalid",
@@ -84,6 +80,14 @@ _VALIDATION_REPAIR_ERRORS = frozenset(
         "llm.correction_units_invalid",
     }
 )
+_LLM_STAGE_VERSIONS = {
+    "correct_source": "correct-source-v2",
+    "terminology": "correct-source-v2",
+    "translate_fast": "translate-v2",
+    "translate_quality": "translate-quality-v2",
+    "review": "review-v2",
+}
+_PROTECTED_FACT_POLICY_VERSION = "protected-facts-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,9 +112,25 @@ class LLMChunkExecutionConfig:
     repair_prompt_content_sha256: str = ""
     repair_prompt_content: str = ""
     tokenizer: str = "cl100k_base"
+    stage_version: str = ""
+    protected_fact_policy_version: str = _PROTECTED_FACT_POLICY_VERSION
     context_payload_factory: Callable[[LLMChunk], Mapping[str, JsonValue]] | None = field(
         default=None, repr=False, compare=False
     )
+
+    def __post_init__(self) -> None:
+        if not self.stage_version:
+            object.__setattr__(
+                self,
+                "stage_version",
+                _LLM_STAGE_VERSIONS.get(self.task_kind, f"llm-{self.task_kind}-v2"),
+            )
+        if not self.protected_fact_policy_version:
+            object.__setattr__(
+                self,
+                "protected_fact_policy_version",
+                _PROTECTED_FACT_POLICY_VERSION,
+            )
 
     def chunk_config(self) -> dict[str, JsonValue]:
         return {
@@ -119,6 +139,8 @@ class LLMChunkExecutionConfig:
             "context_before_items": self.chunking.context_before_items,
             "context_after_items": self.chunking.context_after_items,
             "max_audio_context_duration_ms": self.chunking.max_audio_context_duration_ms,
+            "stage_version": self.stage_version,
+            "protected_fact_policy_version": self.protected_fact_policy_version,
         }
 
 
@@ -174,19 +196,23 @@ class LLMChunkExecutor:
             chunk_results = await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             await _cancel_tasks(tasks)
+            self._cleanup_written_keys()
             raise
         except Exception:
             await _cancel_tasks(tasks)
+            self._cleanup_written_keys()
             raise
         by_id: dict[str, object] = {}
         for result in chunk_results:
             for response in result:
                 response_id = _response_id(response)
                 if response_id in by_id:
+                    self._cleanup_written_keys()
                     raise AppError("llm.duplicate_id", {"id": response_id})
                 by_id[response_id] = response
         expected_ids = tuple(item.id for item in ordered)
         if set(by_id) != set(expected_ids):
+            self._cleanup_written_keys()
             raise AppError("llm.missing_id", {"ids": list(expected_ids)})
         ordered_results = tuple(cast(T, by_id[item_id]) for item_id in expected_ids)
         if aggregate_validator is not None:
@@ -235,7 +261,7 @@ class LLMChunkExecutor:
                 semantic_validator,
             )
         except AppError as exc:
-            if exc.code not in _ID_MISMATCH_ERRORS or len(chunk.items) < 2:
+            if exc.code not in _SHRINK_ERRORS or len(chunk.items) < 2:
                 raise
             positions = {item.id: index for index, item in enumerate(all_items)}
             indexes = tuple(positions[item.id] for item in chunk.items)
@@ -315,6 +341,7 @@ class LLMChunkExecutor:
             self.config.chunking.max_input_tokens,
             request_kind=request.task_kind,
         )
+        generated: object | None = None
         try:
             generated = await self.client.generate_structured(request, batch_schema, context)
             responses = self._validate_and_order(
@@ -328,20 +355,32 @@ class LLMChunkExecutor:
             if exc.code not in _VALIDATION_REPAIR_ERRORS:
                 raise
             context.raise_if_cancelled()
+            invalid_response = _invalid_response_candidate(exc, generated)
             repair_request = structured_repair_request(
                 request,
+                invalid_response=invalid_response,
+                diagnostics=(_repair_diagnostic(exc),),
                 repair_prompt_id=self.config.repair_prompt_id,
                 repair_prompt_version=self.config.repair_prompt_version,
                 repair_prompt_content_sha256=self.config.repair_prompt_content_sha256,
                 repair_prompt_content=self.config.repair_prompt_content,
             )
-            validate_request_budget(
-                repair_request,
-                batch_schema,
-                estimator,
-                self.config.chunking.max_input_tokens,
-                request_kind=repair_request.task_kind,
-            )
+            try:
+                validate_request_budget(
+                    repair_request,
+                    batch_schema,
+                    estimator,
+                    self.config.chunking.max_input_tokens,
+                    request_kind=repair_request.task_kind,
+                )
+            except AppError as budget_error:
+                if budget_error.code != "llm.item_too_large":
+                    raise
+                budget_params: dict[str, JsonValue] = {}
+                for key in ("estimated_tokens", "max_input_tokens"):
+                    if key in budget_error.params:
+                        budget_params[key] = thaw_json_value(budget_error.params[key])
+                raise AppError("llm.repair_budget_exceeded", budget_params) from budget_error
             repaired = await self.client.generate_structured(
                 repair_request,
                 batch_schema,
@@ -361,8 +400,11 @@ class LLMChunkExecutor:
         return responses
 
     def _estimator(self) -> SerializedRequestTokenEstimator:
+        token_counter = getattr(self.planner, "token_counter", None)
+        if token_counter is None:
+            raise AppError("llm.tokenizer_unknown")
         return SerializedRequestTokenEstimator(
-            getattr(self.planner, "token_counter", _PlannerCounter()),
+            token_counter,
             self.config.model,
             self.config.temperature,
             response_schema_version=self.config.response_schema_version,
@@ -507,9 +549,7 @@ class LLMChunkExecutor:
 def _responses_from_batch(value: object) -> tuple[object, ...]:
     if isinstance(value, StructuredResponseBatch):
         return value.responses
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return tuple(cast(Sequence[object], value))
-    return (value,)
+    raise AppError("llm.schema_invalid", {"reason": "batch_object"})
 
 
 def _response_mapping(response: object) -> object:
@@ -534,7 +574,7 @@ def _batch_from_responses(
     parser = getattr(batch_schema, "from_mapping", None)
     if not callable(parser):
         raise AppError("llm.schema_invalid", {"reason": "batch_schema"})
-    result = parser(values)
+    result = parser({"responses": values})
     if not isinstance(result, StructuredResponseBatch):
         raise AppError("llm.cache_value_invalid", {"reason": "batch"})
     return result
@@ -557,3 +597,48 @@ async def _cancel_tasks(tasks: Sequence[asyncio.Task[object]]) -> None:
             task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _invalid_response_candidate(error: AppError, generated: object | None) -> str:
+    if isinstance(error, LLMStructuredDecodeError):
+        return error.raw_content
+    if generated is None:
+        raise error
+    to_dict = getattr(generated, "to_dict", None)
+    if not callable(to_dict):
+        raise error
+    candidate = to_dict()
+    if not isinstance(candidate, Mapping):
+        raise error
+    try:
+        return json.dumps(
+            candidate,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as serialization_error:
+        raise error from serialization_error
+
+
+def _repair_diagnostic(error: AppError) -> LLMRepairDiagnostic:
+    params = error.params
+    item_id = _safe_string(params.get("id")) or _safe_string(params.get("item_id"))
+    field = _safe_string(params.get("field"))
+    expected_kind = _safe_string(params.get("expected_kind"))
+    actual_kind = _safe_string(params.get("actual_kind"))
+    raw_position = params.get("position")
+    position = raw_position if type(raw_position) is int and raw_position >= 0 else None
+    return LLMRepairDiagnostic(
+        code=error.code,
+        item_id=item_id,
+        field=field,
+        expected_kind=expected_kind,
+        actual_kind=actual_kind,
+        position=position,
+    )
+
+
+def _safe_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None

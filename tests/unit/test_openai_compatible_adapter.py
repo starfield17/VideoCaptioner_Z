@@ -51,7 +51,7 @@ def _request(item_id: str = "item-1") -> LLMRequest:
 def _response(item_id: str = "item-1", text: str = "corrected") -> HTTPResponse:
     content = json.dumps({"id": item_id, "corrected_source": text})
     body = json.dumps(
-        {"choices": [{"message": {"content": content}}]},
+        {"choices": [{"finish_reason": "stop", "message": {"content": content}}]},
         separators=(",", ":"),
     ).encode()
     return HTTPResponse(200, {"content-type": "application/json"}, body)
@@ -174,7 +174,7 @@ def test_network_timeout_and_response_shape_failures_are_structured() -> None:
     malformed = HTTPResponse(
         200,
         {},
-        b'{"choices":[{"message":{"content":"{\\"id\\":\\"item-1\\",\\"id\\":\\"item-1\\"}"}}]}',
+        b'{"choices":[{"finish_reason":"stop","message":{"content":"{\\"id\\":\\"item-1\\",\\"id\\":\\"item-1\\"}"}}]}',
     )
     client = OpenAICompatibleClient(_provider(), transport=QueueTransport([malformed]))
     with pytest.raises(AppError, match=r"llm\.schema_invalid"):
@@ -197,8 +197,8 @@ def test_id_mismatch_is_not_retried_by_the_adapter() -> None:
         (b"[]", "envelope_object"),
         (b'{"choices":[]}', "choices"),
         (b'{"choices":[1]}', "choice"),
-        (b'{"choices":[{"message":1}]}', "message"),
-        (b'{"choices":[{"message":{"content":1}}]}', "content"),
+        (b'{"choices":[{"finish_reason":"stop","message":1}]}', "message"),
+        (b'{"choices":[{"finish_reason":"stop","message":{"content":1}}]}', "content"),
     ],
 )
 def test_response_envelope_shape_is_strict(body: bytes, reason: str) -> None:
@@ -210,8 +210,62 @@ def test_response_envelope_shape_is_strict(body: bytes, reason: str) -> None:
         asyncio.run(
             client.generate_structured(_request(), SourceCorrectionResponse, ExecutionContext())
         )
-    assert raised.value.code == "llm.schema_invalid"
+    assert raised.value.code == "llm.provider_response_invalid"
     assert raised.value.params["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("body", "code", "reason"),
+    [
+        (
+            {"choices": [{"finish_reason": "stop", "message": {"refusal": "private refusal"}}]},
+            "llm.refused",
+            None,
+        ),
+        (
+            {"choices": [{"finish_reason": "content_filter", "message": {"content": ""}}]},
+            "llm.content_filtered",
+            None,
+        ),
+        (
+            {"choices": [{"finish_reason": "length", "message": {"content": "partial"}}]},
+            "llm.output_truncated",
+            None,
+        ),
+        (
+            {"choices": [{"finish_reason": "unknown", "message": {"content": "{}"}}]},
+            "llm.provider_response_invalid",
+            "finish_reason",
+        ),
+        (
+            {"choices": [{"message": {"content": "{}"}}]},
+            "llm.provider_response_invalid",
+            "finish_reason",
+        ),
+        (
+            {"choices": [{"finish_reason": "stop", "message": {"content": ""}}]},
+            "llm.provider_response_invalid",
+            "content",
+        ),
+    ],
+)
+def test_provider_outcomes_are_classified_before_structured_decoding(
+    body: dict[str, object], code: str, reason: str | None
+) -> None:
+    raw_body = json.dumps(body).encode()
+    client = OpenAICompatibleClient(
+        _provider(),
+        transport=QueueTransport([HTTPResponse(200, {}, raw_body)]),
+    )
+    with pytest.raises(AppError) as raised:
+        asyncio.run(
+            client.generate_structured(_request(), SourceCorrectionResponse, ExecutionContext())
+        )
+    assert raised.value.code == code
+    assert raised.value.retryable is False
+    if reason is not None:
+        assert raised.value.params["reason"] == reason
+    assert "private refusal" not in str(raised.value)
 
 
 def test_unknown_http_status_is_classified_without_retry() -> None:

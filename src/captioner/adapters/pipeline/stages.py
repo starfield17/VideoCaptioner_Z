@@ -46,12 +46,14 @@ from captioner.core.application.source_correction import (
 from captioner.core.domain.artifact import ArtifactRef
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.llm import (
+    LLM_RESPONSE_SCHEMA_VERSION,
     FastTranslationResponse,
     LLMTaskKind,
     QualityTranslationResponse,
     ReviewResponse,
     SourceCorrectionResponse,
     TerminologyResponse,
+    validate_source_language,
 )
 from captioner.core.domain.publication import PublicationReceipt, PublishedTarget
 from captioner.core.domain.result import JsonValue
@@ -178,7 +180,7 @@ class CorrectSourceStage:
     correction_prompt: PromptIdentity
     config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
     name: StageName = StageName.CORRECT_SOURCE
-    version: str = "correct-source-v1"
+    version: str = "correct-source-v2"
     repair_prompt: PromptIdentity | None = None
 
     async def execute(
@@ -357,7 +359,7 @@ class TranslateStage:
     prompt: PromptIdentity
     config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
     name: StageName = StageName.TRANSLATE
-    version: str = "translate-v1"
+    version: str = "translate-v2"
     repair_prompt: PromptIdentity | None = None
 
     async def execute(
@@ -477,7 +479,7 @@ class QualityTranslateStage:
     prompt: PromptIdentity
     config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
     name: StageName = StageName.TRANSLATE
-    version: str = "translate-quality-v1"
+    version: str = "translate-quality-v2"
     repair_prompt: PromptIdentity | None = None
 
     async def execute(
@@ -612,7 +614,7 @@ class ReviewStage:
     prompt: PromptIdentity
     config: SegmentationPolicyConfig | SimpleSegmentationConfig | None = None
     name: StageName = StageName.REVIEW
-    version: str = "review-v1"
+    version: str = "review-v2"
     repair_prompt: PromptIdentity | None = None
 
     async def execute(
@@ -1119,6 +1121,7 @@ def _stage_execution_config(
     repair_prompt: PromptIdentity | None = None,
     context_payload_factory: Callable[[LLMChunk], Mapping[str, JsonValue]] | None = None,
 ) -> LLMChunkExecutionConfig:
+    validate_source_language(source_language)
     values = {} if llm is None else dict(llm)
     provider_kind = _snapshot_string(values, "kind", "openai-compatible")
     provider_identity = _snapshot_string(values, "provider_profile", "default")
@@ -1127,8 +1130,8 @@ def _stage_execution_config(
     temperature = values.get("temperature", 0.1)
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
         raise AppError("llm.config_invalid", {"field": "temperature"})
-    schema_version = values.get("response_schema_version", 1)
-    if type(schema_version) is not int or schema_version < 1:
+    schema_version = values.get("response_schema_version", LLM_RESPONSE_SCHEMA_VERSION)
+    if type(schema_version) is not int or schema_version != LLM_RESPONSE_SCHEMA_VERSION:
         raise AppError("llm.config_invalid", {"field": "response_schema_version"})
     tokenizer = _snapshot_string(values, "tokenizer", "cl100k_base")
     return LLMChunkExecutionConfig(

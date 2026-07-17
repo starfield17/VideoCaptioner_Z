@@ -74,7 +74,7 @@ def _budget_request(
 def _budget_config(max_input_tokens: int) -> LLMChunkExecutionConfig:
     loader = PromptLoader(Path("resources/prompts"))
     prompt = loader.load("translate_fast", "v1")
-    repair = loader.load("repair_structured", "v1")
+    repair = loader.load("repair_structured", "v2")
     return LLMChunkExecutionConfig(
         task_kind="translate_fast",
         provider_kind="openai-compatible",
@@ -111,14 +111,16 @@ def _translation_response(
     typed_request = cast(LLMRequest, request)
     parser = cast(type[StructuredResponseBatch], response_schema).from_mapping
     return parser(
-        [
-            {
-                "id": item.id,
-                "corrected_source": item.source,
-                "translated_text": item.source,
-            }
-            for item in typed_request.items
-        ]
+        {
+            "responses": [
+                {
+                    "id": item.id,
+                    "corrected_source": item.source,
+                    "translated_text": item.source,
+                }
+                for item in typed_request.items
+            ]
+        }
     )
 
 
@@ -189,7 +191,7 @@ def test_single_item_over_budget_has_structured_error() -> None:
 def test_complete_encoded_request_fits_budget_and_prompt_is_sent_once(tmp_path: Path) -> None:
     loader = PromptLoader(Path("resources/prompts"))
     prompt = loader.load("translate_fast", "v1")
-    repair = loader.load("repair_structured", "v1")
+    repair = loader.load("repair_structured", "v2")
     item = LLMItem("item-0", "source 0")
     request = _budget_request(
         prompt.prompt_id,
@@ -242,7 +244,7 @@ def test_complete_encoded_request_fits_budget_and_prompt_is_sent_once(tmp_path: 
 def test_single_item_complete_request_over_budget_fails_before_adapter(tmp_path: Path) -> None:
     loader = PromptLoader(Path("resources/prompts"))
     prompt = loader.load("translate_fast", "v1")
-    repair = loader.load("repair_structured", "v1")
+    repair = loader.load("repair_structured", "v2")
     request = _budget_request(
         prompt.prompt_id,
         prompt.prompt_version,

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
-from captioner.core.domain.llm import LLMRequest
+from captioner.core.domain.llm import LLMRepairContext, LLMRepairDiagnostic, LLMRequest
 from captioner.core.ports.llm import LLMClient
 
 type Sleep = Callable[[float], Awaitable[None]]
@@ -109,12 +109,14 @@ async def _run_sleep(sleep: Sleep, delay: float) -> None:
 def structured_repair_request(
     request: LLMRequest,
     *,
+    invalid_response: str,
+    diagnostics: tuple[LLMRepairDiagnostic, ...],
     repair_prompt_id: str,
     repair_prompt_version: str,
     repair_prompt_content_sha256: str,
     repair_prompt_content: str,
 ) -> LLMRequest:
-    """Create the single resource-backed repair request owned by the executor."""
+    """Create one contextual repair request owned by the executor."""
     if not all(
         (
             repair_prompt_id,
@@ -124,36 +126,32 @@ def structured_repair_request(
         )
     ):
         raise AppError("prompt.identity_missing", {"prompt_id": "repair_structured"})
+    if request.repair_context is not None:
+        raise AppError("llm.repair_already_attempted")
     return LLMRequest(
-        task_kind="repair_structured",
+        task_kind=request.task_kind,
         items=request.items,
         context=request.context,
         source_language=request.source_language,
         target_language=request.target_language,
-        prompt_id=repair_prompt_id,
-        prompt_version=repair_prompt_version,
-        prompt_content_sha256=repair_prompt_content_sha256,
-        prompt_content=repair_prompt_content,
+        prompt_id=request.prompt_id,
+        prompt_version=request.prompt_version,
+        prompt_content_sha256=request.prompt_content_sha256,
+        prompt_content=request.prompt_content,
         context_payload=request.context_payload,
-        repair_prompt_id=request.repair_prompt_id,
-        repair_prompt_version=request.repair_prompt_version,
-        repair_prompt_content_sha256=request.repair_prompt_content_sha256,
-        repair_prompt_content=request.repair_prompt_content,
+        repair_prompt_id=repair_prompt_id,
+        repair_prompt_version=repair_prompt_version,
+        repair_prompt_content_sha256=repair_prompt_content_sha256,
+        repair_prompt_content=repair_prompt_content,
+        repair_context=LLMRepairContext(
+            original_task_kind=request.task_kind,
+            invalid_response=invalid_response,
+            diagnostics=diagnostics,
+        ),
     )
 
 
 def _is_retryable(error: AppError) -> bool:
     if error.code == "operation.cancelled":
         return False
-    if error.code in {
-        "llm.auth_failed",
-        "llm.request_rejected",
-        "llm.http_error",
-        "llm.schema_invalid",
-        "llm.response_invalid",
-        "llm.id_mismatch",
-        "llm.context_id_returned",
-        "llm.item_too_large",
-    }:
-        return False
-    return error.code in _RETRYABLE_ERRORS or error.retryable
+    return error.code in _RETRYABLE_ERRORS

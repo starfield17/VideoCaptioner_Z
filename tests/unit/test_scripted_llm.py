@@ -38,7 +38,7 @@ def test_scripted_adapter_returns_structured_success_and_malformed_json() -> Non
         adapter.generate_structured(_request(), SourceCorrectionResponse, ExecutionContext())
     )
     assert first == SourceCorrectionResponse("item-1", "corrected")
-    with pytest.raises(AppError, match=r"llm\.response_invalid"):
+    with pytest.raises(AppError, match=r"llm\.schema_invalid"):
         asyncio.run(
             adapter.generate_structured(_request(), SourceCorrectionResponse, ExecutionContext())
         )
@@ -51,10 +51,12 @@ def test_scripted_batch_can_express_id_variants() -> None:
         structured_responses=[
             ScriptedJSON(
                 json.dumps(
-                    [
-                        {"id": "extra", "corrected_source": "corrected"},
-                        {"id": "item-1", "corrected_source": "corrected"},
-                    ]
+                    {
+                        "responses": [
+                            {"id": "extra", "corrected_source": "corrected"},
+                            {"id": "item-1", "corrected_source": "corrected"},
+                        ]
+                    }
                 )
             )
         ]

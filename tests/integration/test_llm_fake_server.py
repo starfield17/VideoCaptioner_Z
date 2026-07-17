@@ -7,6 +7,7 @@ import re
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -19,11 +20,26 @@ from captioner.adapters.llm.http_transport import (
     HttpxTransport,
 )
 from captioner.adapters.llm.openai_compatible import OpenAICompatibleClient
+from captioner.adapters.persistence.filesystem_llm_cache import FilesystemLLMCache
+from captioner.core.application.llm_chunk_executor import (
+    LLMChunkExecutionConfig,
+    LLMChunkExecutor,
+)
 from captioner.core.application.structured_llm_service import StructuredLLMService
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
-from captioner.core.domain.llm import LLMItem, LLMRequest, SourceCorrectionResponse
+from captioner.core.domain.llm import (
+    LLMItem,
+    LLMRequest,
+    SourceCorrectionResponse,
+)
+from captioner.core.policies.llm_chunking import ChunkingConfig, ChunkItem, ChunkPlanner
 from captioner.infrastructure.config import OpenAICompatibleProvider, ProviderCredential
+
+
+class FakeCounter:
+    def count(self, text: str) -> int:
+        return len(text.split())
 
 
 def _provider() -> OpenAICompatibleProvider:
@@ -53,7 +69,8 @@ def _request() -> LLMRequest:
 def _success_body() -> bytes:
     content = json.dumps({"id": "item-1", "corrected_source": "corrected"})
     return json.dumps(
-        {"choices": [{"message": {"content": content}}]}, separators=(",", ":")
+        {"choices": [{"finish_reason": "stop", "message": {"content": content}}]},
+        separators=(",", ":"),
     ).encode()
 
 
@@ -79,7 +96,7 @@ _SCHEMA_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def _validate_provider_schema_name(body: bytes) -> HTTPResponse | None:
-    """Simulate real OpenAI-compatible rejection of illegal json_schema.name."""
+    """Simulate strict Structured Outputs validation at the fake provider."""
     try:
         parsed: object = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -91,6 +108,8 @@ def _validate_provider_schema_name(body: bytes) -> HTTPResponse | None:
     if not isinstance(response_format, dict):
         return HTTPResponse(400, {}, b'{"error":"missing_response_format"}')
     format_map = cast(dict[str, object], response_format)
+    if format_map.get("type") != "json_schema":
+        return HTTPResponse(400, {}, b'{"error":"invalid_response_format"}')
     json_schema = format_map.get("json_schema")
     if not isinstance(json_schema, dict):
         return HTTPResponse(400, {}, b'{"error":"missing_json_schema"}')
@@ -102,6 +121,30 @@ def _validate_provider_schema_name(body: bytes) -> HTTPResponse | None:
         return HTTPResponse(400, {}, b'{"error":"empty_schema_name"}')
     if _SCHEMA_NAME_RE.fullmatch(name) is None:
         return HTTPResponse(400, {}, b'{"error":"invalid_schema_name"}')
+    schema = schema_map.get("schema")
+    if not isinstance(schema, dict):
+        return HTTPResponse(400, {}, b'{"error":"missing_schema"}')
+    schema = cast(dict[str, object], schema)
+    if schema.get("type") != "object":
+        return HTTPResponse(400, {}, b'{"error":"schema_root_not_object"}')
+    if schema.get("additionalProperties") is not False:
+        return HTTPResponse(400, {}, b'{"error":"schema_root_not_strict"}')
+    required = schema.get("required")
+    properties = schema.get("properties")
+    if not isinstance(required, list) or "responses" not in cast(list[object], required):
+        return HTTPResponse(400, {}, b'{"error":"schema_responses_not_required"}')
+    if not isinstance(properties, dict):
+        return HTTPResponse(400, {}, b'{"error":"schema_properties_invalid"}')
+    properties = cast(dict[str, object], properties)
+    responses = properties.get("responses")
+    if not isinstance(responses, dict):
+        return HTTPResponse(400, {}, b'{"error":"schema_responses_missing"}')
+    responses = cast(dict[str, object], responses)
+    min_items = responses.get("minItems")
+    if responses.get("type") != "array" or not isinstance(min_items, int):
+        return HTTPResponse(400, {}, b'{"error":"schema_responses_not_array"}')
+    if min_items < 1:
+        return HTTPResponse(400, {}, b'{"error":"schema_responses_empty"}')
     return None
 
 
@@ -156,7 +199,10 @@ class FakeClient:
         self.closed = True
 
 
-def _client(server: FakeServer) -> tuple[OpenAICompatibleClient, FakeClient]:
+def _client(
+    server: FakeServer, *, validate_schema: bool = False
+) -> tuple[OpenAICompatibleClient, FakeClient]:
+    server.validate_schema_name = validate_schema
     raw_client = FakeClient(server)
     transport = HttpxTransport(timeout=HTTPTimeout.all(1), client=raw_client)
     return OpenAICompatibleClient(_provider(), transport=transport), raw_client
@@ -251,10 +297,20 @@ def test_fake_server_rejects_invalid_schema_name() -> None:
         json.dumps({"response_format": {"json_schema": {"name": "a" * 65}}}).encode()
     )
     assert too_long is not None and too_long.status_code == 400
-    ok = _validate_provider_schema_name(
-        b'{"response_format":{"json_schema":{"name":"captioner_correct_source_batch_v1"}}}'
+    root_array = _validate_provider_schema_name(
+        json.dumps(
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "captioner_correct_source_batch_v2",
+                        "schema": {"type": "array"},
+                    },
+                }
+            }
+        ).encode()
     )
-    assert ok is None
+    assert root_array is not None and root_array.status_code == 400
 
     client, raw_client = _client(server)
     try:
@@ -269,3 +325,67 @@ def test_fake_server_rejects_invalid_schema_name() -> None:
     name = body["response_format"]["json_schema"]["name"]
     assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
     assert "<locals>" not in name
+
+
+def test_production_chunk_executor_request_passes_strict_fake_provider(tmp_path: Path) -> None:
+    prompt = "Return the corrected source."
+    batch_content = json.dumps(
+        {"responses": [{"id": "item-1", "corrected_source": "corrected"}]},
+        separators=(",", ":"),
+    )
+    server = FakeServer(
+        [
+            HTTPResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"content": batch_content},
+                            }
+                        ]
+                    },
+                    separators=(",", ":"),
+                ).encode(),
+            )
+        ]
+    )
+    client, raw_client = _client(server, validate_schema=True)
+    service = StructuredLLMService(client, max_retries=0)
+    config = LLMChunkExecutionConfig(
+        task_kind="correct_source",
+        provider_kind="openai-compatible",
+        provider_identity="default",
+        base_url_identity="https://fake.local/v1",
+        model="fake-model",
+        temperature=0.1,
+        source_language="en",
+        target_language=None,
+        profile="quality",
+        prompt_id="correct_source",
+        prompt_version="v1",
+        prompt_content_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        prompt_content=prompt,
+        chunking=ChunkingConfig(max_items=1, max_input_tokens=4096),
+    )
+    executor = LLMChunkExecutor(
+        service,
+        FilesystemLLMCache(tmp_path),
+        ChunkPlanner(FakeCounter()),
+        config,
+    )
+    try:
+        result = asyncio.run(
+            executor.execute((ChunkItem("item-1", "source"),), SourceCorrectionResponse)
+        )
+    finally:
+        asyncio.run(client.close())
+        asyncio.run(raw_client.aclose())
+    assert result[0] == SourceCorrectionResponse("item-1", "corrected")
+    body = json.loads(server.requests[0].content)
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["responses"]

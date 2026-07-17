@@ -25,7 +25,7 @@ from captioner.core.domain.result import (
     thaw_json_value,
 )
 
-LLM_CACHE_SCHEMA_VERSION = 1
+LLM_CACHE_SCHEMA_VERSION = 2
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _SECRET_KEYS = frozenset(
@@ -107,7 +107,10 @@ def build_llm_cache_key(
         raise AppError("llm.cache_key_invalid", {"reason": "temperature"})
     if not math.isfinite(float(raw_temperature)):
         raise AppError("llm.cache_key_invalid", {"reason": "temperature"})
-    if type(response_schema_version) is not int or response_schema_version < 1:
+    if (
+        type(response_schema_version) is not int
+        or response_schema_version != LLM_RESPONSE_SCHEMA_VERSION
+    ):
         raise AppError("llm.cache_key_invalid", {"reason": "response_schema"})
     if response_schema_name is not None and not response_schema_name.strip():
         raise AppError("llm.cache_key_invalid", {"reason": "response_schema_name"})

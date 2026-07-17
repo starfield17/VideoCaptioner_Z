@@ -70,8 +70,16 @@ def test_retryable_failures_use_bounded_exponential_backoff() -> None:
     assert len(client.calls) == 3
 
 
-def test_permanent_failure_and_id_mismatch_are_not_retried() -> None:
-    for code in ("llm.auth_failed", "llm.request_rejected", "llm.id_mismatch"):
+def test_permanent_failure_and_provider_outcomes_are_not_retried() -> None:
+    for code in (
+        "llm.auth_failed",
+        "llm.request_rejected",
+        "llm.id_mismatch",
+        "llm.refused",
+        "llm.content_filtered",
+        "llm.output_truncated",
+        "llm.provider_response_invalid",
+    ):
         client = ScriptedClient([AppError(code, retryable=True)])
         delays: list[float] = []
         with pytest.raises(AppError, match=code.replace(".", r"\.")):

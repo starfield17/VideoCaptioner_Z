@@ -84,12 +84,15 @@ def _context(tmp_path: Path) -> StageExecutionContext:
 
 def test_fast_translation_preserves_cue_mapping_and_renders_target_text(tmp_path: Path) -> None:
     store = ContentAddressedArtifactStore(tmp_path / "artifacts")
-    transcript = make_transcript(("hello 10 ", "world"))
+    transcript = make_transcript(("hello 10 ", "world"), language="ja")
     source_track = segment_transcript(transcript)
     transcript_ref = _put(store, encode_transcript(transcript), "transcript.json")
     source_ref = _put(store, encode_track(source_track), "subtitle-track.json")
 
+    seen_languages: list[str | None] = []
+
     def response(request: LLMRequest, _schema: type[object], _context: ExecutionContext) -> object:
+        seen_languages.append(request.source_language)
         items = request.items
         payload = [
             {
@@ -99,9 +102,10 @@ def test_fast_translation_preserves_cue_mapping_and_renders_target_text(tmp_path
             }
             for item in items
         ]
-        return response_batch_schema(FastTranslationResponse).from_mapping(payload)
+        return response_batch_schema(FastTranslationResponse).from_mapping({"responses": payload})
 
     prompt = PromptLoader(Path("resources/prompts")).load("translate_fast", "v1")
+    config = _config(tmp_path)
     adapter = ScriptedLLMAdapter(structured_responses=(response,))
     stage = TranslateStage(
         store,
@@ -113,7 +117,7 @@ def test_fast_translation_preserves_cue_mapping_and_renders_target_text(tmp_path
     )
     produced = asyncio.run(
         stage.execute(
-            _request(tmp_path, _config(tmp_path), (transcript_ref, source_ref)),
+            _request(tmp_path, config, (transcript_ref, source_ref)),
             _context(tmp_path),
         )
     )
@@ -123,6 +127,8 @@ def test_fast_translation_preserves_cue_mapping_and_renders_target_text(tmp_path
     assert produced[0].logical_name == "translated-track.zh-CN.json"
     assert produced[1].logical_name == "translation-report.json"
     assert json.loads(produced[0].data or b"")["schema_version"] == 3
+    assert seen_languages == ["ja"]
+    assert config.language == "en"
     assert translated.revision == 1
     assert translated.language == "zh-CN"
     assert translated.cues[0].translated_text == "你好 10 世界"

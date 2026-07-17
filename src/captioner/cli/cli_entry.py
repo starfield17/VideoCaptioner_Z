@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument("--model")
             command_parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
             command_parser.add_argument("--compute-type")
-            command_parser.add_argument("--language")
+            command_parser.add_argument("--language", default=argparse.SUPPRESS)
             command_parser.add_argument("--output", type=Path)
             command_parser.add_argument(
                 "--profile",
@@ -157,14 +157,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         namespace.batch_id,
                         paths=paths,
                         overrides=batch_command.ResumeOverrides(
-                            namespace.model,
-                            namespace.device,
-                            namespace.compute_type,
-                            namespace.language,
-                            namespace.output,
-                            None
-                            if namespace.profile is None
-                            else PipelineProfile(namespace.profile),
+                            model_ref=namespace.model,
+                            device=namespace.device,
+                            compute_type=namespace.compute_type,
+                            language=getattr(namespace, "language", batch_command.LANGUAGE_UNSET),
+                            output_dir=namespace.output,
+                            pipeline_profile=(
+                                None
+                                if namespace.profile is None
+                                else PipelineProfile(namespace.profile)
+                            ),
                             target_language=namespace.target_language,
                             llm_provider_profile=namespace.llm_provider_profile,
                         ),

@@ -127,10 +127,9 @@ class JobConfig:
                 snapshot = LLMJobSnapshot.from_mapping(thaw_json_value(frozen_llm))
                 if snapshot.profile is not profile:
                     raise AppError("job.config_invalid", {"field": "llm.profile"})
-                # JobConfig.language and snapshot.source_language must stay aligned
-                # when the operator fixed a source language. ASR-detected language
-                # may remain None on the Job while the snapshot is still None.
-                if self.language is not None and snapshot.source_language != self.language:
+                # The snapshot records the operator-configured source language,
+                # including an intentional None before ASR detection.
+                if snapshot.source_language != self.language:
                     raise AppError(
                         "job.config_invalid",
                         {"field": "llm.source_language"},

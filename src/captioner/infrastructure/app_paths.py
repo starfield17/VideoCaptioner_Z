@@ -38,6 +38,14 @@ class AppPaths:
         return self.data_dir / "artifacts"
 
     @property
+    def tokenizer_resource_dir(self) -> Path:
+        return self.resource_root / "tokenizers"
+
+    @property
+    def tokenizer_manifest_path(self) -> Path:
+        return self.tokenizer_resource_dir / "tokenizer-manifest.json"
+
+    @property
     def writable_directories(self) -> tuple[Path, ...]:
         return (self.config_dir, self.data_dir, self.cache_dir, self.log_dir, self.temp_dir)
 

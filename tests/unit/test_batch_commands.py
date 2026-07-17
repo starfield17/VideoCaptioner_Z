@@ -280,7 +280,7 @@ def test_batch_helpers_cover_override_and_collision_policies(tmp_path: Path) -> 
         ("source_language", "fr", StageName.TRANSCRIBE),
         ("target_language", "de", StageName.TRANSLATE),
         ("chunk", {"max_items": 8}, StageName.CORRECT_SOURCE),
-        ("response_schema_version", 2, StageName.CORRECT_SOURCE),
+        ("response_schema_version", 1, StageName.CORRECT_SOURCE),
         ("tokenizer", "o200k_base", StageName.CORRECT_SOURCE),
     ],
 )
@@ -315,6 +315,10 @@ def test_each_llm_snapshot_field_has_an_invalidation_boundary(
     # JobConfig.language and snapshot.source_language must stay aligned.
     if field == "source_language":
         changed = replace(quality, language=cast(str, value), llm=values)
+    elif field == "response_schema_version":
+        with pytest.raises(AppError, match=r"llm\.snapshot_invalid"):
+            replace(quality, llm=values)
+        return
     else:
         changed = replace(quality, llm=values)
     assert earliest_change(quality, changed) is expected
@@ -561,6 +565,38 @@ def test_job_rejects_mismatched_snapshot_source_language(tmp_path: Path) -> None
         )
 
 
+def test_job_accepts_matching_none_source_language_and_rejects_none_mismatch(
+    tmp_path: Path,
+) -> None:
+    config = create_job_config(
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language=None,
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        output_dir=tmp_path / "output",
+        overwrite=False,
+        pipeline_profile=PipelineProfile.FAST,
+        llm=llm_snapshot(PipelineProfile.FAST, source_language=None),
+    )
+    assert config.language is None
+    assert config.llm is not None and config.llm["source_language"] is None
+    with pytest.raises(AppError, match=r"job\.config_invalid"):
+        create_job_config(
+            model_ref="tiny",
+            device="cpu",
+            compute_type="int8",
+            language=None,
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+            output_dir=tmp_path / "other-output",
+            overwrite=False,
+            pipeline_profile=PipelineProfile.FAST,
+            llm=llm_snapshot(PipelineProfile.FAST, source_language="en"),
+        )
+
+
 def test_language_override_uses_effective_language(tmp_path: Path) -> None:
     from captioner.cli.commands.batch import ResumeOverrides
     from captioner.infrastructure.app_paths import resolve_app_paths
@@ -598,3 +634,70 @@ tokenizer = "cl100k_base"
     assert updated.language == "ja"
     assert updated.llm is not None
     assert updated.llm["source_language"] == "ja"
+
+
+def test_language_override_to_none_rebuilds_snapshot_and_invalidates_transcribe(
+    tmp_path: Path,
+) -> None:
+    from captioner.cli.commands.batch import ResumeOverrides
+    from captioner.infrastructure.config import write_llm_config
+
+    paths = resolve_app_paths(
+        base_dir=tmp_path,
+        resource_root_override=Path("resources").resolve(),
+    )
+    write_llm_config(
+        paths.config_dir / "llm.toml",
+        """
+[providers.default]
+kind = "openai-compatible"
+base_url = "https://provider.example/v1"
+api_key = "unit-test-key"
+model = "unit-model"
+tokenizer = "cl100k_base"
+""",
+    )
+    original = create_job_config(
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="ja",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        output_dir=tmp_path / "output",
+        overwrite=False,
+        pipeline_profile=PipelineProfile.FAST,
+        llm=llm_snapshot(PipelineProfile.FAST, source_language="ja"),
+    )
+    apply = cast(Callable[..., JobConfig], batch_private._apply_overrides)
+    updated = apply(original, ResumeOverrides(language=None), paths=paths)
+    assert updated.language is None
+    assert updated.llm is not None and updated.llm["source_language"] is None
+    earliest = cast(Callable[[JobConfig, JobConfig], StageName], batch_private._earliest_change)
+    assert earliest(original, updated) is StageName.TRANSCRIBE
+
+
+def test_conflicting_explicit_resume_snapshot_fails_before_runtime_construction(
+    tmp_path: Path,
+) -> None:
+    from captioner.cli.commands.batch import ResumeOverrides
+
+    config = create_job_config(
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="en",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        output_dir=tmp_path / "output",
+        overwrite=False,
+        pipeline_profile=PipelineProfile.FAST,
+        llm=llm_snapshot(PipelineProfile.FAST, source_language="en"),
+    )
+    apply = cast(Callable[..., JobConfig], batch_private._apply_overrides)
+    with pytest.raises(AppError, match=r"llm\.snapshot_invalid"):
+        apply(
+            config,
+            ResumeOverrides(llm=llm_snapshot(PipelineProfile.FAST, source_language="ja")),
+            paths=None,
+        )

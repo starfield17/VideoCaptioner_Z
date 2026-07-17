@@ -213,6 +213,9 @@ def verify_layout(layout: BuildLayout) -> None:
     required = (
         layout.executable_path,
         layout.resource_root / "i18n" / "en.json",
+        layout.resource_root / "tokenizers" / "tokenizer-manifest.json",
+        layout.resource_root / "tokenizers" / "cl100k_base.tiktoken",
+        layout.resource_root / "tokenizers" / "o200k_base.tiktoken",
         layout.final_root / "README.md",
     )
     missing = [str(path) for path in required if not path.is_file()]

@@ -37,6 +37,13 @@ from captioner.infrastructure.app_paths import AppPaths, resolve_safe_child
 from captioner.infrastructure.ids import new_id
 
 
+class _LanguageUnset:
+    __slots__ = ()
+
+
+LANGUAGE_UNSET = _LanguageUnset()
+
+
 @dataclass(frozen=True, slots=True)
 class BatchRunOptions:
     inputs: tuple[Path, ...]
@@ -58,12 +65,16 @@ class ResumeOverrides:
     model_ref: str | None = None
     device: str | None = None
     compute_type: str | None = None
-    language: str | None = None
+    language: str | None | _LanguageUnset = LANGUAGE_UNSET
     output_dir: Path | None = None
     pipeline_profile: PipelineProfile | None = None
     llm: Mapping[str, object] | None = None
     target_language: str | None = None
     llm_provider_profile: str | None = None
+
+    @property
+    def has_language_override(self) -> bool:
+        return not isinstance(self.language, _LanguageUnset)
 
 
 def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
@@ -409,12 +420,13 @@ def _apply_overrides(
         else PipelineProfile(overrides.pipeline_profile)
     )
     llm = _llm_for_resume(config, overrides, selected_profile, paths)
+    effective_language = _effective_language(config, overrides)
     if overrides.model_ref is not None:
         candidate = create_job_config(
             model_ref=overrides.model_ref,
             device=overrides.device or config.device,
             compute_type=overrides.compute_type or config.compute_type,
-            language=config.language if overrides.language is None else overrides.language,
+            language=effective_language,
             ffmpeg_bin=config.ffmpeg_bin,
             ffprobe_bin=config.ffprobe_bin,
             output_dir=Path(config.output_dir)
@@ -439,7 +451,7 @@ def _apply_overrides(
         config,
         device=overrides.device or config.device,
         compute_type=overrides.compute_type or config.compute_type,
-        language=config.language if overrides.language is None else overrides.language,
+        language=effective_language,
         output_dir=config.output_dir
         if overrides.output_dir is None
         else str(overrides.output_dir.resolve()),
@@ -455,18 +467,33 @@ def _llm_for_resume(
     selected_profile: PipelineProfile,
     paths: AppPaths | None,
 ) -> Mapping[str, FrozenJsonValue] | None:
-    if overrides.llm is not None:
-        return _frozen_llm(overrides.llm)
     if selected_profile is PipelineProfile.DETERMINISTIC:
+        if overrides.llm is not None:
+            raise AppError("llm.snapshot_invalid", {"reason": "profile"})
         return None
     # Compute effective values first so snapshot identity never reads stale config.
-    effective_language = config.language if overrides.language is None else overrides.language
-    effective_target_language = overrides.target_language or config.target_language
+    effective_language = _effective_language(config, overrides)
+    effective_target_language = (
+        config.target_language if overrides.target_language is None else overrides.target_language
+    )
     if effective_target_language is None:
         raise AppError("llm.target_language_missing")
     effective_provider_profile = (
-        overrides.llm_provider_profile or config.provider_profile or "default"
+        config.provider_profile or "default"
+        if overrides.llm_provider_profile is None
+        else overrides.llm_provider_profile
     )
+    if overrides.llm is not None:
+        snapshot = LLMJobSnapshot.from_mapping(thaw_json_value(_frozen_llm(overrides.llm)))
+        if snapshot.profile is not selected_profile:
+            raise AppError("llm.snapshot_invalid", {"reason": "profile"})
+        if snapshot.source_language != effective_language:
+            raise AppError("llm.snapshot_invalid", {"reason": "source_language"})
+        if snapshot.target_language != effective_target_language:
+            raise AppError("llm.snapshot_invalid", {"reason": "target_language"})
+        if snapshot.provider.provider_profile != effective_provider_profile:
+            raise AppError("llm.snapshot_invalid", {"reason": "provider_profile"})
+        return snapshot.to_mapping()
     profile_changed = selected_profile is not config.pipeline_profile
     snapshot_source = None if config.llm is None else config.llm.get("source_language")
     if snapshot_source is not None and not isinstance(snapshot_source, str):
@@ -474,7 +501,7 @@ def _llm_for_resume(
     identity_changed = (
         overrides.target_language is not None
         or overrides.llm_provider_profile is not None
-        or overrides.language is not None
+        or overrides.has_language_override
         or profile_changed
         or effective_language != snapshot_source
     )
@@ -492,6 +519,15 @@ def _llm_for_resume(
         pipeline_profile=selected_profile,
     )
     return snapshot
+
+
+def _effective_language(config: JobConfig, overrides: ResumeOverrides) -> str | None:
+    if not overrides.has_language_override:
+        return config.language
+    language = overrides.language
+    if isinstance(language, _LanguageUnset):
+        raise AppError("job.config_invalid", {"field": "language"})
+    return language
 
 
 async def _run_and_close(

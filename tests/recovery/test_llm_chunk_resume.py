@@ -16,12 +16,13 @@ from captioner.core.application.llm_chunk_executor import (
     LLMChunkExecutor,
 )
 from captioner.core.application.structured_llm_service import StructuredLLMService
-from captioner.core.domain.errors import AppError
+from captioner.core.domain.errors import AppError, LLMStructuredDecodeError
 from captioner.core.domain.execution import ExecutionContext
 from captioner.core.domain.llm import (
     LLMRequest,
     SourceCorrectionResponse,
     StructuredResponseBatch,
+    encode_llm_request,
     response_batch_schema,
 )
 from captioner.core.domain.llm_cache import LLMCacheKey
@@ -39,7 +40,7 @@ def _items(count: int = 4) -> tuple[ChunkItem, ...]:
 
 
 def _config(*, max_items: int = 2, context_after_items: int = 0) -> LLMChunkExecutionConfig:
-    repair = PromptLoader(Path("resources/prompts")).load("repair_structured", "v1")
+    repair = PromptLoader(Path("resources/prompts")).load("repair_structured", "v2")
     return LLMChunkExecutionConfig(
         task_kind="correct_source",
         provider_kind="openai-compatible",
@@ -69,10 +70,15 @@ def _config(*, max_items: int = 2, context_after_items: int = 0) -> LLMChunkExec
 def _payload(items: tuple[ChunkItem, ...]) -> ScriptedJSON:
     return ScriptedJSON(
         json.dumps(
-            [
-                {"id": item.id, "corrected_source": item.text.replace("source", "corrected")}
-                for item in items
-            ]
+            {
+                "responses": [
+                    {
+                        "id": item.id,
+                        "corrected_source": item.text.replace("source", "corrected"),
+                    }
+                    for item in items
+                ]
+            }
         )
     )
 
@@ -85,10 +91,12 @@ def _dynamic_success(
     del context
     parser = cast(type[StructuredResponseBatch], response_schema).from_mapping
     return parser(
-        [
-            {"id": item.id, "corrected_source": item.source.replace("source", "corrected")}
-            for item in request.items
-        ]
+        {
+            "responses": [
+                {"id": item.id, "corrected_source": item.source.replace("source", "corrected")}
+                for item in request.items
+            ]
+        }
     )
 
 
@@ -152,6 +160,54 @@ def test_id_mismatch_shrinks_current_chunk_deterministically(tmp_path: Path) -> 
     assert adapter.structured_calls[2].context_ids == ("item-1",)
 
 
+def test_multi_item_truncation_splits_once_per_chunk_node(tmp_path: Path) -> None:
+    cache = FilesystemLLMCache(tmp_path)
+    items = _items()
+    adapter = ScriptedLLMAdapter(
+        structured_responses=[
+            AppError("llm.output_truncated"),
+            _dynamic_success,
+            _dynamic_success,
+        ]
+    )
+    result = asyncio.run(
+        _executor(cache, adapter, _config(max_items=4)).execute(items, SourceCorrectionResponse)
+    )
+    assert [response.id for response in result] == [item.id for item in items]
+    assert [tuple(call.item_ids) for call in adapter.structured_calls] == [
+        tuple(item.id for item in items),
+        tuple(item.id for item in items[:2]),
+        tuple(item.id for item in items[2:]),
+    ]
+    assert len(list(cache.root.rglob("*.json"))) == 2
+
+
+def test_single_item_truncation_fails_without_repair_or_cache(tmp_path: Path) -> None:
+    cache = FilesystemLLMCache(tmp_path)
+    adapter = ScriptedLLMAdapter(structured_responses=[AppError("llm.output_truncated")])
+    with pytest.raises(AppError, match=r"llm\.output_truncated"):
+        asyncio.run(
+            _executor(cache, adapter, _config(max_items=1)).execute(
+                (ChunkItem("item-0", "source"),), SourceCorrectionResponse
+            )
+        )
+    assert len(adapter.structured_calls) == 1
+    assert not list(cache.root.rglob("*.json"))
+
+
+def test_refusal_fails_without_repair_or_cache(tmp_path: Path) -> None:
+    cache = FilesystemLLMCache(tmp_path)
+    adapter = ScriptedLLMAdapter(structured_responses=[AppError("llm.refused")])
+    with pytest.raises(AppError, match=r"llm\.refused"):
+        asyncio.run(
+            _executor(cache, adapter, _config(max_items=1)).execute(
+                (ChunkItem("item-0", "source"),), SourceCorrectionResponse
+            )
+        )
+    assert len(adapter.structured_calls) == 1
+    assert not list(cache.root.rglob("*.json"))
+
+
 def test_retryable_error_retries_only_current_chunk(tmp_path: Path) -> None:
     cache = FilesystemLLMCache(tmp_path)
     items = _items(2)
@@ -185,8 +241,8 @@ def test_cancellation_leaves_no_partial_cache(tmp_path: Path) -> None:
 def test_validation_failure_gets_one_repair_before_cache_write(tmp_path: Path) -> None:
     cache = FilesystemLLMCache(tmp_path)
     item = ChunkItem("item-0", "source 10")
-    invalid = ScriptedJSON('[{"id":"item-0","corrected_source":"corrected"}]')
-    repaired = ScriptedJSON('[{"id":"item-0","corrected_source":"corrected 10"}]')
+    invalid = ScriptedJSON('{"responses":[{"id":"item-0","corrected_source":"corrected"}]}')
+    repaired = ScriptedJSON('{"responses":[{"id":"item-0","corrected_source":"corrected 10"}]}')
     adapter = ScriptedLLMAdapter(structured_responses=(invalid, repaired))
 
     result = asyncio.run(
@@ -199,15 +255,40 @@ def test_validation_failure_gets_one_repair_before_cache_write(tmp_path: Path) -
     assert result[0].corrected_source == "corrected 10"
     assert [call.task_kind for call in adapter.structured_calls] == [
         "correct_source",
-        "repair_structured",
+        "correct_source",
     ]
+    repair = adapter.structured_calls[1]
+    assert repair.repair_context is not None
+    assert repair.repair_context.original_task_kind == "correct_source"
+    assert repair.repair_context.invalid_response == (
+        '{"responses":[{"corrected_source":"corrected","id":"item-0"}]}'
+    )
+    assert repair.repair_context.diagnostics[0].code == "llm.protected_token_lost"
+    wire = json.loads(
+        encode_llm_request(
+            repair, "unit-model", 0.1, response_batch_schema(SourceCorrectionResponse)
+        )
+    )
+    assert [message["role"] for message in wire["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert wire["messages"][0]["content"] == (
+        repair.prompt_content or "Return only the requested JSON object."
+    )
+    assert json.loads(wire["messages"][1]["content"]) == repair.original_wire_envelope()
+    assert wire["messages"][2]["content"] == repair.repair_context.invalid_response
+    assert "llm.protected_token_lost" in wire["messages"][3]["content"]
+    assert wire["response_format"]["json_schema"]["name"] == ("captioner_correct_source_batch_v2")
     assert len(list(cache.root.rglob("*.json"))) == 1
 
 
 def test_failed_validation_repair_is_not_cached(tmp_path: Path) -> None:
     cache = FilesystemLLMCache(tmp_path)
     item = ChunkItem("item-0", "source 10")
-    invalid = ScriptedJSON('[{"id":"item-0","corrected_source":"corrected"}]')
+    invalid = ScriptedJSON('{"responses":[{"id":"item-0","corrected_source":"corrected"}]}')
     adapter = ScriptedLLMAdapter(structured_responses=(invalid, invalid))
 
     with pytest.raises(AppError, match=r"llm\.protected_token_lost"):
@@ -220,7 +301,7 @@ def test_failed_validation_repair_is_not_cached(tmp_path: Path) -> None:
 
     assert [call.task_kind for call in adapter.structured_calls] == [
         "correct_source",
-        "repair_structured",
+        "correct_source",
     ]
     assert not list(cache.root.rglob("*.json"))
 
@@ -236,7 +317,9 @@ def test_semantically_invalid_cache_entry_is_removed_before_re_request(tmp_path:
     )
     request = default_request(chunk)
     batch_schema = response_batch_schema(SourceCorrectionResponse)
-    invalid = batch_schema.from_mapping([{"id": "item-0", "corrected_source": "corrected"}])
+    invalid = batch_schema.from_mapping(
+        {"responses": [{"id": "item-0", "corrected_source": "corrected"}]}
+    )
     cache_key = cast(
         Callable[[LLMRequest, type[StructuredResponseBatch]], LLMCacheKey],
         getattr(executor, "_cache_" + "key"),
@@ -248,6 +331,23 @@ def test_semantically_invalid_cache_entry_is_removed_before_re_request(tmp_path:
         asyncio.run(_executor(cache, adapter, config).execute((item,), SourceCorrectionResponse))
     assert adapter.structured_calls
     assert not cache.path_for(key).exists()
+
+
+def test_aggregate_failure_removes_new_chunk_keys_without_repair(tmp_path: Path) -> None:
+    cache = FilesystemLLMCache(tmp_path)
+    adapter = ScriptedLLMAdapter(structured_responses=(_dynamic_success, _dynamic_success))
+
+    def fail_aggregate(_responses: tuple[object, ...]) -> tuple[object, ...]:
+        raise AppError("llm.terminology_conflict", {"item_id": "item-0"})
+
+    with pytest.raises(AppError, match=r"llm\.terminology_conflict"):
+        asyncio.run(
+            _executor(cache, adapter, _config()).execute(
+                _items(), SourceCorrectionResponse, aggregate_validator=fail_aggregate
+            )
+        )
+    assert len(adapter.structured_calls) == 2
+    assert not list(cache.root.rglob("*.json"))
 
 
 def test_repair_over_budget_is_not_sent(tmp_path: Path) -> None:
@@ -272,7 +372,7 @@ def test_repair_over_budget_is_not_sent(tmp_path: Path) -> None:
             del request, response_schema, context
             self.calls += 1
             # Force a validation failure so the executor attempts repair.
-            raise AppError("llm.schema_invalid")
+            raise LLMStructuredDecodeError('{"responses":[{"id":"item-1","corrected_source":""}]}')
 
     class CharCounter:
         def count(self, text: str) -> int:
@@ -311,7 +411,7 @@ def test_repair_over_budget_is_not_sent(tmp_path: Path) -> None:
         ChunkPlanner(CharCounter()),
         config,
     )
-    with pytest.raises(AppError, match=r"llm\.item_too_large"):
+    with pytest.raises(AppError, match=r"llm\.repair_budget_exceeded"):
         asyncio.run(
             executor.execute(
                 (ChunkItem("item-1", "source"),),

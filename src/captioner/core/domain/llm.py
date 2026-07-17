@@ -19,12 +19,13 @@ from captioner.core.domain.result import (
 )
 from captioner.core.policies.unicode_metrics import normalize_text
 
-LLM_RESPONSE_SCHEMA_VERSION = 1
+LLM_RESPONSE_SCHEMA_VERSION = 2
 _FORBIDDEN_SCHEMA_KEYS = frozenset(
     {"start_ms", "end_ms", "timestamp", "timestamps", "duration", "duration_ms"}
 )
 _CONTEXT_PAYLOAD_FIELDS = frozenset({"terminology", "anomalies", "nearby_cues"})
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_LANGUAGE_RE = re.compile(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*")
 
 
 class LLMTaskKind(StrEnum):
@@ -44,9 +45,74 @@ _PROVIDER_SCHEMA_BASE_NAMES: Mapping[str, str] = {
     LLMTaskKind.TRANSLATE_QUALITY.value: "captioner_translate_quality_batch",
     LLMTaskKind.REVIEW.value: "captioner_review_batch",
     LLMTaskKind.TERMINOLOGY.value: "captioner_terminology_batch",
-    LLMTaskKind.REPAIR_STRUCTURED.value: "captioner_repair_structured_batch",
 }
 _SCHEMA_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+@dataclass(frozen=True, slots=True)
+class LLMRepairDiagnostic:
+    """Safe, structured metadata describing one deterministic repair failure."""
+
+    code: str
+    item_id: str | None = None
+    field: str | None = None
+    expected_kind: str | None = None
+    actual_kind: str | None = None
+    position: int | None = None
+
+    def __post_init__(self) -> None:
+        _canonical_nonempty(self.code, "code")
+        for value, field_name in (
+            (self.item_id, "item_id"),
+            (self.field, "field"),
+            (self.expected_kind, "expected_kind"),
+            (self.actual_kind, "actual_kind"),
+        ):
+            if value is not None:
+                _canonical_nonempty(value, field_name)
+        if self.position is not None and (type(self.position) is not int or self.position < 0):
+            raise AppError("llm.repair_diagnostic_invalid", {"field": "position"})
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        values: dict[str, JsonValue] = {"code": self.code}
+        optional = {
+            "item_id": self.item_id,
+            "field": self.field,
+            "expected_kind": self.expected_kind,
+            "actual_kind": self.actual_kind,
+            "position": self.position,
+        }
+        values.update({key: value for key, value in optional.items() if value is not None})
+        return values
+
+
+@dataclass(frozen=True, slots=True)
+class LLMRepairContext:
+    """The ephemeral candidate and safe diagnostics for one contextual repair."""
+
+    original_task_kind: str
+    invalid_response: str
+    diagnostics: tuple[LLMRepairDiagnostic, ...]
+
+    def __post_init__(self) -> None:
+        _canonical_nonempty(self.original_task_kind, "original_task_kind")
+        if not self.invalid_response:
+            raise AppError("llm.repair_context_invalid", {"field": "invalid_response"})
+        if len(self.invalid_response.encode("utf-8")) > 2 * 1024 * 1024:
+            raise AppError("llm.repair_context_invalid", {"field": "invalid_response"})
+        diagnostics = tuple(self.diagnostics)
+        if not diagnostics:
+            raise AppError("llm.repair_context_invalid", {"field": "diagnostics"})
+        object.__setattr__(self, "diagnostics", diagnostics)
+
+    def diagnostics_json(self) -> str:
+        return json.dumps(
+            [diagnostic.to_dict() for diagnostic in self.diagnostics],
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +153,7 @@ class LLMRequest:
     repair_prompt_version: str = ""
     repair_prompt_content_sha256: str = ""
     repair_prompt_content: str = ""
+    repair_context: LLMRepairContext | None = None
 
     def __post_init__(self) -> None:
         _canonical_nonempty(self.task_kind, "task_kind")
@@ -106,6 +173,12 @@ class LLMRequest:
             value = getattr(self, field)
             if value is not None:
                 _canonical_nonempty(value, field)
+                if _LANGUAGE_RE.fullmatch(value) is None:
+                    raise AppError(
+                        "llm.source_language_invalid"
+                        if field == "source_language"
+                        else "llm.target_language_invalid"
+                    )
         for field in (
             "prompt_id",
             "prompt_version",
@@ -163,6 +236,14 @@ class LLMRequest:
             != self.repair_prompt_content_sha256
         ):
             raise AppError("llm.request_invalid", {"field": "repair_prompt_content_sha256"})
+        if self.repair_context is not None:
+            if type(self.repair_context) is not LLMRepairContext:
+                raise AppError("llm.request_invalid", {"field": "repair_context"})
+            repair_context = self.repair_context
+            if repair_context.original_task_kind != self.task_kind:
+                raise AppError("llm.request_invalid", {"field": "repair_context"})
+            if not self.repair_prompt_content:
+                raise AppError("llm.request_invalid", {"field": "repair_prompt_content"})
         if self.context_payload is not None:
             try:
                 frozen_payload = freeze_json_value(self.context_payload)
@@ -215,6 +296,17 @@ class LLMRequest:
             "repair_prompt_version": self.repair_prompt_version,
             "repair_prompt_content_sha256": self.repair_prompt_content_sha256,
         }
+
+    def original_wire_envelope(self) -> dict[str, JsonValue]:
+        """Return the original task envelope, excluding repair-only metadata."""
+        value = self.to_dict()
+        for field in (
+            "repair_prompt_id",
+            "repair_prompt_version",
+            "repair_prompt_content_sha256",
+        ):
+            value.pop(field, None)
+        return value
 
 
 class _StrictResponse:
@@ -456,7 +548,7 @@ ReviewTranslationResponse = ReviewResponse
 
 @dataclass(frozen=True, slots=True)
 class StructuredResponseBatch:
-    """Strict array wrapper used when one request covers multiple Chunk items."""
+    """Strict root-object wrapper used when one request covers multiple items."""
 
     responses: tuple[object, ...]
 
@@ -474,7 +566,19 @@ class StructuredResponseBatch:
     def from_json(cls, value: str | bytes) -> Self:
         raise NotImplementedError
 
-    def to_dict(self) -> list[JsonValue]:
+    @classmethod
+    def json_schema(cls) -> dict[str, JsonValue]:
+        raise NotImplementedError
+
+    @classmethod
+    def model_json_schema(cls) -> dict[str, JsonValue]:
+        return cls.json_schema()
+
+    @classmethod
+    def schema(cls) -> dict[str, JsonValue]:
+        return cls.json_schema()
+
+    def to_dict(self) -> dict[str, JsonValue]:
         result: list[JsonValue] = []
         for response in self.responses:
             to_dict = getattr(response, "to_dict", None)
@@ -484,19 +588,29 @@ class StructuredResponseBatch:
             if not isinstance(value, dict):
                 raise AppError("llm.response_invalid", {"reason": "batch_item"})
             result.append(cast(dict[str, JsonValue], value))
-        return result
+        return {"responses": result}
 
 
 def response_batch_schema[T](item_schema: type[T]) -> type[StructuredResponseBatch]:
-    """Create a schema class for a non-empty array of one strict item schema."""
+    """Create a schema class for a non-empty root-object response batch."""
 
     class BatchResponse(StructuredResponseBatch):
         @classmethod
         def from_mapping(cls, value: object) -> StructuredResponseBatch:
-            if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-                raise AppError("llm.response_invalid", {"reason": "batch_array"})
+            if not isinstance(value, Mapping):
+                raise AppError("llm.response_invalid", {"reason": "batch_object"})
+            raw = cast(Mapping[object, object], value)
+            if set(raw) != {"responses"}:
+                raise AppError("llm.response_invalid", {"reason": "batch_fields"})
+            items = raw.get("responses")
+            if (
+                not isinstance(items, Sequence)
+                or isinstance(items, (str, bytes, bytearray))
+                or not items
+            ):
+                raise AppError("llm.response_invalid", {"reason": "batch_responses"})
             responses: list[object] = []
-            for item in cast(Sequence[object], value):
+            for item in cast(Sequence[object], items):
                 parser = getattr(item_schema, "from_mapping", None)
                 if not callable(parser):
                     raise AppError("llm.schema_invalid", {"reason": "batch_item_schema"})
@@ -518,9 +632,16 @@ def response_batch_schema[T](item_schema: type[T]) -> type[StructuredResponseBat
         @classmethod
         def json_schema(cls) -> dict[str, JsonValue]:
             return {
-                "type": "array",
-                "minItems": 1,
-                "items": response_schema_for(cast(type[object], item_schema)),
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["responses"],
+                "properties": {
+                    "responses": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": response_schema_for(cast(type[object], item_schema)),
+                    }
+                },
             }
 
         @classmethod
@@ -576,7 +697,7 @@ def encode_llm_request(
             {
                 "role": "user",
                 "content": json.dumps(
-                    request.to_dict(),
+                    request.original_wire_envelope(),
                     ensure_ascii=False,
                     allow_nan=False,
                     separators=(",", ":"),
@@ -592,6 +713,24 @@ def encode_llm_request(
             },
         },
     }
+    if request.repair_context is not None:
+        messages = cast(list[JsonValue], payload["messages"])
+        messages.extend(
+            (
+                {
+                    "role": "assistant",
+                    "content": request.repair_context.invalid_response,
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        request.repair_prompt_content
+                        + "\n\nValidation diagnostics: "
+                        + request.repair_context.diagnostics_json()
+                    ),
+                },
+            )
+        )
     return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode(
         "utf-8"
     )
@@ -606,7 +745,10 @@ def provider_response_schema_name(
     Names are derived only from durable business identity. They never depend on
     Python class ``__name__``, ``__qualname__``, module path, or runtime state.
     """
-    if type(response_schema_version) is not int or response_schema_version < 1:
+    if (
+        type(response_schema_version) is not int
+        or response_schema_version != LLM_RESPONSE_SCHEMA_VERSION
+    ):
         raise AppError(
             "llm.schema_name_invalid",
             {"reason": "version", "version": response_schema_version},
@@ -752,6 +894,13 @@ def _canonical_nonempty(value: object, field: str) -> str:
         raise AppError("llm.response_invalid", {"field": field, "reason": "control"}) from exc
     if canonical != value:
         raise AppError("llm.response_invalid", {"field": field, "reason": "not_canonical"})
+    return value
+
+
+def validate_source_language(value: object) -> str:
+    """Validate the effective ASR language before constructing a request."""
+    if not isinstance(value, str) or _LANGUAGE_RE.fullmatch(value) is None:
+        raise AppError("llm.source_language_invalid")
     return value
 
 

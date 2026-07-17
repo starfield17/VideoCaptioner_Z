@@ -53,9 +53,10 @@ rejected. Response schemas never contain timestamps, durations, Cue boundaries,
 or Word IDs. Application code copies those values from validated domain inputs.
 
 Provider `json_schema.name` values are stable task-based identities such as
-`captioner_translate_fast_batch_v1`. They never derive from Python class
-`__qualname__` and always match `[A-Za-z0-9_-]{1,64}`. Wire requests and Cache
-keys share the same schema identity function.
+`captioner_translate_fast_batch_v2`. They never derive from Python class
+`__qualname__`; every batch uses a strict root object with a non-empty
+`responses` array. Wire requests and Cache keys share the same schema identity
+function, and the old root-array format is not accepted.
 
 ## Prompts and artifacts
 
@@ -68,7 +69,7 @@ persisted identity. The current Prompt identities are:
 - `translate_fast.v1`
 - `translate_quality.v1`
 - `review_anomalies.v1`
-- `repair_structured.v1`
+- `repair_structured.v2`
 
 Quality writes `terminology.json` and `corrected-transcript.json`, then
 `translated-track.<language>.json` and `translation-report.json`, then
@@ -81,12 +82,20 @@ SRT, WebVTT, and ASS.
 Chunk planning obeys item, complete-request token, context-item, and
 audio-context budgets. The complete request includes the system Prompt, user
 JSON envelope, language/task metadata, dynamic context, and response schema.
-Every network call — original, repair, and ID-mismatch shrink — is preflighted
-through the same `validate_request_budget` gate before transport. Over-budget
-requests fail with `llm.item_too_large` and never reach the provider. Context
-IDs never enter the expected output set. ID mismatch deterministically bisects
-the current Chunk and terminates at one item. Invalid schema/text may receive
-at most one structured repair request, which is re-budgeted independently.
+Every network call — original, contextual repair, and ID-mismatch shrink — is
+preflighted through the same `validate_request_budget` gate before transport.
+Over-budget requests fail with `llm.item_too_large` and never reach the
+provider. Context IDs never enter the expected output set. ID mismatch and
+multi-item truncation deterministically bisect the current Chunk and terminate
+at one item. Invalid schema/text may receive at most one
+`repair_structured.v2` request, which keeps the original task, system
+instruction, user envelope, invalid assistant candidate, and safe validation
+diagnostics. Refusals and content filters are final; truncation is split-only
+and a one-item truncation fails closed.
+
+The adapter classifies the Provider envelope before decoding content. Only a
+`stop` completion with non-empty string content reaches the strict JSON parser;
+missing or unknown finish reasons produce `llm.provider_response_invalid`.
 
 Stage semantic validation (Fast dual-field protected checks, terminology
 unit/term matching and aggregate conflict detection) runs before Cache put.
@@ -101,10 +110,11 @@ and local temporary paths. Entries use canonical JSON, flush, fsync, and atomic
 rename; corrupt or mismatched entries are misses.
 
 The adapter classifies 429, 502/503/504, network failure, and timeout as
-retryable. Authentication and request rejection are final. Cancellation is
-never retried. Backoff is bounded, deterministic, injectable, and immediately
-cancellable (sleep races the cancellation token). All Stages and Jobs share one
-client and one application-wide Semaphore.
+retryable. Authentication, refusal, content filtering, truncation, and invalid
+Provider envelopes are final. Cancellation is never retried. Backoff is
+bounded, deterministic, injectable, and immediately cancellable (sleep races
+the cancellation token). All Stages and Jobs share one client and one
+application-wide Semaphore.
 
 ## Recovery and redaction
 
@@ -114,15 +124,21 @@ Resume reuses validated
 hits before Semaphore acquisition, so successful Chunks are not requested
 again after a Stage crash. Once a Stage commit is durable, normal resume skips
 the Stage entirely. Cancellation removes incomplete tasks and temporary Cache
-files while retaining already committed valid entries. Structured repair has one
-owner, the Chunk executor: transport retries do not consume its budget, and an
-ID mismatch shrinks the Chunk instead of repairing it. The provider adapter
+files while retaining already committed valid entries. An aggregate semantic
+failure removes every key written by that aggregate attempt. Structured repair
+has one owner, the Chunk executor: transport retries do not consume its budget,
+and an ID mismatch shrinks the Chunk instead of repairing it. The provider adapter
 races every in-flight request against cancellation and awaits cleanup before
 releasing the shared Semaphore.
 
 Authorization and credentials are redacted before logging or structured error
 creation. Provider credentials suppress dataclass representation. Automated
 tests use scripted adapters or a local fake server and synthetic keys only.
+
+Bundled `cl100k_base` and `o200k_base` resources are verified by SHA-256 before
+initialization; token counting never downloads an encoding file. `auto` is
+resolved to one of those durable IDs through the pinned tiktoken model map
+before a Job snapshot is accepted.
 
 ## Known limitations
 

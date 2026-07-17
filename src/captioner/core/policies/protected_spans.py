@@ -7,6 +7,7 @@ import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +38,7 @@ class ProtectedToken:
 
     @property
     def percent(self) -> bool:
-        return self.marker == "%"
+        return self.kind == "percentage"
 
     def identity(self) -> tuple[str, ...]:
         """Canonical identity used for exact ordered sequence comparison."""
@@ -51,6 +52,16 @@ class ProtectedToken:
             self.am_pm,
             self.phone_components,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedTokenDifference:
+    """Safe metadata describing one protected-fact sequence difference."""
+
+    code: str
+    position: int
+    expected_kind: str | None = None
+    actual_kind: str | None = None
 
 
 _MONTHS = {
@@ -80,16 +91,65 @@ _MONTHS = {
     "december": "12",
 }
 
-_CURRENCY_SYMBOLS = r"US\$|[$€£¥₹]|元|円|ドル"
-_UNIT_MARKERS = r"kg|g|km/h|km|m|cm|mm|mph|°C|°F|%|Hz|kHz|GB|MB"
+# These are deliberately explicit.  In particular, "$" and "US$" are not
+# inferred to be interchangeable merely because their text overlaps.
+_CURRENCY_ALIASES = MappingProxyType(
+    {
+        "$": "symbol:$",
+        "US$": "symbol:US$",
+        "A$": "symbol:A$",
+        "C$": "symbol:C$",
+        "NZ$": "symbol:NZ$",
+        "€": "symbol:€",
+        "£": "symbol:£",
+        "¥": "symbol:¥",
+        "₹": "symbol:₹",
+        "USD": "code:USD",
+        "EUR": "code:EUR",
+        "GBP": "code:GBP",
+        "JPY": "code:JPY",
+        "CNY": "code:CNY",
+        "RMB": "code:CNY",
+        "元": "code:CNY",
+        "人民币": "code:CNY",
+        "円": "code:JPY",
+        "ドル": "word:dollar",
+    }
+)
+_UNIT_ALIASES = MappingProxyType(
+    {
+        "kg": "kg",
+        "g": "g",
+        "km/h": "km/h",
+        "km": "km",
+        "m": "m",
+        "cm": "cm",
+        "mm": "mm",
+        "mph": "mph",
+        "°c": "°c",
+        "°f": "°f",
+        "hz": "hz",
+        "khz": "khz",
+        "gb": "gb",
+        "mb": "mb",
+        "piece": "piece",
+        "pieces": "piece",
+        "item": "item",
+        "items": "item",
+    }
+)
+
+_CURRENCY_MARKERS = r"US\$|NZ\$|A\$|C\$|[$€£¥₹]|USD|EUR|GBP|JPY|CNY|RMB|元|人民币|円|ドル"
+_UNIT_MARKERS = r"kg|g|km/h|km|m|cm|mm|mph|°C|°F|Hz|kHz|GB|MB|pieces?|items?"
 _NUMBER = r"\d[\d,\.\u066B\u066C]*"
 
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "currency",
         re.compile(
-            rf"(?:[+\-\u2212\uff0d]\s*)?(?:{_CURRENCY_SYMBOLS})\s?{_NUMBER}"
-            rf"|(?:[+\-\u2212\uff0d]\s*)?{_NUMBER}\s?(?:元|円|€|£|ドル)"
+            rf"(?:[+\-\u2212\uff0d]\s*)?(?:{_CURRENCY_MARKERS})\s?{_NUMBER}"
+            rf"|(?:[+\-\u2212\uff0d]\s*)?{_NUMBER}\s?(?:{_CURRENCY_MARKERS})",
+            re.IGNORECASE,
         ),
     ),
     (
@@ -110,6 +170,10 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r")",
             re.IGNORECASE,
         ),
+    ),
+    (
+        "percentage",
+        re.compile(rf"(?:[+\-\u2212\uff0d]\s*)?{_NUMBER}\s?%"),
     ),
     (
         "unit",
@@ -145,20 +209,82 @@ def protected_tokens(text: str) -> tuple[ProtectedToken, ...]:
     return tuple(_classify_span(span) for span in find_protected_spans(text))
 
 
+def protected_token_differences(source: str, output: str) -> tuple[ProtectedTokenDifference, ...]:
+    """Return safe, ordered differences between protected semantic sequences."""
+    expected = protected_tokens(source)
+    actual = protected_tokens(output)
+    differences: list[ProtectedTokenDifference] = []
+    if len(expected) != len(actual):
+        if len(actual) > len(expected):
+            for position in range(len(expected), len(actual)):
+                differences.append(
+                    ProtectedTokenDifference(
+                        "protected_fact_added", position, None, actual[position].kind
+                    )
+                )
+        else:
+            for position in range(len(actual), len(expected)):
+                differences.append(
+                    ProtectedTokenDifference(
+                        "protected_fact_removed", position, expected[position].kind, None
+                    )
+                )
+    if len(expected) == len(actual) and _same_multiset(expected, actual):
+        expected_identities = tuple(token.identity() for token in expected)
+        actual_identities = tuple(token.identity() for token in actual)
+        if expected_identities != actual_identities:
+            position = next(
+                index
+                for index, (expected_identity, actual_identity) in enumerate(
+                    zip(expected_identities, actual_identities, strict=True)
+                )
+                if expected_identity != actual_identity
+            )
+            return (
+                ProtectedTokenDifference(
+                    "protected_fact_order_changed",
+                    position,
+                    expected[position].kind,
+                    actual[position].kind,
+                ),
+            )
+    for position, (expected_token, actual_token) in enumerate(zip(expected, actual, strict=False)):
+        if expected_token.kind != actual_token.kind:
+            differences.append(
+                ProtectedTokenDifference(
+                    "protected_fact_kind_changed",
+                    position,
+                    expected_token.kind,
+                    actual_token.kind,
+                )
+            )
+        elif not _matches(expected_token, actual_token):
+            value_changed = (
+                expected_token.numeric_value != actual_token.numeric_value
+                or expected_token.sign != actual_token.sign
+                or expected_token.date_components != actual_token.date_components
+                or expected_token.time_components != actual_token.time_components
+                or expected_token.am_pm != actual_token.am_pm
+            )
+            code = (
+                "protected_fact_value_changed" if value_changed else "protected_fact_marker_changed"
+            )
+            differences.append(
+                ProtectedTokenDifference(code, position, expected_token.kind, actual_token.kind)
+            )
+    if len(expected) == len(actual) and not differences:
+        return ()
+    return tuple(differences)
+
+
 def protected_tokens_preserved(source: str, output: str) -> bool:
     """Require exact ordered semantic token sequence equality.
 
-    Representation differences that normalize to the same identity are allowed
-    (grouping symbols, Arabic-Indic digits, ISO vs month-name dates). Adding,
-    removing, or reordering protected facts is rejected.
+    Formatting differences that normalize to the same identity are allowed.
+    An empty source has an empty expected sequence and therefore still rejects
+    any protected fact introduced by the output.
     """
-    expected = protected_tokens(source)
-    if not expected:
-        return True
-    actual = protected_tokens(output)
-    if len(actual) != len(expected):
-        return False
-    return all(_matches(left, right) for left, right in zip(expected, actual, strict=True))
+    return not protected_token_differences(source, output)
 
 
 def protected_break_cost(
@@ -189,7 +315,7 @@ def _classify_span(span: ProtectedSpan) -> ProtectedToken:
     text = span.text
     sign = (
         "minus"
-        if re.search(r"(?<!\d)[-\u2212\uff0d]\s*(?:(?:US\$|[$€£¥₹])\s*)?\d", text)
+        if re.search(r"(?<!\d)[-\u2212\uff0d]\s*(?:(?:US\$|NZ\$|A\$|C\$|[$€£¥₹])\s*)?\d", text)
         else "plus"
         if re.search(r"(?<!\d)\+\s*\d", text)
         else "none"
@@ -201,18 +327,21 @@ def _classify_span(span: ProtectedSpan) -> ProtectedToken:
     time_components = ""
     am_pm = ""
     phone_components = ""
+    kind = span.kind
     if span.kind == "date-time":
         date_components, time_components, am_pm = _date_time_identity(text)
         if date_components:
+            kind = "date"
             numeric_value = date_components
         elif time_components:
+            kind = "time"
             numeric_value = time_components
     if span.kind == "phone":
         phone_components = re.sub(r"\D+", "|", text).strip("|")
         numeric_value = phone_components
     return ProtectedToken(
         text,
-        span.kind,
+        kind,
         numeric_value,
         sign,
         marker,
@@ -269,8 +398,6 @@ def _date_time_identity(text: str) -> tuple[str, str, str]:
             hour += 12
         elif period == "AM" and hour == 12:
             hour = 0
-        # Keep AM/PM as part of identity so 10:00 AM != 10:00 PM and != 22:00
-        # when the source used a 12-hour form with period.
         return "", f"{hour:02d}:{minute:02d}", period
     return "", "", ""
 
@@ -308,62 +435,36 @@ def _normalize_numeric(value: str) -> str:
 def _marker(kind: str, text: str, number: str) -> str:
     remainder = text.replace(number, "")
     if kind == "currency":
-        if "元" in text:
-            return "yuan"
-        if "円" in text:
-            return "yen"
-        if "ドル" in text:
-            return "dollar"
-        if "US$" in text or "us$" in text.casefold():
-            return "us$"
-        symbols = re.findall(r"[$€£¥₹]", text)
-        if symbols:
-            return symbols[0]
+        marker_text = re.sub(r"^[+\-\u2212\uff0d\s]+|\s+$", "", remainder)
+        marker_text = marker_text.strip().casefold()
+        for alias, identity in _CURRENCY_ALIASES.items():
+            if alias.casefold() == marker_text:
+                return identity
         return "currency"
     if kind == "unit":
         unit = re.sub(r"[^%A-Za-z°/]+", "", remainder).casefold()
-        return unit
-    if kind in {"date-time", "phone", "abbreviation"}:
+        return _UNIT_ALIASES.get(unit, unit)
+    if kind == "percentage":
+        return "%"
+    if kind in {"date-time", "date", "time", "phone", "abbreviation"}:
         return kind
     return "number"
 
 
 def _matches(expected: ProtectedToken, actual: ProtectedToken) -> bool:
-    """Exact identity match for one ordered protected fact."""
-    if expected.kind == "date-time":
-        if actual.kind != "date-time":
-            return False
-        if expected.date_components:
-            return expected.date_components == actual.date_components
-        if expected.time_components:
-            # Require same wall-clock time AND same AM/PM form when source had it.
-            if expected.time_components != actual.time_components:
-                return False
-            if expected.am_pm and expected.am_pm != actual.am_pm:
-                return False
-            if not expected.am_pm and actual.am_pm:
-                # Source was 24h; reject introducing AM/PM that would change meaning
-                # only if the numeric hour already encodes period — already compared.
-                return True
-            return True
-        return expected.identity() == actual.identity()
-    if expected.kind == "phone":
-        return actual.kind == "phone" and expected.phone_components == actual.phone_components
-    if expected.kind in {"currency", "unit", "abbreviation"}:
-        if actual.kind != expected.kind or actual.marker != expected.marker:
-            return False
-        return expected.numeric_value == actual.numeric_value and expected.sign == actual.sign
-    # Generic numbers may surface as unit/currency when markers appear in output;
-    # still require exact ordered numeric identity and percent marker.
-    if actual.kind not in {"number", "currency", "unit"}:
+    """Match only identical semantic kinds and identities."""
+    if expected.kind != actual.kind:
         return False
-    return (
-        expected.numeric_value == actual.numeric_value
-        and expected.sign == actual.sign
-        and (expected.marker == "%") == (actual.marker == "%")
-        and (
-            expected.marker == "number"
-            or actual.marker == expected.marker
-            or (expected.marker == "%" and actual.marker == "%")
-        )
+    if expected.kind == "date":
+        return expected.date_components == actual.date_components
+    if expected.kind == "time":
+        return expected.time_components == actual.time_components and expected.am_pm == actual.am_pm
+    if expected.kind == "phone":
+        return expected.phone_components == actual.phone_components
+    return expected.identity() == actual.identity()
+
+
+def _same_multiset(expected: Sequence[ProtectedToken], actual: Sequence[ProtectedToken]) -> bool:
+    return sorted(token.identity() for token in expected) == sorted(
+        token.identity() for token in actual
     )
