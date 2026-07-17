@@ -8,6 +8,7 @@ from typing import Protocol, cast
 import pytest
 
 import captioner.core.policies.protected_spans as protected_spans_module
+import captioner.core.policies.quantity_scanner as quantity_scanner_module
 from captioner.core.policies.protected_spans import (
     ProtectedSpan,
     ProtectedToken,
@@ -25,25 +26,34 @@ class _NumberResult(Protocol):
     normalized: str
 
 
-class _ProtectedItemResult(Protocol):
-    span: ProtectedSpan
-    token: ProtectedToken
+class _QuantityFactResult(Protocol):
+    start: int
+    end: int
+    kind: str
+    numeric_value: str
+    sign: str
+    marker: str
 
 
 def _scan_number(text: str, position: int) -> _NumberResult | None:
     scanner = cast(
         Callable[[str, int], _NumberResult | None],
-        attrgetter("_scan_number")(protected_spans_module),
+        attrgetter("_scan_number")(quantity_scanner_module),
     )
     return scanner(text, position)
 
 
-def _scan_numeric_fact_at(text: str, position: int) -> _ProtectedItemResult | None:
+def _scan_numeric_fact_at(text: str, position: int) -> _QuantityFactResult | None:
     scanner = cast(
-        Callable[[str, int], _ProtectedItemResult | None],
-        attrgetter("_scan_numeric_fact_at")(protected_spans_module),
+        Callable[[str, int], _QuantityFactResult | None],
+        attrgetter("_scan_numeric_fact_at")(quantity_scanner_module),
     )
     return scanner(text, position)
+
+
+class _ProtectedItemResult(Protocol):
+    span: ProtectedSpan
+    token: ProtectedToken
 
 
 def _protected_items(text: str) -> tuple[_ProtectedItemResult, ...]:
@@ -104,9 +114,9 @@ def test_quantity_scanner_consumes_the_complete_number(text: str, expected_numbe
     assert number.normalized == expected_number
     item = _scan_numeric_fact_at(text, 0)
     assert item is not None
-    assert item.token.numeric_value == expected_number
-    assert item.span.start == 0
-    assert item.span.end > number.end
+    assert item.numeric_value == expected_number
+    assert item.start == 0
+    assert item.end > number.end
     assert all(
         token.numeric_value not in {"1", "10"}
         for token in protected_tokens(text)
@@ -135,9 +145,9 @@ def test_unsupported_slash_spacing_has_one_canonical_identity(
     left, right = spacing
     item = _scan_numeric_fact_at(f"100 kg{left}/{right}m", 0)
     assert item is not None
-    assert item.token.kind == "unsupported-compound"
-    assert item.token.numeric_value == "100"
-    assert item.token.marker == "unsupported:unit:kg/m"
+    assert item.kind == "unsupported-compound"
+    assert item.numeric_value == "100"
+    assert item.marker == "unsupported:unit:kg/m"
     assert protected_tokens_preserved("100 kg/m", f"100 kg{left}/{right}m")
 
 
@@ -286,7 +296,17 @@ def test_free_currency_prefix_is_not_reduced_to_bare_number(output: str) -> None
     assert protected_tokens_preserved("100", output) is False
 
 
-@pytest.mark.parametrize("text", ["xUSD 100", "myEUR 100", "abcUS$100"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "xUSD 100",
+        "myEUR 100",
+        "abcUS$100",
+        "abcA$100",
+        "abcC$100",
+        "abcNZ$100",
+    ],
+)
 def test_currency_code_prefix_still_requires_word_boundary(text: str) -> None:
     tokens = protected_tokens(text)
 
@@ -304,6 +324,114 @@ def test_attached_tail_is_bounded() -> None:
     assert len(spans) == 1
     assert spans[0].end > spans[0].start
     assert spans[0].end <= len(text)
+
+
+@pytest.mark.parametrize(
+    ("source", "output"),
+    [
+        ("$100", "$100%"),
+        ("$100", "$100€"),
+        ("10%", "10%$"),
+        ("100 kg", "100 kg%"),
+        ("100 kg", "100 kg €"),
+        ("100\u00d7200", "100\u00d7200\u00b0C"),
+        ("100", "100+tax"),
+        ("100", "100@foo"),
+    ],
+)
+def test_semantic_symbol_continuation_cannot_be_ignored(source: str, output: str) -> None:
+    assert protected_tokens_preserved(source, output) is False
+
+
+@pytest.mark.parametrize(
+    ("text", "numeric_value"),
+    [
+        ("$100%", "100"),
+        ("$100%USD", "100"),
+        ("10%$", "10"),
+        ("100 kg%", "100"),
+        ("100 kg €", "100"),
+        ("100\u00d7200\u00b0C", "100|200"),
+        ("100+tax", "100"),
+        ("100@foo", "100"),
+    ],
+)
+def test_semantic_symbol_tail_is_one_unsupported_fact(text: str, numeric_value: str) -> None:
+    tokens = protected_tokens(text)
+    spans = find_protected_spans(text)
+
+    assert len(tokens) == 1
+    assert len(spans) == 1
+    assert tokens[0].kind == "unsupported-attached"
+    assert tokens[0].numeric_value == numeric_value
+    assert spans[0].start == 0
+    assert spans[0].end == len(text)
+
+
+def test_long_attached_tails_do_not_share_overflow_identity() -> None:
+    source = "$100" + ("a" * 256)
+    output = "$100" + ("b" * 256)
+
+    source_tokens = protected_tokens(source)
+    output_tokens = protected_tokens(output)
+
+    assert len(source_tokens) == 1
+    assert len(output_tokens) == 1
+    assert source_tokens[0].kind == "unsupported-attached"
+    assert output_tokens[0].kind == "unsupported-attached"
+    assert source_tokens[0].marker != output_tokens[0].marker
+    assert protected_tokens_preserved(source, output) is False
+    assert len(source_tokens[0].marker) < 256
+    assert "overflow:256:" in source_tokens[0].marker
+
+
+def test_long_slash_tails_do_not_share_overflow_identity() -> None:
+    source = "100 kg/" + ("a" * 256)
+    output = "100 kg/" + ("b" * 256)
+
+    source_tokens = protected_tokens(source)
+    output_tokens = protected_tokens(output)
+
+    assert len(source_tokens) == 1
+    assert len(output_tokens) == 1
+    assert source_tokens[0].kind == "unsupported-compound"
+    assert output_tokens[0].kind == "unsupported-compound"
+    assert source_tokens[0].marker != output_tokens[0].marker
+    assert protected_tokens_preserved(source, output) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "$100" + ("a" * 256),
+        "100 kg/" + ("a" * 256),
+        "$100%" + ("a" * 256),
+    ],
+)
+def test_long_unsupported_tail_is_fully_consumed(text: str) -> None:
+    spans = find_protected_spans(text)
+    tokens = protected_tokens(text)
+
+    assert len(spans) == 1
+    assert len(tokens) == 1
+    assert spans[0].start == 0
+    assert spans[0].end == len(text)
+    assert len(tokens[0].marker) < 256
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "$100" + ("a" * 256),
+        "100 kg/" + ("a" * 256),
+    ],
+)
+def test_long_unsupported_tail_identity_is_deterministic(text: str) -> None:
+    first = protected_tokens(text)
+    second = protected_tokens(text)
+
+    assert first == second
+    assert protected_tokens_preserved(text, text)
 
 
 @pytest.mark.parametrize("text", ["10/20", "100/200", "١٢/٣"])

@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import re
-import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
-from enum import StrEnum
-from types import MappingProxyType
 
 from captioner.core.domain.errors import AppError
+from captioner.core.policies.quantity_scanner import QuantityFact, scan_quantity_facts
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +64,12 @@ class ProtectedTokenDifference:
     actual_kind: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ProtectedItem:
+    span: ProtectedSpan
+    token: ProtectedToken
+
+
 _MONTHS = {
     "jan": "01",
     "january": "01",
@@ -94,330 +97,6 @@ _MONTHS = {
     "december": "12",
 }
 
-# These are deliberately explicit.  In particular, "$", "US$", and
-# textual dollar aliases are not inferred to be interchangeable merely
-# because their text overlaps.
-_CURRENCY_SYMBOL_ALIASES = MappingProxyType(
-    {
-        "$": "symbol:$",
-        "US$": "symbol:US$",
-        "A$": "symbol:A$",
-        "C$": "symbol:C$",
-        "NZ$": "symbol:NZ$",
-        "€": "symbol:€",
-        "£": "symbol:£",
-        "¥": "symbol:¥",
-        "₹": "symbol:₹",
-        "USD": "code:USD",
-        "EUR": "code:EUR",
-        "GBP": "code:GBP",
-        "JPY": "code:JPY",
-        "CNY": "code:CNY",
-        "RMB": "code:CNY",
-        "元": "code:CNY",
-        "人民币": "code:CNY",
-        "円": "code:JPY",
-        "ドル": "word:USD",
-    }
-)
-_CURRENCY_WORD_ALIASES = MappingProxyType(
-    {
-        "dollar": "word:USD",
-        "dollars": "word:USD",
-        "US dollar": "word:USD",
-        "US dollars": "word:USD",
-        "euro": "word:EUR",
-        "euros": "word:EUR",
-        "pound": "word:GBP",
-        "pounds": "word:GBP",
-        "British pound": "word:GBP",
-        "British pounds": "word:GBP",
-        "yen": "word:JPY",
-        "yuan": "word:CNY",
-        "renminbi": "word:CNY",
-    }
-)
-_CURRENCY_FREE_PREFIX_ALIASES = MappingProxyType(
-    {
-        "$": _CURRENCY_SYMBOL_ALIASES["$"],
-        "€": _CURRENCY_SYMBOL_ALIASES["€"],
-        "£": _CURRENCY_SYMBOL_ALIASES["£"],
-        "¥": _CURRENCY_SYMBOL_ALIASES["¥"],
-        "₹": _CURRENCY_SYMBOL_ALIASES["₹"],
-        "元": _CURRENCY_SYMBOL_ALIASES["元"],
-        "人民币": _CURRENCY_SYMBOL_ALIASES["人民币"],
-        "円": _CURRENCY_SYMBOL_ALIASES["円"],
-        "ドル": _CURRENCY_SYMBOL_ALIASES["ドル"],
-    }
-)
-_CURRENCY_BOUNDARY_PREFIX_ALIASES = MappingProxyType(
-    {
-        "US$": _CURRENCY_SYMBOL_ALIASES["US$"],
-        "A$": _CURRENCY_SYMBOL_ALIASES["A$"],
-        "C$": _CURRENCY_SYMBOL_ALIASES["C$"],
-        "NZ$": _CURRENCY_SYMBOL_ALIASES["NZ$"],
-        "USD": _CURRENCY_SYMBOL_ALIASES["USD"],
-        "EUR": _CURRENCY_SYMBOL_ALIASES["EUR"],
-        "GBP": _CURRENCY_SYMBOL_ALIASES["GBP"],
-        "JPY": _CURRENCY_SYMBOL_ALIASES["JPY"],
-        "CNY": _CURRENCY_SYMBOL_ALIASES["CNY"],
-        "RMB": _CURRENCY_SYMBOL_ALIASES["RMB"],
-    }
-)
-_PERCENTAGE_WORD_ALIASES = MappingProxyType({"percent": "%", "percentage": "%", "per cent": "%"})
-_UNIT_COMPACT_ALIASES = MappingProxyType(
-    {
-        "kg": "kg",
-        "g": "g",
-        "km/h": "km/h",
-        "km": "km",
-        "m": "m",
-        "cm": "cm",
-        "mm": "mm",
-        "mph": "mph",
-        "°c": "°c",
-        "°f": "°f",
-        "hz": "hz",
-        "khz": "khz",
-        "gb": "gb",
-        "mb": "mb",
-    }
-)
-_UNIT_WORD_ALIASES = MappingProxyType(
-    {
-        "kilogram": "kg",
-        "kilograms": "kg",
-        "gram": "g",
-        "grams": "g",
-        "meter": "m",
-        "meters": "m",
-        "metre": "m",
-        "metres": "m",
-        "centimeter": "cm",
-        "centimeters": "cm",
-        "centimetre": "cm",
-        "centimetres": "cm",
-        "millimeter": "mm",
-        "millimeters": "mm",
-        "millimetre": "mm",
-        "millimetres": "mm",
-        "kilometer": "km",
-        "kilometers": "km",
-        "kilometre": "km",
-        "kilometres": "km",
-        "mile": "mile",
-        "miles": "mile",
-        "hour": "hour",
-        "hours": "hour",
-        "minute": "minute",
-        "minutes": "minute",
-        "second": "second",
-        "seconds": "second",
-        "piece": "piece",
-        "pieces": "piece",
-        "item": "item",
-        "items": "item",
-        "gigabyte": "gb",
-        "gigabytes": "gb",
-        "megabyte": "mb",
-        "megabytes": "mb",
-        "hertz": "hz",
-        "kilohertz": "khz",
-    }
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _AliasSpec:
-    text: str
-    identity: str
-    boundary_before: bool
-    boundary_after: bool
-    requires_space_before: bool = False
-    requires_space_after: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _NumberMatch:
-    start: int
-    end: int
-    raw: str
-    normalized: str
-
-
-@dataclass(frozen=True, slots=True)
-class _SignMatch:
-    end: int
-    semantic: str
-
-
-@dataclass(frozen=True, slots=True)
-class _AliasMatch:
-    start: int
-    end: int
-    text: str
-    identity: str
-
-
-@dataclass(frozen=True, slots=True)
-class _SlashTailMatch:
-    end: int
-    identity: str
-
-
-@dataclass(frozen=True, slots=True)
-class _AttachedTailMatch:
-    end: int
-    identity: str
-
-
-@dataclass(frozen=True, slots=True)
-class _ProtectedItem:
-    span: ProtectedSpan
-    token: ProtectedToken
-
-
-class _ContinuationKind(StrEnum):
-    END = "end"
-    PUNCTUATION = "punctuation"
-    SEPARATED_WORD = "separated_word"
-    ATTACHED_WORD_SUFFIX = "attached_word_suffix"
-    SLASH_SUFFIX = "slash_suffix"
-
-
-_INLINE_SPACES = " \t"
-_MAX_UNSUPPORTED_TAIL_LENGTH = 128
-
-
-def _is_word_character(character: str) -> bool:
-    return character.isalnum() or character == "_"
-
-
-def _skip_inline_spaces(text: str, position: int) -> int:
-    while position < len(text) and text[position] in _INLINE_SPACES:
-        position += 1
-    return position
-
-
-def _sorted_alias_specs(
-    aliases: Mapping[str, str],
-    *,
-    boundary_before: bool,
-    boundary_after: bool,
-    requires_space_before: bool = False,
-    requires_space_after: bool = False,
-) -> tuple[_AliasSpec, ...]:
-    return tuple(
-        sorted(
-            (
-                _AliasSpec(
-                    alias,
-                    identity,
-                    boundary_before,
-                    boundary_after,
-                    requires_space_before,
-                    requires_space_after,
-                )
-                for alias, identity in aliases.items()
-            ),
-            key=lambda spec: len(spec.text),
-            reverse=True,
-        )
-    )
-
-
-_LONGEST_CURRENCY_PREFIX_ALIASES = tuple(
-    sorted(
-        (
-            *_sorted_alias_specs(
-                _CURRENCY_FREE_PREFIX_ALIASES,
-                boundary_before=False,
-                boundary_after=False,
-            ),
-            *_sorted_alias_specs(
-                _CURRENCY_BOUNDARY_PREFIX_ALIASES,
-                boundary_before=True,
-                boundary_after=False,
-            ),
-            *_sorted_alias_specs(
-                _CURRENCY_WORD_ALIASES,
-                boundary_before=True,
-                boundary_after=True,
-                requires_space_after=True,
-            ),
-        ),
-        key=lambda spec: len(spec.text),
-        reverse=True,
-    )
-)
-_LONGEST_CURRENCY_SUFFIX_ALIASES = tuple(
-    sorted(
-        (
-            *_sorted_alias_specs(
-                _CURRENCY_SYMBOL_ALIASES,
-                boundary_before=False,
-                boundary_after=True,
-            ),
-            *_sorted_alias_specs(
-                _CURRENCY_WORD_ALIASES,
-                boundary_before=False,
-                boundary_after=True,
-                requires_space_before=True,
-            ),
-        ),
-        key=lambda spec: len(spec.text),
-        reverse=True,
-    )
-)
-_LONGEST_PERCENTAGE_ALIASES = tuple(
-    sorted(
-        (
-            *_sorted_alias_specs(
-                {"%": "%"},
-                boundary_before=False,
-                boundary_after=True,
-            ),
-            *_sorted_alias_specs(
-                _PERCENTAGE_WORD_ALIASES,
-                boundary_before=False,
-                boundary_after=True,
-                requires_space_before=True,
-            ),
-        ),
-        key=lambda spec: len(spec.text),
-        reverse=True,
-    )
-)
-_LONGEST_UNIT_ALIASES = tuple(
-    sorted(
-        (
-            *_sorted_alias_specs(
-                _UNIT_COMPACT_ALIASES,
-                boundary_before=False,
-                boundary_after=True,
-            ),
-            *_sorted_alias_specs(
-                _UNIT_WORD_ALIASES,
-                boundary_before=False,
-                boundary_after=True,
-                requires_space_before=True,
-            ),
-        ),
-        key=lambda spec: len(spec.text),
-        reverse=True,
-    )
-)
-_QUANTITY_START_CHARACTERS = frozenset(
-    {
-        "+",
-        "-",
-        "\u2212",
-        "\uff0d",
-        *(alias.text[0].casefold() for alias in _LONGEST_CURRENCY_PREFIX_ALIASES),
-    }
-)
-
-
 # Quantity facts intentionally use the deterministic scanner below.  Regex
 # remains only for the isolated legacy categories listed here.
 _PHONE_PATTERN = re.compile(r"\+\d{1,3}(?:\s+\d{3,4}){2,3}")
@@ -443,315 +122,6 @@ _LEGACY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def _match_alias(
-    text: str,
-    position: int,
-    aliases: Sequence[_AliasSpec],
-) -> _AliasMatch | None:
-    for alias in aliases:
-        if alias.boundary_before and position > 0 and _is_word_character(text[position - 1]):
-            continue
-        end = position + len(alias.text)
-        if end > len(text) or text[position:end].casefold() != alias.text.casefold():
-            continue
-        if alias.boundary_after and end < len(text) and _is_word_character(text[end]):
-            continue
-        if alias.requires_space_after and (end >= len(text) or text[end] not in _INLINE_SPACES):
-            continue
-        return _AliasMatch(position, end, text[position:end], alias.identity)
-    return None
-
-
-def _is_embedded_currency_code_suffix(
-    text: str,
-    position: int,
-    alias_text: str,
-) -> bool:
-    alias_end = position + len(alias_text)
-    for boundary_alias in _CURRENCY_BOUNDARY_PREFIX_ALIASES:
-        if not boundary_alias.endswith(alias_text):
-            continue
-        boundary_start = alias_end - len(boundary_alias)
-        if boundary_start < 0:
-            continue
-        if text[boundary_start:alias_end].casefold() != boundary_alias.casefold():
-            continue
-        if boundary_start > 0 and _is_word_character(text[boundary_start - 1]):
-            return True
-    return False
-
-
-def _match_suffix_alias(
-    text: str,
-    position: int,
-    aliases: Sequence[_AliasSpec],
-) -> _AliasMatch | None:
-    for alias in aliases:
-        candidate = position
-        if alias.requires_space_before:
-            if candidate >= len(text) or text[candidate] not in _INLINE_SPACES:
-                continue
-            candidate = _skip_inline_spaces(text, candidate)
-        else:
-            candidate = _skip_inline_spaces(text, candidate)
-        match = _match_alias(text, candidate, (alias,))
-        if match is not None:
-            return match
-    return None
-
-
-def _scan_sign(text: str, position: int) -> _SignMatch:
-    if position >= len(text) or text[position] not in "+-\u2212\uff0d":
-        return _SignMatch(position, "none")
-    semantic = "plus" if text[position] == "+" else "minus"
-    return _SignMatch(_skip_inline_spaces(text, position + 1), semantic)
-
-
-def _scan_number(text: str, position: int) -> _NumberMatch | None:
-    if position >= len(text) or not text[position].isdigit():
-        return None
-    end = position + 1
-    while end < len(text) and (text[end].isdigit() or text[end] in ",.\u066b\u066c"):
-        end += 1
-    raw = text[position:end]
-    return _NumberMatch(position, end, raw, _normalize_numeric(raw))
-
-
-def _classify_fact_continuation(
-    text: str,
-    position: int,
-) -> tuple[_ContinuationKind, int]:
-    if position >= len(text):
-        return _ContinuationKind.END, position
-    if _is_word_character(text[position]):
-        return _ContinuationKind.ATTACHED_WORD_SUFFIX, position
-    candidate = _skip_inline_spaces(text, position)
-    if candidate >= len(text):
-        return _ContinuationKind.END, candidate
-    if text[candidate] == "/":
-        return _ContinuationKind.SLASH_SUFFIX, candidate
-    if _is_word_character(text[candidate]):
-        return _ContinuationKind.SEPARATED_WORD, candidate
-    return _ContinuationKind.PUNCTUATION, candidate
-
-
-def _is_slash_component_character(character: str) -> bool:
-    return _is_word_character(character) or character in "$€£¥₹%°+-"
-
-
-def _scan_slash_tail(text: str, position: int) -> _SlashTailMatch | None:
-    slash_position = _skip_inline_spaces(text, position)
-    if slash_position >= len(text) or text[slash_position] != "/":
-        return None
-    limit = min(len(text), slash_position + _MAX_UNSUPPORTED_TAIL_LENGTH)
-    cursor = slash_position
-    components: list[str] = []
-    last_end = slash_position + 1
-    overflow = False
-    while cursor < len(text) and text[cursor] == "/":
-        if cursor >= limit:
-            overflow = True
-            break
-        cursor += 1
-        cursor = _skip_inline_spaces(text, cursor)
-        component_start = cursor
-        while cursor < len(text) and cursor < limit and _is_slash_component_character(text[cursor]):
-            cursor += 1
-        if cursor == limit and cursor < len(text) and _is_slash_component_character(text[cursor]):
-            overflow = True
-        component = text[component_start:cursor].casefold()
-        components.append(component)
-        last_end = cursor if component else max(cursor, slash_position + 1)
-        probe = _skip_inline_spaces(text, cursor)
-        if probe < len(text) and text[probe] == "/" and probe < limit:
-            cursor = probe
-            continue
-        break
-    identity = "overflow" if overflow else "/".join(components)
-    return _SlashTailMatch(max(last_end, slash_position + 1), identity)
-
-
-def _scan_attached_word_tail(text: str, position: int) -> _AttachedTailMatch | None:
-    if position >= len(text) or not _is_word_character(text[position]):
-        return None
-
-    limit = min(len(text), position + _MAX_UNSUPPORTED_TAIL_LENGTH)
-    cursor = position
-    while cursor < limit and _is_word_character(text[cursor]):
-        cursor += 1
-    overflow = cursor == limit and cursor < len(text) and _is_word_character(text[cursor])
-    identity = "overflow" if overflow else text[position:cursor].casefold()
-    return _AttachedTailMatch(cursor, identity)
-
-
-def _quantity_item(
-    text: str,
-    start: int,
-    end: int,
-    kind: str,
-    numeric_value: str,
-    sign: str,
-    marker: str,
-) -> _ProtectedItem:
-    span = ProtectedSpan(start, end, kind, text[start:end])
-    token = ProtectedToken(span.text, kind, numeric_value, sign, marker)
-    return _ProtectedItem(span, token)
-
-
-def _finish_quantity_fact(
-    text: str,
-    start: int,
-    base_end: int,
-    kind: str,
-    numeric_value: str,
-    sign: str,
-    marker: str,
-) -> _ProtectedItem:
-    continuation, continuation_position = _classify_fact_continuation(text, base_end)
-    if continuation is _ContinuationKind.SLASH_SUFFIX:
-        tail = _scan_slash_tail(text, base_end)
-        if tail is not None:
-            base_marker = marker or "none"
-            unsupported_marker = f"unsupported:{kind}:{base_marker}/{tail.identity}"
-            return _quantity_item(
-                text,
-                start,
-                tail.end,
-                "unsupported-compound",
-                numeric_value,
-                sign,
-                unsupported_marker,
-            )
-    if continuation is _ContinuationKind.ATTACHED_WORD_SUFFIX:
-        tail = _scan_attached_word_tail(text, continuation_position)
-        if tail is not None:
-            base_marker = marker or "none"
-            unsupported_marker = f"unsupported:{kind}:{base_marker}+{tail.identity}"
-            return _quantity_item(
-                text,
-                start,
-                tail.end,
-                "unsupported-attached",
-                numeric_value,
-                sign,
-                unsupported_marker,
-            )
-    return _quantity_item(text, start, base_end, kind, numeric_value, sign, marker)
-
-
-def _scan_currency_prefix_fact_at(
-    text: str,
-    position: int,
-) -> _ProtectedItem | None:
-    sign = _scan_sign(text, position)
-    alias = _match_alias(text, sign.end, _LONGEST_CURRENCY_PREFIX_ALIASES)
-    if alias is None:
-        return None
-    if _is_embedded_currency_code_suffix(text, sign.end, alias.text):
-        return None
-    number_position = alias.end
-    number_position = _skip_inline_spaces(text, number_position)
-    number = _scan_number(text, number_position)
-    if number is None:
-        return None
-    return _finish_quantity_fact(
-        text,
-        position,
-        number.end,
-        "currency",
-        number.normalized,
-        sign.semantic,
-        alias.identity,
-    )
-
-
-def _scan_numeric_fact_at(text: str, position: int) -> _ProtectedItem | None:
-    sign = _scan_sign(text, position)
-    number = _scan_number(text, sign.end)
-    if number is None:
-        return None
-
-    dimension_position = _skip_inline_spaces(text, number.end)
-    if dimension_position < len(text) and text[dimension_position] == "\u00d7":
-        second = _scan_number(text, _skip_inline_spaces(text, dimension_position + 1))
-        if second is not None:
-            return _finish_quantity_fact(
-                text,
-                position,
-                second.end,
-                "unit",
-                f"{number.normalized}|{second.normalized}",
-                sign.semantic,
-                "",
-            )
-
-    if number.end < len(text) and text[number.end] == "/":
-        second = _scan_number(text, number.end + 1)
-        if second is not None:
-            return _finish_quantity_fact(
-                text,
-                position,
-                second.end,
-                "number",
-                f"{number.normalized}|{second.normalized}",
-                sign.semantic,
-                "number",
-            )
-
-    percentage = _match_suffix_alias(text, number.end, _LONGEST_PERCENTAGE_ALIASES)
-    if percentage is not None:
-        return _finish_quantity_fact(
-            text,
-            position,
-            percentage.end,
-            "percentage",
-            number.normalized,
-            sign.semantic,
-            percentage.identity,
-        )
-
-    currency = _match_suffix_alias(text, number.end, _LONGEST_CURRENCY_SUFFIX_ALIASES)
-    if currency is not None:
-        return _finish_quantity_fact(
-            text,
-            position,
-            currency.end,
-            "currency",
-            number.normalized,
-            sign.semantic,
-            currency.identity,
-        )
-
-    unit = _match_suffix_alias(text, number.end, _LONGEST_UNIT_ALIASES)
-    if unit is not None:
-        return _finish_quantity_fact(
-            text,
-            position,
-            unit.end,
-            "unit",
-            number.normalized,
-            sign.semantic,
-            unit.identity,
-        )
-
-    return _finish_quantity_fact(
-        text,
-        position,
-        number.end,
-        "number",
-        number.normalized,
-        sign.semantic,
-        "number",
-    )
-
-
-def _scan_quantity_fact_at(text: str, position: int) -> _ProtectedItem | None:
-    prefix = _scan_currency_prefix_fact_at(text, position)
-    if prefix is not None:
-        return prefix
-    return _scan_numeric_fact_at(text, position)
-
-
 def _legacy_items(text: str) -> tuple[_ProtectedItem, ...]:
     candidates: list[tuple[int, ProtectedSpan]] = []
     for priority, (kind, pattern) in enumerate(_LEGACY_PATTERNS):
@@ -771,43 +141,54 @@ def _legacy_items(text: str) -> tuple[_ProtectedItem, ...]:
     return tuple(found)
 
 
+def _quantity_fact_to_item(
+    text: str,
+    fact: QuantityFact,
+) -> _ProtectedItem:
+    span = ProtectedSpan(
+        fact.start,
+        fact.end,
+        fact.kind,
+        text[fact.start : fact.end],
+    )
+    token = ProtectedToken(
+        span.text,
+        fact.kind,
+        fact.numeric_value,
+        fact.sign,
+        fact.marker,
+    )
+    return _ProtectedItem(span, token)
+
+
 def _protected_items(text: str) -> tuple[_ProtectedItem, ...]:
     legacy = _legacy_items(text)
-    quantity: list[_ProtectedItem] = []
-    position = 0
-    legacy_index = 0
-    while position < len(text):
-        while legacy_index < len(legacy) and legacy[legacy_index].span.end <= position:
-            legacy_index += 1
-        if legacy_index < len(legacy):
-            occupied = legacy[legacy_index].span
-            if occupied.start <= position < occupied.end:
-                quantity.append(legacy[legacy_index])
-                position = occupied.end
-                legacy_index += 1
-                continue
-        if (
-            not text[position].isdigit()
-            and text[position].casefold() not in _QUANTITY_START_CHARACTERS
-        ):
-            position += 1
-            continue
-        item = _scan_quantity_fact_at(text, position)
-        if item is None:
-            position += 1
-            continue
-        if item.span.end <= position:
+    occupied_ranges = tuple((item.span.start, item.span.end) for item in legacy)
+    quantity = tuple(
+        _quantity_fact_to_item(text, fact)
+        for fact in scan_quantity_facts(text, occupied_ranges=occupied_ranges)
+    )
+    items = sorted(
+        (*legacy, *quantity),
+        key=lambda item: (
+            item.span.start,
+            item.span.end,
+            item.span.kind,
+        ),
+    )
+    previous_end = 0
+    for item in items:
+        if item.span.start < previous_end:
             raise AppError(
                 "llm.protected_scanner_invalid",
-                {"reason": "no_progress", "position": position, "category": "quantity"},
+                {
+                    "reason": "overlap",
+                    "position": item.span.start,
+                    "category": "pipeline",
+                },
             )
-        if legacy_index < len(legacy) and _overlap(item.span, legacy[legacy_index].span):
-            position = max(position + 1, legacy[legacy_index].span.start)
-            continue
-        quantity.append(item)
-        position = item.span.end
-    quantity.sort(key=lambda item: (item.span.start, item.span.end, item.span.kind))
-    return tuple(quantity)
+        previous_end = item.span.end
+    return tuple(items)
 
 
 def find_protected_spans(text: str) -> tuple[ProtectedSpan, ...]:
@@ -1005,36 +386,6 @@ def _date_time_identity(text: str) -> tuple[str, str, str]:
             hour = 0
         return "", f"{hour:02d}:{minute:02d}", period
     return "", "", ""
-
-
-def _normalize_numeric(value: str) -> str:
-    raw = (
-        value.replace("\u2212", "-")
-        .replace("\uff0d", "-")
-        .replace("\u066b", ".")
-        .replace("\u066c", ",")
-        .replace(" ", "")
-    )
-    sign = "-" if raw.startswith("-") else ""
-    raw = raw.lstrip("+-")
-    raw = "".join(
-        str(unicodedata.digit(character)) if character.isdigit() else character for character in raw
-    )
-    if "," in raw and "." in raw:
-        decimal_separator = "." if raw.rfind(".") > raw.rfind(",") else ","
-        grouping_separator = "," if decimal_separator == "." else "."
-        raw = raw.replace(grouping_separator, "").replace(decimal_separator, ".")
-    elif "," in raw:
-        parts = raw.split(",")
-        raw = "".join(parts) if len(parts[-1]) == 3 and all(parts) else ".".join(parts)
-    try:
-        normalized = format(Decimal(raw), "f")
-    except (InvalidOperation, ValueError):
-        normalized = raw
-    if "." in normalized:
-        normalized = normalized.rstrip("0").rstrip(".")
-    normalized = normalized or "0"
-    return sign + normalized
 
 
 def _legacy_marker(kind: str) -> str:
