@@ -27,6 +27,7 @@ class BatchCatalogEntry:
     lease_state: LeaseExecutionState
     batch_cancel_requested: bool
     job_cancel_requests: frozenset[str]
+    batch_pause_requested: bool
 
 
 @dataclass(frozen=True, slots=True)

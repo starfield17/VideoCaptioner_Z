@@ -88,6 +88,7 @@ class FilesystemBatchCatalog:
             batch_dir / "control",
             {job.job_id for job in projection.jobs},
         )
+        batch_pause_requested = _pause_marker(batch_dir / "control")
         return BatchCatalogEntry(
             batch_id=name,
             created_at_utc=first.timestamp_utc,
@@ -97,6 +98,7 @@ class FilesystemBatchCatalog:
             lease_state=lease_state,
             batch_cancel_requested=batch_cancel_requested,
             job_cancel_requests=job_cancel_requests,
+            batch_pause_requested=batch_pause_requested,
         )
 
     def _inspect_lease(self, path: Path) -> LeaseExecutionState:
@@ -131,6 +133,13 @@ def _cancel_markers(
         if job_id in job_ids:
             job_cancels.add(job_id)
     return batch_cancel, frozenset(job_cancels)
+
+
+def _pause_marker(control_dir: Path) -> bool:
+    if not control_dir.is_dir():
+        return False
+    marker = control_dir / "pause-batch"
+    return marker.is_file()
 
 
 def _issue_code(error: AppError) -> str:

@@ -16,7 +16,7 @@ from captioner.core.ports.batch_catalog import (
 )
 from captioner.core.ports.manifest import ManifestStatus
 
-QUEUE_SCHEMA_VERSION = 1
+QUEUE_SCHEMA_VERSION = 2
 _TERMINAL_JOB_STATES = frozenset(
     {
         JobState.SUCCEEDED,
@@ -59,6 +59,8 @@ class JobQueueItem:
     active_stage_state: StageState | None
     active_stage_attempt: int
     cancel_requested: bool
+    pause_requested: bool
+    paused: bool
     last_event_seq: int
     journal_tail_status: Literal["clean", "incomplete"]
     manifest_status: ManifestStatus
@@ -196,6 +198,9 @@ def _item_for_job(
     if state is JobState.INTERRUPTED and active_stage_state is StageState.RUNNING:
         active_stage_state = StageState.INTERRUPTED
     cancel_requested = entry.batch_cancel_requested or job.job_id in entry.job_cancel_requests
+    terminal = state in _TERMINAL_JOB_STATES
+    pause_requested = bool(entry.batch_pause_requested and not terminal)
+    paused = pause_requested and entry.lease_state in _STALE_RUNNING_LEASE_STATES
     return JobQueueItem(
         batch_id=entry.batch_id,
         job_id=job.job_id,
@@ -209,6 +214,8 @@ def _item_for_job(
         active_stage_state=active_stage_state,
         active_stage_attempt=active_stage_attempt,
         cancel_requested=cancel_requested,
+        pause_requested=pause_requested,
+        paused=paused,
         last_event_seq=entry.projection.last_event_seq,
         journal_tail_status=entry.journal_tail_status,
         manifest_status=entry.manifest_status,
@@ -274,6 +281,8 @@ def _snapshot_signature(
                 None if item.active_stage_state is None else item.active_stage_state.value,
                 item.active_stage_attempt,
                 item.cancel_requested,
+                item.pause_requested,
+                item.paused,
                 item.last_event_seq,
                 item.journal_tail_status,
                 item.manifest_status,
@@ -286,6 +295,7 @@ def _snapshot_signature(
 
 
 __all__ = [
+    "QUEUE_SCHEMA_VERSION",
     "JobQueueItem",
     "QueueLoadIssue",
     "QueueProjectionService",

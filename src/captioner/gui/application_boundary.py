@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
+from captioner.core.application.batch_commands import (
+    BatchActionRequest,
+    BatchCommandAck,
+    CancelLocalWorkRequest,
+    ExecutionCompletion,
+    JobActionRequest,
+    LocalExecutionSnapshot,
+    SubmitBatchRequest,
+)
 from captioner.core.application.configuration import (
     ConfigurationSnapshot,
     ExecutionPreset,
@@ -13,7 +23,15 @@ from captioner.core.application.configuration import (
     ProviderSettingsUpdate,
 )
 from captioner.core.application.input_selection import InputPreview, InputSelectionRequest
+from captioner.core.application.job_detail import JobDetailRequest, JobDetailSnapshot
 from captioner.core.application.queue_projection import QueueSnapshot
+from captioner.core.application.recovery import RecoveryRequest, RecoverySnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPoll:
+    state: LocalExecutionSnapshot
+    completions: tuple[ExecutionCompletion, ...]
 
 
 class GuiApplicationBoundary(Protocol):
@@ -46,5 +64,21 @@ class GuiApplicationBoundary(Protocol):
         update: ProviderSettingsUpdate,
     ) -> ProviderConnectionResult: ...
 
+    def submit_batch(self, request: SubmitBatchRequest) -> BatchCommandAck: ...
 
-__all__ = ["GuiApplicationBoundary"]
+    def perform_batch_action(self, request: BatchActionRequest) -> BatchCommandAck: ...
+
+    def perform_job_action(self, request: JobActionRequest) -> BatchCommandAck: ...
+
+    def cancel_local_work(self, request: CancelLocalWorkRequest) -> BatchCommandAck: ...
+
+    def load_job_detail(self, request: JobDetailRequest) -> JobDetailSnapshot: ...
+
+    def scan_recovery(self, request: RecoveryRequest) -> RecoverySnapshot: ...
+
+    def poll_execution(self) -> ExecutionPoll: ...
+
+    def shutdown(self) -> None: ...
+
+
+__all__ = ["ExecutionPoll", "GuiApplicationBoundary"]

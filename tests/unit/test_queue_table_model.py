@@ -51,6 +51,8 @@ def _item(
         active_stage_state=active_stage_state,
         active_stage_attempt=active_stage_attempt,
         cancel_requested=cancel_requested,
+        pause_requested=False,
+        paused=False,
         last_event_seq=1,
         journal_tail_status="clean",
         manifest_status="missing",
@@ -65,7 +67,7 @@ def _snapshot(
     omitted: int = 0,
 ) -> QueueSnapshot:
     return QueueSnapshot(
-        schema_version=1,
+        schema_version=2,
         revision=revision,
         items=items,
         issues=issues,

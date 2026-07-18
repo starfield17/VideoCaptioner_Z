@@ -105,9 +105,24 @@ class CreatePage(QWidget):
         self._validate_button = QPushButton(service.translate("gui.create.validate"))
         self._validate_button.setObjectName("createValidateButton")
         self._validate_button.clicked.connect(self._on_validate)
+        self._submit_button = QPushButton(service.translate("gui.create.submit"))
+        self._submit_button.setObjectName("createSubmitButton")
+        self._submit_button.clicked.connect(self._on_submit)
+        self._submit_button.setEnabled(False)
         validate_row.addWidget(self._validate_button)
+        validate_row.addWidget(self._submit_button)
         validate_row.addStretch(1)
         body_layout.addLayout(validate_row)
+
+        self._submit_busy = QLabel(service.translate("gui.create.submitting"))
+        self._submit_busy.setObjectName("createSubmitBusyLabel")
+        self._submit_busy.setVisible(False)
+        body_layout.addWidget(self._submit_busy)
+
+        self._submit_failure = QLabel("")
+        self._submit_failure.setObjectName("createSubmitFailureLabel")
+        self._submit_failure.setVisible(False)
+        body_layout.addWidget(self._submit_failure)
 
         self._draft_status = QLabel("")
         self._draft_status.setObjectName("createDraftStatusLabel")
@@ -129,8 +144,12 @@ class CreatePage(QWidget):
         controller.busy_changed.connect(self._on_busy)
         controller.failure_changed.connect(self._on_failure)
         controller.preset_busy_changed.connect(self._on_preset_busy)
+        controller.submission_busy_changed.connect(self._on_submission_busy)
+        controller.submission_failure_changed.connect(self._on_submission_failure)
+        controller.batch_submitted.connect(self._on_batch_submitted)
         self._wire_draft_invalidation()
         self._update_llm_enabled()
+        self._update_submit_enabled()
 
     def _build_input_section(self) -> QWidget:
         widget = QWidget()
@@ -524,6 +543,9 @@ class CreatePage(QWidget):
             collision_policy=str(self._collision_combo.currentData() or "unique_subdir"),
         )
 
+    def _on_submit(self) -> None:
+        self._controller.submit_draft()
+
     def _on_draft(self, draft: object) -> None:
         if isinstance(draft, BatchDraft):
             self._draft_status.setText(
@@ -538,18 +560,61 @@ class CreatePage(QWidget):
             )
             self._draft_failure.clear()
             self._draft_failure.setVisible(False)
+            self._update_submit_enabled()
             return
         self._draft_status.clear()
+        self._update_submit_enabled()
 
     def _on_busy(self, busy: bool) -> None:
-        self._validate_button.setEnabled(not busy and not self._controller.preset_busy)
+        self._validate_button.setEnabled(
+            not busy and not self._controller.preset_busy and not self._controller.submission_busy
+        )
+        self._update_submit_enabled()
 
     def _on_preset_busy(self, busy: bool) -> None:
         for name in ("createSavePresetButton", "createDeletePresetButton"):
             button = self.findChild(QPushButton, name)
             if button is not None:
                 button.setEnabled(not busy)
-        self._validate_button.setEnabled(not busy and not self._controller.busy)
+        self._validate_button.setEnabled(
+            not busy and not self._controller.busy and not self._controller.submission_busy
+        )
+        self._update_submit_enabled()
+
+    def _on_submission_busy(self, busy: bool) -> None:
+        self._submit_busy.setVisible(busy)
+        self._validate_button.setEnabled(
+            not busy and not self._controller.busy and not self._controller.preset_busy
+        )
+        self._update_submit_enabled()
+
+    def _on_submission_failure(self, failure: object) -> None:
+        if failure is None:
+            self._submit_failure.clear()
+            self._submit_failure.setVisible(False)
+            return
+        code = (
+            failure.code if isinstance(failure, RunnerFailure) else "gui.application_bridge_failed"
+        )
+        self._submit_failure.setText(
+            self._service.translate("gui.create.submit_failure", {"code": code})
+        )
+        self._submit_failure.setVisible(True)
+
+    def _on_batch_submitted(self, _ack: object) -> None:
+        self._submit_failure.clear()
+        self._submit_failure.setVisible(False)
+        self._draft_status.setText(self._service.translate("gui.create.submitted"))
+        self._update_submit_enabled()
+
+    def _update_submit_enabled(self) -> None:
+        enabled = (
+            self._controller.draft is not None
+            and not self._controller.busy
+            and not self._controller.preset_busy
+            and not self._controller.submission_busy
+        )
+        self._submit_button.setEnabled(enabled)
 
     def _on_failure(self, failure: object) -> None:
         if failure is None:
@@ -568,6 +633,7 @@ class CreatePage(QWidget):
                 self._service.translate("gui.create.input.failure", {"code": code})
             )
             self._input_failure.setVisible(True)
+        self._update_submit_enabled()
 
 
 __all__ = ["CreatePage"]

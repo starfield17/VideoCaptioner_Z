@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from captioner.core.application.batch_commands import (
+    BatchCommandAck,
+    BatchCommandFailure,
+    BatchCommandKind,
+    SubmitBatchRequest,
+)
 from captioner.core.application.configuration import ConfigurationSnapshot, ExecutionPreset
 from captioner.core.application.input_selection import (
     BatchDraft,
@@ -15,10 +21,11 @@ from captioner.core.application.input_selection import (
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.stage import PipelineProfile
 from captioner.gui.application_runner import ApplicationRunnerBridge, RunnerFailure
+from captioner.infrastructure.ids import new_id
 
 
 class CreateController(QObject):
-    """Coordinates input selection preview; never creates durable Batches."""
+    """Coordinates input selection preview and durable Batch submission."""
 
     entries_changed = Signal(object)
     preview_changed = Signal(object)
@@ -27,6 +34,9 @@ class CreateController(QObject):
     busy_changed = Signal(bool)
     failure_changed = Signal(object)
     preset_busy_changed = Signal(bool)
+    batch_submitted = Signal(object)
+    submission_busy_changed = Signal(bool)
+    submission_failure_changed = Signal(object)
 
     def __init__(
         self,
@@ -49,6 +59,9 @@ class CreateController(QObject):
         self._last_failure: RunnerFailure | None = None
         self._preset_busy = False
         self._pending_preset_op: str | None = None
+        self._submission_busy = False
+        self._pending_submit_request_id: str | None = None
+        self._submission_failure: RunnerFailure | None = None
 
         self._runner.input_preview_ready.connect(self._on_preview)
         self._runner.input_failure.connect(self._on_failure)
@@ -56,6 +69,8 @@ class CreateController(QObject):
         self._runner.preset_deleted.connect(self._on_preset_deleted)
         self._runner.preset_save_failure.connect(self._on_preset_failure)
         self._runner.preset_delete_failure.connect(self._on_preset_failure)
+        self._runner.batch_command_ready.connect(self._on_batch_command)
+        self._runner.batch_command_failure.connect(self._on_batch_command_failure)
 
     @property
     def entries(self) -> tuple[str, ...]:
@@ -88,6 +103,14 @@ class CreateController(QObject):
     @property
     def preset_busy(self) -> bool:
         return self._preset_busy
+
+    @property
+    def submission_busy(self) -> bool:
+        return self._submission_busy
+
+    @property
+    def submission_failure(self) -> RunnerFailure | None:
+        return self._submission_failure
 
     @property
     def validation_error(self) -> str | None:
@@ -213,6 +236,54 @@ class CreateController(QObject):
         self.draft_changed.emit(draft)
         self.failure_changed.emit(None)
         return draft
+
+    def submit_draft(self) -> None:
+        if self._submission_busy:
+            return
+        draft = self._draft
+        if draft is None:
+            self._submission_failure = RunnerFailure(code="batch.draft_invalid", retryable=False)
+            self.submission_failure_changed.emit(self._submission_failure)
+            return
+        request_id = new_id("req-")
+        self._pending_submit_request_id = request_id
+        self._submission_busy = True
+        self._submission_failure = None
+        self.submission_busy_changed.emit(True)
+        self.submission_failure_changed.emit(None)
+        self._runner.request_submit_batch(SubmitBatchRequest(request_id=request_id, draft=draft))
+
+    @Slot(object)
+    def _on_batch_command(self, ack: object) -> None:
+        if not isinstance(ack, BatchCommandAck):
+            return
+        if ack.kind is not BatchCommandKind.SUBMIT:
+            return
+        if ack.request_id != self._pending_submit_request_id:
+            return
+        self._pending_submit_request_id = None
+        self._submission_busy = False
+        self.submission_busy_changed.emit(False)
+        self._draft = None
+        self.draft_changed.emit(None)
+        self.clear_entries()
+        self._preview = None
+        self.preview_changed.emit(None)
+        self.batch_submitted.emit(ack)
+
+    @Slot(object)
+    def _on_batch_command_failure(self, failure: object) -> None:
+        if not isinstance(failure, BatchCommandFailure):
+            return
+        if failure.kind is not BatchCommandKind.SUBMIT:
+            return
+        if failure.request_id != self._pending_submit_request_id:
+            return
+        self._pending_submit_request_id = None
+        self._submission_busy = False
+        self.submission_busy_changed.emit(False)
+        self._submission_failure = RunnerFailure(code=failure.code, retryable=failure.retryable)
+        self.submission_failure_changed.emit(self._submission_failure)
 
     def _request_preview(self) -> None:
         self._preview_generation += 1

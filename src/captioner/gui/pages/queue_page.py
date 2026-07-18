@@ -1,4 +1,4 @@
-"""Queue presentation page bound to BatchController."""
+"""Queue presentation page bound to BatchController and JobOperationsController."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QPushButton,
+    QSplitter,
     QStackedWidget,
     QTableView,
     QVBoxLayout,
@@ -17,23 +18,27 @@ from PySide6.QtWidgets import (
 from captioner.core.application.queue_projection import QueueSnapshot
 from captioner.gui.application_runner import RunnerFailure
 from captioner.gui.batch_controller import BatchController
+from captioner.gui.job_operations_controller import JobOperationsController
 from captioner.gui.queue_table_model import QueueColumn
+from captioner.gui.widgets.job_detail_panel import JobDetailPanel
 from captioner.i18n.service import I18nService
 
 
 class QueuePage(QWidget):
-    """Functional Queue surface for PR5.2."""
+    """Functional Queue surface for PR5.4."""
 
     def __init__(
         self,
         service: I18nService,
         controller: BatchController,
+        operations: JobOperationsController,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("queuePage")
         self._service = service
         self._controller = controller
+        self._operations = operations
         self._selected_key: tuple[str, str] | None = None
 
         self._title = QLabel(service.translate("gui.queue.title"))
@@ -91,12 +96,24 @@ class QueuePage(QWidget):
         self._content_stack.addWidget(self._empty_label)
         self._content_stack.addWidget(self._table)
 
+        self._detail = JobDetailPanel(service, operations)
+        splitter = QSplitter()
+        splitter.setObjectName("queueDetailSplitter")
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(self._content_stack)
+        splitter.addWidget(left)
+        splitter.addWidget(self._detail)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
         layout = QVBoxLayout(self)
         layout.addLayout(toolbar)
         layout.addWidget(self._summary_label)
         layout.addWidget(self._issue_label)
         layout.addWidget(self._failure_label)
-        layout.addWidget(self._content_stack, stretch=1)
+        layout.addWidget(splitter, stretch=1)
 
         model = controller.model
         model.modelAboutToBeReset.connect(self._capture_selection)
@@ -104,6 +121,8 @@ class QueuePage(QWidget):
         model.rowsInserted.connect(self._on_rows_changed)
         model.rowsRemoved.connect(self._on_rows_changed)
         model.dataChanged.connect(self._on_data_changed)
+
+        self._table.selectionModel().selectionChanged.connect(self._on_selection_changed)
 
         controller.snapshot_changed.connect(self._on_snapshot)
         controller.failure_changed.connect(self._on_failure)
@@ -120,12 +139,14 @@ class QueuePage(QWidget):
         key = self._selected_key
         if key is None:
             self._table.clearSelection()
+            self._operations.select_job(None)
             self._update_empty_state()
             return
         row = self._controller.model.row_for_key(key)
         if row is None:
             self._selected_key = None
             self._table.clearSelection()
+            self._operations.select_job(None)
         else:
             index = self._controller.model.index(row, 0)
             self._table.selectionModel().select(
@@ -134,6 +155,8 @@ class QueuePage(QWidget):
                 | QItemSelectionModel.SelectionFlag.Rows,
             )
             self._table.setCurrentIndex(index)
+            item = self._controller.model.item_at(row)
+            self._operations.select_job(item)
         self._update_empty_state()
 
     def _current_selection_key(self) -> tuple[str, str] | None:
@@ -141,6 +164,20 @@ class QueuePage(QWidget):
         if not indexes:
             return self._selected_key
         return self._controller.model.key_at(indexes[0].row())
+
+    def _on_selection_changed(self, *_args: object) -> None:
+        indexes = self._table.selectionModel().selectedRows()
+        if not indexes:
+            self._selected_key = None
+            self._operations.select_job(None)
+            return
+        item = self._controller.model.item_at(indexes[0].row())
+        if item is None:
+            self._selected_key = None
+            self._operations.select_job(None)
+            return
+        self._selected_key = (item.batch_id, item.job_id)
+        self._operations.select_job(item)
 
     def _on_snapshot(self, snapshot: object) -> None:
         if isinstance(snapshot, QueueSnapshot):
@@ -165,8 +202,15 @@ class QueuePage(QWidget):
         _bottom_right: QModelIndex,
         _roles: object = None,
     ) -> None:
-        # Keep selection when only cell values change.
-        return
+        key = self._selected_key
+        if key is None:
+            return
+        row = self._controller.model.row_for_key(key)
+        if row is None:
+            return
+        item = self._controller.model.item_at(row)
+        if item is not None:
+            self._operations.refresh_detail()
 
     def _apply_busy(self, busy: bool) -> None:
         self._refresh_button.setEnabled(not busy)

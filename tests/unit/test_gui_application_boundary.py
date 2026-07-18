@@ -50,7 +50,7 @@ def test_structural_boundary_and_empty_snapshot(tmp_path: Path) -> None:
     boundary: GuiApplicationBoundary = build_gui_application_boundary(paths=paths)
     first = boundary.get_queue_snapshot()
     second = boundary.refresh_queue()
-    assert first.schema_version == 1
+    assert first.schema_version == 2
     assert first.revision == 1
     assert first.items == ()
     assert first.issues == ()
@@ -103,3 +103,30 @@ def test_boundary_import_still_excludes_heavy_sdks() -> None:
         env=None,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_boundary_batch_command_surface(tmp_path: Path) -> None:
+    import pytest
+
+    from captioner.core.application.batch_commands import (
+        CancelLocalWorkRequest,
+        LocalExecutionSnapshot,
+    )
+    from captioner.core.application.job_detail import JobDetailRequest
+    from captioner.core.application.recovery import RecoveryRequest
+    from captioner.core.domain.errors import AppError
+
+    paths = resolve_app_paths(base_dir=tmp_path / "runtime")
+    boundary = build_gui_application_boundary(paths=paths)
+    poll = boundary.poll_execution()
+    assert isinstance(poll.state, LocalExecutionSnapshot)
+    assert poll.completions == ()
+    snapshot = boundary.scan_recovery(RecoveryRequest(request_id="req-scan1"))
+    assert snapshot.schema_version == 1
+    with pytest.raises(AppError):
+        boundary.load_job_detail(
+            JobDetailRequest(request_id="req-d", batch_id="batch-missing", job_id="job-000001")
+        )
+    ack = boundary.cancel_local_work(CancelLocalWorkRequest(request_id="req-clw"))
+    assert ack.kind.value == "cancel_local_work"
+    boundary.shutdown()

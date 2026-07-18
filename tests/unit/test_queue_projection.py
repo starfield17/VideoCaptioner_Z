@@ -85,6 +85,7 @@ def _entry(
     lease_state: LeaseExecutionState = "missing",
     batch_cancel_requested: bool = False,
     job_cancel_requests: frozenset[str] = frozenset(),
+    batch_pause_requested: bool = False,
     journal_tail_status: str = "clean",
     manifest_status: str = "missing",
     last_event_seq: int = 1,
@@ -98,6 +99,7 @@ def _entry(
         lease_state=lease_state,
         batch_cancel_requested=batch_cancel_requested,
         job_cancel_requests=job_cancel_requests,
+        batch_pause_requested=batch_pause_requested,
     )
 
 

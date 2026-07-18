@@ -46,6 +46,8 @@ class FakeRunner(QObject):
     preset_delete_failure = Signal(object)
     provider_test_ready = Signal(object)
     provider_test_failure = Signal(object)
+    batch_command_ready = Signal(object)
+    batch_command_failure = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -106,6 +108,9 @@ def test_required_object_names_and_no_start_button() -> None:
         "createBrowseOutputButton",
         "createCollisionPolicyCombo",
         "createValidateButton",
+        "createSubmitButton",
+        "createSubmitBusyLabel",
+        "createSubmitFailureLabel",
         "createDraftStatusLabel",
         "createDraftFailureLabel",
         "createInputSection",
@@ -115,8 +120,13 @@ def test_required_object_names_and_no_start_button() -> None:
         "createOutputSection",
     ):
         assert page.findChild(QObject, name) is not None, name
-    for forbidden in ("Start", "Run", "Add to Queue", "Submit", "开始", "运行"):
+    submit = page.findChild(QPushButton, "createSubmitButton")
+    assert submit is not None
+    assert "Add to Queue" in submit.text()
+    for forbidden in ("Start", "Run", "开始", "运行"):
         for button in page.findChildren(QPushButton):
+            if button.objectName() == "createSubmitButton":
+                continue
             assert forbidden not in button.text()
     controller.clear_entries()
     page.close()

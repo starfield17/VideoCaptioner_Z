@@ -97,6 +97,7 @@ markers = [
 [tool.coverage.run]
 branch = true
 source = ["src/captioner"]
+concurrency = ["thread"]
 
 [tool.coverage.report]
 fail_under = 85

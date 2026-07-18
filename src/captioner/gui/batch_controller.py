@@ -91,6 +91,8 @@ class BatchController(QObject):
         self._refresh_queued = False
         stopped = self._runner.stop(timeout_ms=timeout_ms)
         if not stopped:
+            if self._running:
+                self._timer.start()
             return False
         was_busy = self._refresh_in_flight
         self._refresh_in_flight = False

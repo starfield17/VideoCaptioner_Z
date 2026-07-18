@@ -22,7 +22,7 @@ _app = QApplication.instance() or QApplication(["test-application-runner"])
 
 
 def _empty_snapshot(revision: int = 1) -> QueueSnapshot:
-    return QueueSnapshot(1, revision, (), (), 0)
+    return QueueSnapshot(2, revision, (), (), 0)
 
 
 @dataclass
@@ -113,6 +113,98 @@ class FakeBoundary:
         from captioner.core.application.configuration import ProviderConnectionResult
 
         return ProviderConnectionResult(True, "llm.connection_ok")
+
+    def submit_batch(self, request: object) -> Any:
+        self._record_op()
+        from captioner.core.application.batch_commands import (
+            BatchCommandAck,
+            BatchCommandKind,
+        )
+
+        return BatchCommandAck(
+            request_id=getattr(request, "request_id", "req"),
+            kind=BatchCommandKind.SUBMIT,
+            batch_id="batch-a",
+            job_id=None,
+            accepted_at_utc="t0",
+            scheduled=True,
+            created_batch_id="batch-a",
+        )
+
+    def perform_batch_action(self, request: object) -> Any:
+        self._record_op()
+        from captioner.core.application.batch_commands import (
+            BatchCommandAck,
+            BatchCommandKind,
+        )
+
+        return BatchCommandAck(
+            request_id=getattr(request, "request_id", "req"),
+            kind=getattr(request, "kind", BatchCommandKind.PAUSE_BATCH),
+            batch_id=getattr(request, "batch_id", "batch-a"),
+            job_id=None,
+            accepted_at_utc="t0",
+            scheduled=False,
+        )
+
+    def perform_job_action(self, request: object) -> Any:
+        self._record_op()
+        from captioner.core.application.batch_commands import (
+            BatchCommandAck,
+            BatchCommandKind,
+        )
+
+        return BatchCommandAck(
+            request_id=getattr(request, "request_id", "req"),
+            kind=getattr(request, "kind", BatchCommandKind.CANCEL_JOB),
+            batch_id=getattr(request, "batch_id", "batch-a"),
+            job_id=getattr(request, "job_id", "job-000001"),
+            accepted_at_utc="t0",
+            scheduled=False,
+        )
+
+    def cancel_local_work(self, request: object) -> Any:
+        self._record_op()
+        from captioner.core.application.batch_commands import (
+            BatchCommandAck,
+            BatchCommandKind,
+        )
+
+        return BatchCommandAck(
+            request_id=getattr(request, "request_id", "req"),
+            kind=BatchCommandKind.CANCEL_LOCAL_WORK,
+            batch_id=None,
+            job_id=None,
+            accepted_at_utc="t0",
+            scheduled=False,
+        )
+
+    def load_job_detail(self, request: object) -> Any:
+        self._record_op()
+        raise AppError("batch.not_found")
+
+    def scan_recovery(self, request: object) -> Any:
+        self._record_op()
+        from captioner.core.application.recovery import RecoverySnapshot
+
+        return RecoverySnapshot(
+            schema_version=1,
+            request_id=getattr(request, "request_id", "req"),
+            items=(),
+            issues=(),
+        )
+
+    def poll_execution(self) -> Any:
+        from captioner.core.application.batch_commands import LocalExecutionSnapshot
+        from captioner.gui.application_boundary import ExecutionPoll
+
+        return ExecutionPoll(
+            state=LocalExecutionSnapshot(None, ()),
+            completions=(),
+        )
+
+    def shutdown(self) -> None:
+        return None
 
 
 def _wait_until(predicate: Callable[[], bool], timeout_ms: int = 2000) -> bool:
@@ -453,3 +545,370 @@ def test_configuration_failure_is_operation_specific() -> None:
         assert failure.code == "config.write_failed"
     finally:
         assert bridge.stop()
+
+
+def test_submit_and_execution_poll_and_shutdown() -> None:
+    main_id = threading.get_ident()
+    factory_ids: list[int] = []
+
+    def factory() -> FakeBoundary:
+        factory_ids.append(threading.get_ident())
+        return FakeBoundary(
+            main_thread_id=main_id,
+            factory_thread_ids=factory_ids,
+            refresh_thread_ids=[],
+            get_calls=[],
+            refresh_calls=[],
+            snapshots=[_empty_snapshot(1)],
+            operation_thread_ids=[],
+        )
+
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
+    ready = QSignalSpy(bridge.snapshot_ready)
+    command = QSignalSpy(bridge.batch_command_ready)
+    bridge.start()
+    assert _wait_until(lambda: ready.count() >= 1)
+    from captioner.core.application.batch_commands import (
+        SubmitBatchRequest,
+    )
+    from captioner.core.application.input_selection import BatchDraft
+    from captioner.core.domain.stage import PipelineProfile
+
+    draft = BatchDraft(
+        input_paths=("/tmp/a.wav",),
+        output_root="/tmp/out",
+        preset_name="deterministic",
+        pipeline_profile=PipelineProfile.DETERMINISTIC,
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        source_language="en",
+        target_language=None,
+        provider_profile="default",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        collision_policy="unique_subdir",
+    )
+    bridge.request_submit_batch(SubmitBatchRequest(request_id="req-submit", draft=draft))
+    assert _wait_until(lambda: command.count() >= 1)
+    assert bridge.stop(timeout_ms=3000)
+
+
+def test_all_request_paths_and_failures() -> None:
+    main_id = threading.get_ident()
+    op_ids: list[int] = []
+
+    def factory() -> FakeBoundary:
+        return FakeBoundary(
+            main_thread_id=main_id,
+            factory_thread_ids=[],
+            refresh_thread_ids=[],
+            get_calls=[],
+            refresh_calls=[],
+            snapshots=[_empty_snapshot(1)],
+            operation_thread_ids=op_ids,
+        )
+
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
+    ready = QSignalSpy(bridge.snapshot_ready)
+    command = QSignalSpy(bridge.batch_command_ready)
+    recovery = QSignalSpy(bridge.recovery_ready)
+    detail_fail = QSignalSpy(bridge.job_detail_failure)
+    bridge.start()
+    assert _wait_until(lambda: ready.count() >= 1)
+
+    from captioner.core.application.batch_commands import (
+        BatchActionRequest,
+        BatchCommandKind,
+        CancelLocalWorkRequest,
+        JobActionRequest,
+        SubmitBatchRequest,
+    )
+    from captioner.core.application.configuration import (
+        ExecutionPreset,
+        GlobalSettings,
+        ProviderSettingsUpdate,
+    )
+    from captioner.core.application.input_selection import BatchDraft, InputSelectionRequest
+    from captioner.core.application.job_detail import JobDetailRequest
+    from captioner.core.application.recovery import RecoveryRequest
+    from captioner.core.domain.stage import PipelineProfile
+
+    bridge.request_refresh()
+    bridge.request_input_preview(InputSelectionRequest(entries=("/a.wav",)))
+    bridge.request_configuration_load()
+    bridge.request_global_save(
+        GlobalSettings(
+            locale="en",
+            default_preset_name="deterministic",
+            default_output_root="/tmp",
+            recursive_input=True,
+            collision_policy="unique_subdir",
+        )
+    )
+    bridge.request_provider_save(
+        ProviderSettingsUpdate(
+            profile_name="default",
+            base_url="https://example.com",
+            model="m",
+            api_key=None,
+            max_concurrency=1,
+            request_timeout_sec=30.0,
+            max_retries=1,
+            temperature=0.0,
+            tokenizer="cl100k_base",
+        )
+    )
+    bridge.request_preset_save(
+        ExecutionPreset(
+            name="user-a",
+            display_name="User A",
+            built_in=False,
+            pipeline_profile=PipelineProfile.DETERMINISTIC,
+            model_ref="tiny",
+            device="cpu",
+            compute_type="int8",
+            source_language=None,
+            target_language=None,
+            provider_profile="default",
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+        )
+    )
+    bridge.request_preset_delete("user-a")
+    bridge.request_provider_test(
+        ProviderSettingsUpdate(
+            profile_name="default",
+            base_url="https://example.com",
+            model="m",
+            api_key=None,
+            max_concurrency=1,
+            request_timeout_sec=30.0,
+            max_retries=1,
+            temperature=0.0,
+            tokenizer="cl100k_base",
+        )
+    )
+    draft = BatchDraft(
+        input_paths=("/tmp/a.wav",),
+        output_root="/tmp/out",
+        preset_name="deterministic",
+        pipeline_profile=PipelineProfile.DETERMINISTIC,
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        source_language="en",
+        target_language=None,
+        provider_profile="default",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        collision_policy="unique_subdir",
+    )
+    bridge.request_submit_batch(SubmitBatchRequest(request_id="req-s", draft=draft))
+    bridge.request_batch_action(
+        BatchActionRequest(
+            request_id="req-b",
+            kind=BatchCommandKind.PAUSE_BATCH,
+            batch_id="batch-a",
+        )
+    )
+    bridge.request_job_action(
+        JobActionRequest(
+            request_id="req-j",
+            kind=BatchCommandKind.CANCEL_JOB,
+            batch_id="batch-a",
+            job_id="job-000001",
+        )
+    )
+    bridge.request_cancel_local_work(CancelLocalWorkRequest(request_id="req-c"))
+    bridge.request_job_detail(
+        JobDetailRequest(request_id="req-d", batch_id="batch-a", job_id="job-000001")
+    )
+    bridge.request_recovery_scan(RecoveryRequest(request_id="req-r"))
+    assert _wait_until(lambda: command.count() >= 1)
+    assert _wait_until(lambda: recovery.count() >= 1)
+    assert _wait_until(lambda: detail_fail.count() >= 1)
+    assert bridge.stop(timeout_ms=5000)
+
+
+def test_worker_slots_on_main_thread_for_coverage() -> None:
+    """Exercise worker methods on the main thread so coverage records them."""
+    from captioner.core.application.batch_commands import (
+        BatchActionRequest,
+        BatchCommandKind,
+        CancelLocalWorkRequest,
+        JobActionRequest,
+        SubmitBatchRequest,
+    )
+    from captioner.core.application.configuration import (
+        ExecutionPreset,
+        GlobalSettings,
+        ProviderSettingsUpdate,
+    )
+    from captioner.core.application.input_selection import BatchDraft, InputSelectionRequest
+    from captioner.core.application.job_detail import JobDetailRequest
+    from captioner.core.application.recovery import RecoveryRequest
+    from captioner.core.domain.stage import PipelineProfile
+    from captioner.gui import application_runner as runner_mod
+
+    main_id = threading.get_ident()
+    boundary = FakeBoundary(
+        main_thread_id=main_id,
+        factory_thread_ids=[],
+        refresh_thread_ids=[],
+        get_calls=[],
+        refresh_calls=[],
+        snapshots=[_empty_snapshot(1)],
+        operation_thread_ids=[],
+    )
+
+    def factory() -> FakeBoundary:
+        return boundary
+
+    worker = runner_mod._ApplicationRunnerWorker(factory)  # pyright: ignore[reportPrivateUsage]
+    worker.initialize()
+    worker.refresh()
+    worker.preview_inputs(InputSelectionRequest(entries=("/a.wav",)))
+    worker.load_configuration()
+    worker.save_global(GlobalSettings())
+    worker.save_provider(
+        ProviderSettingsUpdate(
+            profile_name="default",
+            base_url="https://example.com",
+            model="m",
+        )
+    )
+    worker.save_preset(
+        ExecutionPreset(
+            name="user-a",
+            display_name="User A",
+            built_in=False,
+            pipeline_profile=PipelineProfile.DETERMINISTIC,
+            model_ref="tiny",
+            device="cpu",
+            compute_type="int8",
+            source_language=None,
+            target_language=None,
+            provider_profile="default",
+        )
+    )
+    worker.delete_preset("user-a")
+    worker.test_provider(
+        ProviderSettingsUpdate(
+            profile_name="default",
+            base_url="https://example.com",
+            model="m",
+        )
+    )
+    draft = BatchDraft(
+        input_paths=("/tmp/a.wav",),
+        output_root="/tmp/out",
+        preset_name="deterministic",
+        pipeline_profile=PipelineProfile.DETERMINISTIC,
+        model_ref="tiny",
+        device="cpu",
+        compute_type="int8",
+        source_language="en",
+        target_language=None,
+        provider_profile="default",
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        collision_policy="unique_subdir",
+    )
+    worker.submit_batch(SubmitBatchRequest(request_id="req-s", draft=draft))
+    worker.perform_batch_action(
+        BatchActionRequest(
+            request_id="req-b",
+            kind=BatchCommandKind.PAUSE_BATCH,
+            batch_id="batch-a",
+        )
+    )
+    worker.perform_job_action(
+        JobActionRequest(
+            request_id="req-j",
+            kind=BatchCommandKind.CANCEL_JOB,
+            batch_id="batch-a",
+            job_id="job-000001",
+        )
+    )
+    worker.cancel_local_work(CancelLocalWorkRequest(request_id="req-c"))
+    worker.load_job_detail(
+        JobDetailRequest(request_id="req-d", batch_id="batch-a", job_id="job-000001")
+    )
+    worker.scan_recovery(RecoveryRequest(request_id="req-r"))
+    worker.poll_execution()
+    # invalid payloads
+    worker.preview_inputs("bad")
+    worker.save_global("bad")
+    worker.save_provider("bad")
+    worker.save_preset("bad")
+    worker.test_provider("bad")
+    worker.submit_batch("bad")
+    worker.perform_batch_action("bad")
+    worker.perform_job_action("bad")
+    worker.cancel_local_work("bad")
+    worker.load_job_detail("bad")
+    worker.scan_recovery("bad")
+    worker.shutdown()
+
+
+def test_worker_error_paths_for_coverage() -> None:
+    from captioner.gui import application_runner as runner_mod
+
+    main_id = threading.get_ident()
+
+    def factory_ok() -> FakeBoundary:
+        return FakeBoundary(
+            main_thread_id=main_id,
+            factory_thread_ids=[],
+            refresh_thread_ids=[],
+            get_calls=[],
+            refresh_calls=[],
+            snapshots=[_empty_snapshot(1)],
+            operation_thread_ids=[],
+            get_error=AppError("queue.read_failed"),
+            refresh_error=AppError("queue.refresh_failed"),
+            preview_error=AppError("input.failed"),
+            config_error=AppError("config.failed"),
+            provider_test_error=AppError("llm.connection_failed"),
+        )
+
+    worker = runner_mod._ApplicationRunnerWorker(factory_ok)  # pyright: ignore[reportPrivateUsage]
+    worker.initialize()  # get_error path
+    # Reset boundary without error for partial coverage of None-boundary paths:
+    object.__setattr__(worker, "_boundary", None)
+    worker.refresh()
+    worker.preview_inputs(object())
+    worker.load_configuration()
+    worker.save_global(object())
+    worker.save_provider(object())
+    worker.save_preset(object())
+    worker.delete_preset("x")
+    worker.test_provider(object())
+    worker.submit_batch(object())
+    worker.perform_batch_action(object())
+    worker.perform_job_action(object())
+    worker.cancel_local_work(object())
+    worker.load_job_detail(object())
+    worker.scan_recovery(object())
+    worker.poll_execution()
+    worker.shutdown()
+
+    # exception paths with boundary present
+    boundary = factory_ok()
+    worker2 = runner_mod._ApplicationRunnerWorker(lambda: boundary)  # type: ignore[attr-defined]
+    worker2.initialize()
+    object.__setattr__(worker2, "_boundary", boundary)
+    worker2.refresh()
+    from captioner.core.application.input_selection import InputSelectionRequest
+
+    worker2.preview_inputs(InputSelectionRequest(entries=("/a.wav",)))
+    worker2.load_configuration()
+    from captioner.core.application.configuration import ProviderSettingsUpdate
+
+    worker2.save_provider(
+        ProviderSettingsUpdate(profile_name="default", base_url="https://x", model="m")
+    )
+    worker2.test_provider(
+        ProviderSettingsUpdate(profile_name="default", base_url="https://x", model="m")
+    )

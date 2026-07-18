@@ -19,6 +19,7 @@ from captioner.core.domain.job import JobState
 from captioner.core.domain.stage import PipelineProfile, StageName, StageState
 from captioner.gui.application_runner import RunnerFailure
 from captioner.gui.batch_controller import BatchController
+from captioner.gui.job_operations_controller import JobOperationsController
 from captioner.gui.pages.queue_page import QueuePage
 from captioner.gui.queue_table_model import QueueTableModel
 from captioner.i18n.service import I18nService
@@ -46,6 +47,8 @@ def _item(
         active_stage_state=StageState.RUNNING if state is JobState.RUNNING else None,
         active_stage_attempt=1 if state is JobState.RUNNING else 0,
         cancel_requested=False,
+        pause_requested=False,
+        paused=False,
         last_event_seq=1,
         journal_tail_status="clean",
         manifest_status="missing",
@@ -59,7 +62,7 @@ def _snapshot(
     issues: tuple[QueueLoadIssue, ...] = (),
     omitted: int = 0,
 ) -> QueueSnapshot:
-    return QueueSnapshot(1, revision, items, issues, omitted)
+    return QueueSnapshot(2, revision, items, issues, omitted)
 
 
 class FakeRunner(QObject):
@@ -67,6 +70,12 @@ class FakeRunner(QObject):
     failure = Signal(object)
     started = Signal()
     stopped = Signal()
+    batch_command_ready = Signal(object)
+    batch_command_failure = Signal(object)
+    job_detail_ready = Signal(object)
+    job_detail_failure = Signal(object)
+    execution_completion = Signal(object)
+    local_execution_state_changed = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -96,7 +105,8 @@ def _build_page(locale: str = "en") -> tuple[QueuePage, BatchController, FakeRun
     model = QueueTableModel(service)
     runner = FakeRunner()
     controller = BatchController(model, runner, refresh_interval_ms=1000)  # type: ignore[arg-type]
-    page = QueuePage(service, controller)
+    operations = JobOperationsController(runner)  # type: ignore[arg-type]
+    page = QueuePage(service, controller, operations)
     page.show()
     return page, controller, runner
 

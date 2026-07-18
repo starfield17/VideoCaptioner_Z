@@ -1,4 +1,4 @@
-"""GUI composition root for Queue, Create, and Settings controllers."""
+"""GUI composition root for Queue, Create, Settings, and operations controllers."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from captioner.gui.application_boundary import GuiApplicationBoundary
 from captioner.gui.application_runner import ApplicationRunnerBridge
 from captioner.gui.batch_controller import BatchController
 from captioner.gui.create_controller import CreateController
+from captioner.gui.job_operations_controller import JobOperationsController
 from captioner.gui.queue_table_model import QueueTableModel
+from captioner.gui.recovery_controller import RecoveryController
 from captioner.gui.settings_controller import SettingsController
 from captioner.gui_bootstrap import build_gui_application_boundary
 from captioner.i18n.service import I18nService
@@ -20,6 +22,8 @@ class GuiControllers:
     queue: BatchController
     create: CreateController
     settings: SettingsController
+    operations: JobOperationsController
+    recovery: RecoveryController
 
 
 def build_gui_controllers(
@@ -47,8 +51,29 @@ def build_gui_controllers(
     )
     create = CreateController(runner)
     settings = SettingsController(runner, startup_issue=startup_issue)
+    operations = JobOperationsController(runner)
+    recovery = RecoveryController(runner)
+
     settings.configuration_changed.connect(create.set_configuration)
-    return GuiControllers(queue=queue, create=create, settings=settings)
+
+    def _refresh_queue(_payload: object = None) -> None:
+        queue.refresh()
+
+    def _scan_recovery(_payload: object = None) -> None:
+        recovery.scan()
+
+    create.batch_submitted.connect(_refresh_queue)
+    operations.command_succeeded.connect(_refresh_queue)
+    operations.refresh_requested.connect(queue.refresh)
+    queue.snapshot_changed.connect(_scan_recovery)
+
+    return GuiControllers(
+        queue=queue,
+        create=create,
+        settings=settings,
+        operations=operations,
+        recovery=recovery,
+    )
 
 
 def build_batch_controller(

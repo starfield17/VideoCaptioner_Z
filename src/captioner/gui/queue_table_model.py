@@ -205,6 +205,10 @@ class QueueTableModel(QAbstractTableModel):
         if column == int(QueueColumn.STATUS):
             if item.cancel_requested and not item.terminal:
                 return self._i18n.translate("gui.queue.state.cancelling")
+            if item.paused:
+                return self._i18n.translate("gui.queue.state.paused")
+            if item.pause_requested and not item.terminal:
+                return self._i18n.translate("gui.queue.state.pausing")
             return self._i18n.translate(_JOB_STATE_KEYS[item.state])
         if column == int(QueueColumn.STAGE):
             if item.active_stage is None:

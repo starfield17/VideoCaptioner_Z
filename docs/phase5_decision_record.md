@@ -13,6 +13,8 @@
 
 - One Queue row represents one Job.
 - Queue projections are immutable.
+- Queue schema version: 2.
+- Pause state is projected from the exact durable `pause-batch` control marker.
 - Updates use complete snapshots with session-monotonic revisions.
 - The GUI receives refresh/change notifications through an Application boundary.
 - Application state is reconstructed before being presented.
@@ -37,10 +39,11 @@
 ## Job actions
 
 - Pause means stop scheduling new work after the current safe boundary.
+- Pause is derived from the durable `control/pause-batch` marker, not a fake Journal Job state.
 - Cancellation uses the existing cooperative and escalation path.
-- Batch cancellation is supported.
-- Retry uses a simple default action with optional advanced Stage selection.
-- Running a completed input again creates a new Job.
+- Batch cancellation is supported and clears pause.
+- Retry uses a simple default action from the earliest retryable Stage.
+- Running a completed input again creates a new Job in a new Batch.
 
 ## GUI architecture
 
@@ -52,7 +55,20 @@
 - Initial Queue is flat rather than hierarchical.
 - Job details use a side panel or dialog.
 - One dedicated Application runner bridge; no worker per Job.
+- One serial Pipeline executor (`ThreadPoolExecutor(max_workers=1)`) outside the Qt worker.
+- Long Pipeline work never runs on the GUI thread or inside the Qt worker event loop.
+- One shared application-wide LLM runtime/semaphore reused across sequential Fast/Quality Batches.
 - No detached process or tray mode in initial Phase 5.
+- Active local work is cancelled before GUI shutdown; no tray/background continuation.
+
+## Scope exclusions (retained)
+
+- Diagnostics export
+- Runtime/model installation
+- OS keychain
+- Dynamic language switching
+- Native notifications
+- Tray/background mode
 
 ## Configuration
 

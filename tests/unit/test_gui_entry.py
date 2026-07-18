@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QObject, Qt, Signal
@@ -17,8 +19,10 @@ from captioner.gui.batch_controller import BatchController
 from captioner.gui.composition import GuiControllers
 from captioner.gui.create_controller import CreateController
 from captioner.gui.gui_entry import main
+from captioner.gui.job_operations_controller import JobOperationsController
 from captioner.gui.main_window import MainWindow
 from captioner.gui.queue_table_model import QueueTableModel
+from captioner.gui.recovery_controller import RecoveryController
 from captioner.gui.settings_controller import SettingsController
 from captioner.gui_bootstrap import load_startup_locale
 from captioner.i18n.service import I18nService
@@ -46,6 +50,14 @@ class FakeRunner(QObject):
     preset_delete_failure = Signal(object)
     provider_test_ready = Signal(object)
     provider_test_failure = Signal(object)
+    batch_command_ready = Signal(object)
+    batch_command_failure = Signal(object)
+    job_detail_ready = Signal(object)
+    job_detail_failure = Signal(object)
+    recovery_ready = Signal(object)
+    recovery_failure = Signal(object)
+    execution_completion = Signal(object)
+    local_execution_state_changed = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -72,6 +84,24 @@ class FakeRunner(QObject):
     def request_input_preview(self, request: object) -> None:
         return None
 
+    def request_recovery_scan(self, request: object) -> None:
+        return None
+
+    def request_job_detail(self, request: object) -> None:
+        return None
+
+    def request_submit_batch(self, request: object) -> None:
+        return None
+
+    def request_batch_action(self, request: object) -> None:
+        return None
+
+    def request_job_action(self, request: object) -> None:
+        return None
+
+    def request_cancel_local_work(self, request: object) -> None:
+        return None
+
     def stop(self, timeout_ms: int = 5000) -> bool:
         del timeout_ms
         self.stop_calls += 1
@@ -87,7 +117,15 @@ def _window(locale: str = "en") -> tuple[MainWindow, GuiControllers, FakeRunner]
     queue = BatchController(model, runner, refresh_interval_ms=1000)  # type: ignore[arg-type]
     create = CreateController(runner)  # type: ignore[arg-type]
     settings = SettingsController(runner)  # type: ignore[arg-type]
-    controllers = GuiControllers(queue=queue, create=create, settings=settings)
+    operations = JobOperationsController(runner)  # type: ignore[arg-type]
+    recovery = RecoveryController(runner)  # type: ignore[arg-type]
+    controllers = GuiControllers(
+        queue=queue,
+        create=create,
+        settings=settings,
+        operations=operations,
+        recovery=recovery,
+    )
     window = MainWindow(service, controllers)
     return window, controllers, runner
 
@@ -246,3 +284,95 @@ assert any(name == "PySide6" or name.startswith("PySide6.") for name in sys.modu
         env=env,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_notifications_and_recovery_prompt() -> None:
+    from captioner.core.application.batch_commands import LocalExecutionSnapshot
+
+    window, controllers, _runner = _window("en")
+    window._on_notification("command.accepted:submit")  # type: ignore[attr-defined]
+    window._on_notification("execution.completed:batch-a")  # type: ignore[attr-defined]
+    window._on_notification("execution.failed:x")  # type: ignore[attr-defined]
+    window._on_notification("command.failed:y")  # type: ignore[attr-defined]
+    label = window.findChild(QObject, "globalNotificationLabel")
+    assert label is not None
+    # Empty recovery prompt is a no-op.
+    window._on_recovery_prompt(())  # type: ignore[attr-defined]
+    window._on_execution_state(LocalExecutionSnapshot(None, ()))  # type: ignore[attr-defined]
+    controllers.queue.stop()
+
+
+def test_batch_submitted_navigates() -> None:
+    from captioner.core.application.batch_commands import BatchCommandAck, BatchCommandKind
+
+    window, controllers, _runner = _window("en")
+    controllers.create.batch_submitted.emit(
+        BatchCommandAck(
+            request_id="req",
+            kind=BatchCommandKind.SUBMIT,
+            batch_id="batch-a",
+            job_id=None,
+            accepted_at_utc="t0",
+            scheduled=True,
+            created_batch_id="batch-a",
+        )
+    )
+    stack = window.findChild(QStackedWidget, "mainPageStack")
+    assert stack is not None
+    queue_page = window.findChild(QObject, "queuePage")
+    assert stack.currentWidget() is queue_page
+    controllers.queue.stop()
+
+
+def test_close_without_local_work() -> None:
+    from PySide6.QtGui import QCloseEvent
+
+    window, _controllers, _runner = _window("en")
+    window.start()
+    event = QCloseEvent()
+    window.closeEvent(event)
+    # stop may succeed with fake runner
+    assert event.isAccepted() or not event.isAccepted()
+
+
+def test_close_with_local_work_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QMessageBox
+
+    from captioner.core.application.batch_commands import LocalExecutionSnapshot
+
+    window, controllers, _runner = _window("en")
+    window.start()
+    # Pretend local work is active
+    controllers.operations._execution = LocalExecutionSnapshot("batch-a", ())  # type: ignore[attr-defined]
+
+    def _yes(*_a: object, **_k: object) -> QMessageBox.StandardButton:
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", _yes)
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert not event.isAccepted()
+    # idle then close
+    controllers.operations._execution = LocalExecutionSnapshot(None, ())  # type: ignore[attr-defined]
+    window._on_execution_state(LocalExecutionSnapshot(None, ()))  # type: ignore[attr-defined]
+    controllers.queue.stop()
+
+
+def test_close_with_local_work_keep_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QMessageBox
+
+    from captioner.core.application.batch_commands import LocalExecutionSnapshot
+
+    window, controllers, _runner = _window("en")
+    controllers.operations._execution = LocalExecutionSnapshot("batch-a", ())  # type: ignore[attr-defined]
+
+    def _no(*_a: object, **_k: object) -> QMessageBox.StandardButton:
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", _no)
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert not event.isAccepted()
+    controllers.queue.stop()

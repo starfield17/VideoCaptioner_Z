@@ -40,6 +40,8 @@ def _item(
         active_stage_state=None,
         active_stage_attempt=0,
         cancel_requested=False,
+        pause_requested=False,
+        paused=False,
         last_event_seq=1,
         journal_tail_status="clean",
         manifest_status="missing",
@@ -51,7 +53,7 @@ def _snapshot(
     *,
     revision: int = 1,
 ) -> QueueSnapshot:
-    return QueueSnapshot(1, revision, items, (), 0)
+    return QueueSnapshot(2, revision, items, (), 0)
 
 
 class FakeRunner(QObject):
