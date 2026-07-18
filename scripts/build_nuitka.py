@@ -42,6 +42,22 @@ class BuildError(RuntimeError):
     def missing_files(cls, paths: str) -> BuildError:
         return cls(f"packaged layout is missing: {paths}")
 
+    @classmethod
+    def source_file_missing(cls, path: Path) -> BuildError:
+        return cls(f"required release source file is missing: {path}")
+
+    @classmethod
+    def source_file_invalid(cls, path: Path) -> BuildError:
+        return cls(f"required release source file is not a regular file: {path}")
+
+    @classmethod
+    def staging_destination_escape(cls, path: Path) -> BuildError:
+        return cls(f"release document destination escapes final root: {path}")
+
+    @classmethod
+    def staging_copy_failed(cls, source: Path, target: Path, detail: str) -> BuildError:
+        return cls(f"failed to stage {source} -> {target}: {detail}")
+
 
 @dataclass(frozen=True, slots=True)
 class BuildLayout:
@@ -51,6 +67,7 @@ class BuildLayout:
     final_root: Path
     executable_path: Path
     resource_root: Path
+    readme_path: Path
     notice_path: Path
 
 
@@ -106,12 +123,14 @@ def layout_for_platform(
         final_root = root / "Captioner.app"
         executable = final_root / "Contents" / "MacOS" / "captioner"
         resource_root = final_root / "Contents" / "Resources" / "resources"
+        readme_path = final_root / "Contents" / "Resources" / "README.md"
         notice_path = final_root / "Contents" / "Resources" / "THIRD_PARTY_NOTICES.md"
     else:
         final_root = root / "captioner"
         executable_name = "captioner.exe" if normalized == "windows" else "captioner"
         executable = final_root / executable_name
         resource_root = final_root / "resources"
+        readme_path = final_root / "README.md"
         notice_path = final_root / "THIRD_PARTY_NOTICES.md"
     return BuildLayout(
         platform_name=normalized,
@@ -120,6 +139,7 @@ def layout_for_platform(
         final_root=final_root,
         executable_path=executable,
         resource_root=resource_root,
+        readme_path=readme_path,
         notice_path=notice_path,
     )
 
@@ -157,8 +177,6 @@ def build_command(
     display_version = validate_version(version)
     python = str(sys.executable if python_executable is None else python_executable)
     resources = project_root / "resources"
-    readme = project_root / "README.md"
-    notices = project_root / "THIRD_PARTY_NOTICES.md"
     command = [
         python,
         "-m",
@@ -168,8 +186,7 @@ def build_command(
         "--enable-plugin=pyside6",
         "--include-package=captioner",
         f"--include-data-dir={resources}=resources",
-        f"--include-data-files={readme}=README.md",
-        f"--include-data-files={notices}=THIRD_PARTY_NOTICES.md",
+        "--assume-yes-for-downloads",
         "--nofollow-import-to=tests",
         "--nofollow-import-to=faster_whisper",
         "--nofollow-import-to=ctranslate2",
@@ -204,16 +221,67 @@ def find_unique_artifact(work_root: Path, suffix: str) -> Path:
     return artifacts[0]
 
 
-def stage_artifact(layout: BuildLayout, artifact: Path) -> None:
+def _require_regular_source_file(path: Path) -> Path:
+    """Require a non-symlink regular file for release document sources."""
+    if path.is_symlink() or not path.is_file():
+        if not path.exists() and not path.is_symlink():
+            raise BuildError.source_file_missing(path)
+        raise BuildError.source_file_invalid(path)
+    return path
+
+
+def _destination_within_final_root(layout: BuildLayout, destination: Path) -> Path:
+    """Reject document destinations that escape the staged final root."""
+    final_root = layout.final_root.resolve()
+    resolved = destination.expanduser()
+    # Destination may not exist yet; resolve parents and rejoin the name.
+    parent = resolved.parent.resolve()
+    candidate = parent / resolved.name
+    try:
+        candidate.relative_to(final_root)
+    except ValueError as exc:
+        raise BuildError.staging_destination_escape(destination) from exc
+    return candidate
+
+
+def stage_release_documents(
+    layout: BuildLayout,
+    *,
+    project_root: Path = PROJECT_ROOT,
+) -> None:
+    """Copy release documentation into the deterministic platform layout."""
+    sources = (
+        (project_root / "README.md", layout.readme_path),
+        (project_root / "THIRD_PARTY_NOTICES.md", layout.notice_path),
+    )
+    for source, destination in sources:
+        _require_regular_source_file(source)
+        target = _destination_within_final_root(layout, destination)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(source, target)
+        except OSError as exc:
+            raise BuildError.staging_copy_failed(source, target, str(exc)) from exc
+
+
+def stage_artifact(
+    layout: BuildLayout,
+    artifact: Path,
+    *,
+    project_root: Path = PROJECT_ROOT,
+) -> None:
     """Stage one Nuitka artifact into the standardized final location.
 
     Prefer a same-filesystem move over a full tree copy so standalone builds do
     not pay a second multi-hundred-megabyte directory walk. Cross-device failures
-    fall back to ``shutil.move``'s copy-and-remove path.
+    fall back to ``shutil.move``'s copy-and-remove path. Release documentation is
+    staged explicitly after the move so platform layout does not depend on Nuitka
+    data-file placement.
     """
     safe_remove_owned(layout.final_root, (layout.work_root, layout.final_root))
     layout.final_root.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(artifact), str(layout.final_root))
+    stage_release_documents(layout, project_root=project_root)
     verify_layout(layout)
 
 
@@ -221,7 +289,7 @@ def verify_layout(layout: BuildLayout) -> None:
     """Verify the executable and staged resources needed by smoke tests."""
     required = (
         layout.executable_path,
-        layout.final_root / "README.md",
+        layout.readme_path,
         layout.notice_path,
     )
     missing = [str(path) for path in required if not path.is_file()]
