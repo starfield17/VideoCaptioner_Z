@@ -114,6 +114,20 @@ class RuntimeTarget:
             "minimum_os_version": self.minimum_os_version,
         }
 
+    @classmethod
+    def from_dict(cls, value: object) -> RuntimeTarget:
+        if not isinstance(value, Mapping):
+            raise AppError("runtime.target_invalid", {"field": "target"})
+        raw = cast(Mapping[object, object], value)
+        return cls(
+            platform=_required_string(raw, "platform", "runtime.target_invalid"),
+            architecture=_required_string(raw, "architecture", "runtime.target_invalid"),
+            device_kind=_required_string(raw, "device_kind", "runtime.target_invalid"),
+            minimum_os_version=_required_string(
+                raw, "minimum_os_version", "runtime.target_invalid"
+            ),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeFileEntry:
@@ -218,6 +232,85 @@ class RuntimeManifest:
             "files": [entry.to_dict() for entry in self.files],
         }
 
+    @classmethod
+    def from_dict(cls, value: object) -> RuntimeManifest:
+        """Decode a sidecar manifest without filling missing required fields."""
+        if not isinstance(value, Mapping):
+            raise AppError("runtime.manifest_invalid", {"field": "root"})
+        raw = cast(Mapping[object, object], value)
+        if _contains_sensitive_key(raw):
+            raise AppError("runtime.manifest_invalid", {"reason": "sensitive"})
+        capabilities_value = _required_mapping(raw, "capabilities", "runtime.manifest_invalid")
+        capabilities = BackendCapability(
+            backend_id=_required_string(
+                capabilities_value, "backend_id", "runtime.manifest_invalid"
+            ),
+            device_kind=_required_string(
+                capabilities_value, "device_kind", "runtime.manifest_invalid"
+            ),
+            supported_model_formats=_required_string_tuple(
+                capabilities_value, "supported_model_formats", "runtime.manifest_invalid"
+            ),
+            word_timestamps=_required_bool(
+                capabilities_value, "word_timestamps", "runtime.manifest_invalid"
+            ),
+            language_detection=_required_bool(
+                capabilities_value, "language_detection", "runtime.manifest_invalid"
+            ),
+            translation_task=_required_bool(
+                capabilities_value, "translation_task", "runtime.manifest_invalid"
+            ),
+            additional_capabilities=_required_string_tuple(
+                capabilities_value, "additional_capabilities", "runtime.manifest_invalid"
+            ),
+        )
+        files_value = _required_sequence(raw, "files", "runtime.manifest_invalid")
+        files = tuple(
+            RuntimeFileEntry(
+                relative_path=_required_string(
+                    _mapping_item(item, "file", "runtime.manifest_invalid"),
+                    "relative_path",
+                    "runtime.manifest_invalid",
+                ),
+                size_bytes=_required_int(
+                    _mapping_item(item, "file", "runtime.manifest_invalid"),
+                    "size_bytes",
+                    "runtime.manifest_invalid",
+                ),
+                sha256=_required_string(
+                    _mapping_item(item, "file", "runtime.manifest_invalid"),
+                    "sha256",
+                    "runtime.manifest_invalid",
+                ),
+                executable=_required_bool(
+                    _mapping_item(item, "file", "runtime.manifest_invalid"),
+                    "executable",
+                    "runtime.manifest_invalid",
+                ),
+            )
+            for item in files_value
+        )
+        return cls(
+            schema_version=_required_int(raw, "schema_version", "runtime.manifest_invalid"),
+            runtime_identity=RuntimeIdentity.from_dict(
+                _required_value(raw, "runtime_identity", "runtime.manifest_invalid")
+            ),
+            worker_protocol_version=_required_string(
+                raw, "worker_protocol_version", "runtime.manifest_invalid"
+            ),
+            backend_id=_required_string(raw, "backend_id", "runtime.manifest_invalid"),
+            backend_version=_required_string(raw, "backend_version", "runtime.manifest_invalid"),
+            target=RuntimeTarget.from_dict(
+                _required_value(raw, "target", "runtime.manifest_invalid")
+            ),
+            capabilities=capabilities,
+            supported_model_formats=_required_string_tuple(
+                raw, "supported_model_formats", "runtime.manifest_invalid"
+            ),
+            archive_sha256=_required_string(raw, "archive_sha256", "runtime.manifest_invalid"),
+            files=files,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeInstallation:
@@ -251,6 +344,14 @@ class RuntimeInstallation:
         )
         if type(managed) is not bool or type(doctor_passed) is not bool:
             raise AppError("runtime.installation_invalid", {"field": "health"})
+        if self.state is RuntimeState.EXTERNAL_UNMANAGED:
+            if managed:
+                raise AppError("runtime.installation_invalid", {"field": "managed"})
+        elif self.state is RuntimeState.AVAILABLE:
+            if not managed or not doctor_passed:
+                raise AppError("runtime.installation_invalid", {"field": "health"})
+        elif doctor_passed:
+            raise AppError("runtime.installation_invalid", {"field": "health"})
         object.__setattr__(self, "managed", managed)
         object.__setattr__(self, "doctor_passed", doctor_passed)
 
@@ -269,6 +370,46 @@ class RuntimeInstallation:
     def path(self) -> Path:
         """Compatibility alias for adapters that call the installation root a path."""
         return self.install_path
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRuntimePointer:
+    """One atomically persisted backend/target active slot."""
+
+    backend_id: str
+    target: RuntimeTarget
+    current: RuntimeIdentity | None = None
+    previous: RuntimeIdentity | None = None
+    pending_activation: RuntimeIdentity | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.backend_id, "backend_id", "runtime.active_pointer_invalid")
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "backend_id": self.backend_id,
+            "target": self.target.to_dict(),
+            "current": None if self.current is None else self.current.to_dict(),
+            "previous": None if self.previous is None else self.previous.to_dict(),
+            "pending_activation": (
+                None if self.pending_activation is None else self.pending_activation.to_dict()
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> ActiveRuntimePointer:
+        if not isinstance(value, Mapping):
+            raise AppError("runtime.active_pointer_invalid", {"field": "slot"})
+        raw = cast(Mapping[object, object], value)
+        return cls(
+            backend_id=_required_string(raw, "backend_id", "runtime.active_pointer_invalid"),
+            target=RuntimeTarget.from_dict(
+                _required_value(raw, "target", "runtime.active_pointer_invalid")
+            ),
+            current=_optional_identity(raw, "current"),
+            previous=_optional_identity(raw, "previous"),
+            pending_activation=_optional_identity(raw, "pending_activation"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +505,31 @@ def _validate_relative_posix_path(value: object, code: str) -> None:
         raise AppError(code, {"field": "relative_path"})
 
 
+def _contains_sensitive_key(value: object) -> bool:
+    if isinstance(value, Mapping):
+        raw = cast(Mapping[object, object], value)
+        for key, nested in raw.items():
+            if isinstance(key, str) and any(
+                marker in key.casefold()
+                for marker in (
+                    "token",
+                    "secret",
+                    "password",
+                    "credential",
+                    "authorization",
+                    "api_key",
+                    "apikey",
+                )
+            ):
+                return True
+            if _contains_sensitive_key(nested):
+                return True
+    elif isinstance(value, (list, tuple)):
+        sequence = cast(list[object] | tuple[object, ...], value)
+        return any(_contains_sensitive_key(item) for item in sequence)
+    return False
+
+
 def _optional_text(value: object, field: str, code: str) -> None:
     if value is not None:
         _require_text(value, field, code)
@@ -380,10 +546,72 @@ def _freeze_details(value: object, code: str) -> Mapping[str, JsonValue]:
     return cast(Mapping[str, JsonValue], frozen)
 
 
+def _required_value(value: Mapping[object, object], key: str, code: str) -> object:
+    if key not in value:
+        raise AppError(code, {"field": key})
+    return value[key]
+
+
+def _required_string(value: Mapping[object, object], key: str, code: str) -> str:
+    item = _required_value(value, key, code)
+    if not isinstance(item, str):
+        raise AppError(code, {"field": key})
+    return item
+
+
+def _required_int(value: Mapping[object, object], key: str, code: str) -> int:
+    item = _required_value(value, key, code)
+    if type(item) is not int:
+        raise AppError(code, {"field": key})
+    return item
+
+
+def _required_bool(value: Mapping[object, object], key: str, code: str) -> bool:
+    item = _required_value(value, key, code)
+    if type(item) is not bool:
+        raise AppError(code, {"field": key})
+    return item
+
+
+def _required_mapping(
+    value: Mapping[object, object], key: str, code: str
+) -> Mapping[object, object]:
+    item = _required_value(value, key, code)
+    if not isinstance(item, Mapping):
+        raise AppError(code, {"field": key})
+    return cast(Mapping[object, object], item)
+
+
+def _required_sequence(value: Mapping[object, object], key: str, code: str) -> tuple[object, ...]:
+    item = _required_value(value, key, code)
+    if not isinstance(item, (list, tuple)):
+        raise AppError(code, {"field": key})
+    return tuple(cast(list[object] | tuple[object, ...], item))
+
+
+def _required_string_tuple(value: Mapping[object, object], key: str, code: str) -> tuple[str, ...]:
+    entries = _required_sequence(value, key, code)
+    if any(not isinstance(item, str) for item in entries):
+        raise AppError(code, {"field": key})
+    return tuple(cast(str, item) for item in entries)
+
+
+def _mapping_item(value: object, field: str, code: str) -> Mapping[object, object]:
+    if not isinstance(value, Mapping):
+        raise AppError(code, {"field": field})
+    return cast(Mapping[object, object], value)
+
+
+def _optional_identity(value: Mapping[object, object], key: str) -> RuntimeIdentity | None:
+    item = _required_value(value, key, "runtime.active_pointer_invalid")
+    return None if item is None else RuntimeIdentity.from_dict(item)
+
+
 __all__ = [
     "SUPPORTED_RUNTIME_ARCHITECTURES",
     "SUPPORTED_RUNTIME_DEVICES",
     "SUPPORTED_RUNTIME_PLATFORMS",
+    "ActiveRuntimePointer",
     "DoctorCheck",
     "DoctorPhase",
     "DoctorReport",
