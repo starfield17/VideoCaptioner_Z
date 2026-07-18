@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -16,7 +18,7 @@ from captioner.core.domain.result import JsonValue
 
 LLM_CONFIG_FILENAME = "llm.toml"
 OPENAI_COMPATIBLE_KIND = "openai-compatible"
-_PROVIDER_FIELDS = frozenset(
+PROVIDER_FIELDS = frozenset(
     {
         "kind",
         "base_url",
@@ -29,7 +31,43 @@ _PROVIDER_FIELDS = frozenset(
         "tokenizer",
     }
 )
+_PROVIDER_FIELDS = PROVIDER_FIELDS
 _SUPPORTED_TOKENIZERS = frozenset({"cl100k_base", "o200k_base", "auto"})
+_ENV_PROFILE_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def normalize_profile_env_suffix(profile_name: str) -> str:
+    """Normalize a provider profile name for environment variable suffixes."""
+    return _ENV_PROFILE_RE.sub("_", profile_name.upper())
+
+
+def resolve_provider_credential(
+    *,
+    profile_name: str,
+    config_api_key: str | None,
+    environment: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve API key with config-first precedence, then environment fallbacks.
+
+    Order:
+    1. Non-empty ``api_key`` from the selected llm.toml profile
+    2. ``CAPTIONER_LLM_API_KEY_<NORMALIZED_PROFILE>``
+    3. ``CAPTIONER_LLM_API_KEY``
+    4. ``OPENAI_API_KEY``
+    """
+    if isinstance(config_api_key, str) and config_api_key.strip():
+        return config_api_key.strip()
+    env = os.environ if environment is None else environment
+    candidates = (
+        f"CAPTIONER_LLM_API_KEY_{normalize_profile_env_suffix(profile_name)}",
+        "CAPTIONER_LLM_API_KEY",
+        "OPENAI_API_KEY",
+    )
+    for name in candidates:
+        value = env.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -145,8 +183,13 @@ LLMProviderConfig = OpenAICompatibleProvider
 def load_provider_config(
     config_dir_or_file: Path,
     provider_profile: str = "default",
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> OpenAICompatibleProvider:
-    """Load one provider profile from ``llm.toml`` without creating files."""
+    """Load one provider profile from ``llm.toml`` without creating files.
+
+    ``api_key`` may be omitted from TOML when an environment fallback is present.
+    """
     path = _config_path(config_dir_or_file)
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -172,7 +215,6 @@ def load_provider_config(
     try:
         kind = provider["kind"]
         base_url = provider["base_url"]
-        api_key = provider["api_key"]
         model = provider["model"]
         max_concurrency = provider.get("max_concurrency", 4)
         request_timeout_sec = provider.get("request_timeout_sec", 120.0)
@@ -181,7 +223,22 @@ def load_provider_config(
         tokenizer = provider.get("tokenizer", "cl100k_base")
     except KeyError as exc:
         raise AppError("llm.config_invalid", {"field": str(exc.args[0])}) from exc
-    if not all(isinstance(item, str) for item in (kind, base_url, api_key, model)):
+    raw_api_key = provider.get("api_key")
+    config_api_key: str | None
+    if raw_api_key is None:
+        config_api_key = None
+    elif isinstance(raw_api_key, str):
+        config_api_key = raw_api_key.strip() or None
+    else:
+        raise AppError("llm.config_invalid", {"reason": "provider_types"})
+    resolved_key = resolve_provider_credential(
+        profile_name=normalized_profile,
+        config_api_key=config_api_key,
+        environment=environment,
+    )
+    if resolved_key is None:
+        raise AppError("llm.config_invalid", {"field": "api_key"})
+    if not all(isinstance(item, str) for item in (kind, base_url, model)):
         raise AppError("llm.config_invalid", {"reason": "provider_types"})
     if type(max_concurrency) is not int or type(max_retries) is not int:
         raise AppError("llm.config_invalid", {"reason": "retry_types"})
@@ -196,7 +253,7 @@ def load_provider_config(
         normalized_profile,
         cast(str, base_url),
         cast(str, model),
-        ProviderCredential(cast(str, api_key)),
+        ProviderCredential(resolved_key),
         max_concurrency,
         float(request_timeout_sec),
         max_retries,
@@ -209,9 +266,15 @@ def load_provider_config(
 def load_llm_config(
     config_dir_or_file: Path,
     provider_profile: str = "default",
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> OpenAICompatibleProvider:
     """Compatibility spelling for callers that load the selected profile."""
-    return load_provider_config(config_dir_or_file, provider_profile)
+    return load_provider_config(
+        config_dir_or_file,
+        provider_profile,
+        environment=environment,
+    )
 
 
 def normalize_base_url_identity(value: str) -> str:

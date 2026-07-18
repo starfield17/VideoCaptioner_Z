@@ -150,6 +150,8 @@ class DurablePipelineService:
             if (self.control_dir / "cancel-batch").exists():
                 projection = self.acknowledge_cancel_requests(projection, active_job_id=None)
                 raise AppError("operation.cancelled", {"scope": "batch"})
+            if self._pause_requested():
+                return projection
             try:
                 projection = await self._run_job(projection, job.job_id)
             except AppError as exc:
@@ -164,6 +166,8 @@ class DurablePipelineService:
             if (self.control_dir / "cancel-batch").exists():
                 projection = self.acknowledge_cancel_requests(projection, active_job_id=None)
                 break
+            if self._pause_requested():
+                return projection
         return projection
 
     async def resume(self) -> BatchProjection:
@@ -176,6 +180,7 @@ class DurablePipelineService:
         projection = self._invalidate_corrupt_artifacts(projection)
         projection = self.acknowledge_cancel_requests(projection, active_job_id=None)
         self._remove_stale_workspaces()
+        clear_pause_marker(self.control_dir)
         return await self.run(projection)
 
     def read_status(self) -> BatchStatus:
@@ -338,6 +343,9 @@ class DurablePipelineService:
             for name in plan:
                 context.raise_if_cancelled()
                 job = projection.job(job_id)
+                current_stage = job.stage(name)
+                if current_stage.state is not StageState.COMMITTED and self._pause_requested():
+                    return projection
                 runner = _runner_for(self.runners, name, job.config.pipeline_profile.value)
                 plan = stage_plan_for(job.config.pipeline_profile)
                 inputs = tuple(
@@ -491,6 +499,9 @@ class DurablePipelineService:
             (self.control_dir / f"cancel-{job.job_id}").exists() for job in projection.jobs
         )
 
+    def _pause_requested(self) -> bool:
+        return (self.control_dir / "pause-batch").exists()
+
     def acknowledge_cancel_requests(
         self,
         projection: BatchProjection,
@@ -542,6 +553,7 @@ class DurablePipelineService:
         self.manifest.write(projection)
         if batch_requested:
             (self.control_dir / "cancel-batch").unlink(missing_ok=True)
+            clear_pause_marker(self.control_dir)
         for job_id in targeted:
             if projection.job(job_id).state in {
                 JobState.SUCCEEDED,
@@ -553,16 +565,44 @@ class DurablePipelineService:
 
 
 def write_cancel_marker(control_dir: Path, *, job_id: str | None) -> Path:
+    target = control_dir / ("cancel-batch" if job_id is None else f"cancel-{job_id}")
+    return _write_control_marker(
+        control_dir,
+        target=target,
+        payload=b"cancel\n",
+        error_code="batch.cancel_marker_failed",
+    )
+
+
+def write_pause_marker(control_dir: Path) -> Path:
+    return _write_control_marker(
+        control_dir,
+        target=control_dir / "pause-batch",
+        payload=b"pause\n",
+        error_code="batch.pause_marker_failed",
+    )
+
+
+def clear_pause_marker(control_dir: Path) -> None:
+    (control_dir / "pause-batch").unlink(missing_ok=True)
+
+
+def _write_control_marker(
+    control_dir: Path,
+    *,
+    target: Path,
+    payload: bytes,
+    error_code: str,
+) -> Path:
     import os
     import tempfile
 
     control_dir.mkdir(parents=True, exist_ok=True)
-    target = control_dir / ("cancel-batch" if job_id is None else f"cancel-{job_id}")
     descriptor, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=control_dir)
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, "wb") as handle:
-            handle.write(b"cancel\n")
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)
@@ -573,7 +613,7 @@ def write_cancel_marker(control_dir: Path, *, job_id: str | None) -> Path:
             finally:
                 os.close(directory)
     except OSError as exc:
-        raise AppError("batch.cancel_marker_failed") from exc
+        raise AppError(error_code) from exc
     finally:
         temporary.unlink(missing_ok=True)
     return target

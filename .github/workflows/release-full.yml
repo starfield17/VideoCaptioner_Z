@@ -100,6 +100,12 @@ jobs:
         run: |
           set -euo pipefail
           SMOKE_ROOT="$(mktemp -d)"
+          HOME_ROOT="$(mktemp -d)"
+          export HOME="$HOME_ROOT"
+          export XDG_CONFIG_HOME="$HOME_ROOT/config"
+          export XDG_DATA_HOME="$HOME_ROOT/data"
+          export XDG_CACHE_HOME="$HOME_ROOT/cache"
+          export XDG_STATE_HOME="$HOME_ROOT/state"
           cd "$SMOKE_ROOT"
           "$GITHUB_WORKSPACE/dist/captioner/captioner" --cli --help
           "$GITHUB_WORKSPACE/dist/captioner/captioner" --cli doctor --tokenizer-smoke --json
@@ -107,7 +113,8 @@ jobs:
             --cli subtitle-corpus \
             "$GITHUB_WORKSPACE/tests/fixtures/transcripts" \
             --json
-          "$GITHUB_WORKSPACE/dist/captioner/captioner" --gui --smoke-test
+          "$GITHUB_WORKSPACE/dist/captioner/captioner" --gui --lang en --smoke-test
+          "$GITHUB_WORKSPACE/dist/captioner/captioner" --gui --lang zh-CN --smoke-test
       - name: Archive Ubuntu distribution
         run: tar -C dist -czf dist/captioner-linux.tar.gz captioner
       - name: Extract Ubuntu archive
@@ -122,13 +129,20 @@ jobs:
           test -x "$EXTRACTED"
           test -f "$CAPTIONER_EXTRACT_ROOT/captioner/THIRD_PARTY_NOTICES.md"
           SMOKE_ROOT="$(mktemp -d)"
+          HOME_ROOT="$(mktemp -d)"
+          export HOME="$HOME_ROOT"
+          export XDG_CONFIG_HOME="$HOME_ROOT/config"
+          export XDG_DATA_HOME="$HOME_ROOT/data"
+          export XDG_CACHE_HOME="$HOME_ROOT/cache"
+          export XDG_STATE_HOME="$HOME_ROOT/state"
           cd "$SMOKE_ROOT"
           "$EXTRACTED" --cli --help
           "$EXTRACTED" --cli doctor --tokenizer-smoke --json
           "$EXTRACTED" --cli subtitle-corpus \
             "$GITHUB_WORKSPACE/tests/fixtures/transcripts" \
             --json
-          "$EXTRACTED" --gui --smoke-test
+          "$EXTRACTED" --gui --lang en --smoke-test
+          "$EXTRACTED" --gui --lang zh-CN --smoke-test
       - name: Upload Ubuntu archive
         uses: actions/upload-artifact@v4
         with:
@@ -169,12 +183,17 @@ jobs:
         shell: pwsh
         run: |
           $SmokeRoot = Join-Path $env:RUNNER_TEMP ("captioner-prearchive-" + [guid]::NewGuid())
+          $HomeRoot = Join-Path $env:RUNNER_TEMP ("captioner-home-" + [guid]::NewGuid())
           New-Item -ItemType Directory -Force -Path $SmokeRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path $HomeRoot | Out-Null
+          $env:USERPROFILE = $HomeRoot
+          $env:HOME = $HomeRoot
           Set-Location $SmokeRoot
           & "$env:GITHUB_WORKSPACE\dist\captioner\captioner.exe" --cli --help
           & "$env:GITHUB_WORKSPACE\dist\captioner\captioner.exe" --cli doctor --tokenizer-smoke --json
           & "$env:GITHUB_WORKSPACE\dist\captioner\captioner.exe" --cli subtitle-corpus "$env:GITHUB_WORKSPACE\tests\fixtures\transcripts" --json
-          & "$env:GITHUB_WORKSPACE\dist\captioner\captioner.exe" --gui --smoke-test
+          & "$env:GITHUB_WORKSPACE\dist\captioner\captioner.exe" --gui --lang en --smoke-test
+          & "$env:GITHUB_WORKSPACE\dist\captioner\captioner.exe" --gui --lang zh-CN --smoke-test
       - name: Archive Windows distribution
         shell: pwsh
         run: |
@@ -200,12 +219,17 @@ jobs:
           if (-not (Test-Path (Join-Path $ExtractedRoot "resources\tokenizers\cl100k_base.tiktoken"))) { throw "missing extracted cl100k_base" }
           if (-not (Test-Path (Join-Path $ExtractedRoot "resources\tokenizers\o200k_base.tiktoken"))) { throw "missing extracted o200k_base" }
           $SmokeRoot = Join-Path $env:RUNNER_TEMP ("captioner-postarchive-" + [guid]::NewGuid())
+          $HomeRoot = Join-Path $env:RUNNER_TEMP ("captioner-home-post-" + [guid]::NewGuid())
           New-Item -ItemType Directory -Force -Path $SmokeRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path $HomeRoot | Out-Null
+          $env:USERPROFILE = $HomeRoot
+          $env:HOME = $HomeRoot
           Set-Location $SmokeRoot
           & $Extracted --cli --help
           & $Extracted --cli doctor --tokenizer-smoke --json
           & $Extracted --cli subtitle-corpus "$env:GITHUB_WORKSPACE\tests\fixtures\transcripts" --json
-          & $Extracted --gui --smoke-test
+          & $Extracted --gui --lang en --smoke-test
+          & $Extracted --gui --lang zh-CN --smoke-test
       - name: Upload Windows archive
         uses: actions/upload-artifact@v4
         with:
@@ -245,6 +269,8 @@ jobs:
         run: |
           set -euo pipefail
           SMOKE_ROOT="$(mktemp -d)"
+          HOME_ROOT="$(mktemp -d)"
+          export HOME="$HOME_ROOT"
           cd "$SMOKE_ROOT"
           "$GITHUB_WORKSPACE/dist/Captioner.app/Contents/MacOS/captioner" --cli --help
           "$GITHUB_WORKSPACE/dist/Captioner.app/Contents/MacOS/captioner" --cli doctor --tokenizer-smoke --json
@@ -252,7 +278,8 @@ jobs:
             --cli subtitle-corpus \
             "$GITHUB_WORKSPACE/tests/fixtures/transcripts" \
             --json
-          "$GITHUB_WORKSPACE/dist/Captioner.app/Contents/MacOS/captioner" --gui --smoke-test
+          "$GITHUB_WORKSPACE/dist/Captioner.app/Contents/MacOS/captioner" --gui --lang en --smoke-test
+          "$GITHUB_WORKSPACE/dist/Captioner.app/Contents/MacOS/captioner" --gui --lang zh-CN --smoke-test
       - name: Archive macOS distribution
         run: |
           ditto -c -k --sequesterRsrc --keepParent \
@@ -270,13 +297,16 @@ jobs:
           test -x "$EXTRACTED"
           test -f "$CAPTIONER_EXTRACT_ROOT/Captioner.app/Contents/Resources/THIRD_PARTY_NOTICES.md"
           SMOKE_ROOT="$(mktemp -d)"
+          HOME_ROOT="$(mktemp -d)"
+          export HOME="$HOME_ROOT"
           cd "$SMOKE_ROOT"
           "$EXTRACTED" --cli --help
           "$EXTRACTED" --cli doctor --tokenizer-smoke --json
           "$EXTRACTED" --cli subtitle-corpus \
             "$GITHUB_WORKSPACE/tests/fixtures/transcripts" \
             --json
-          "$EXTRACTED" --gui --smoke-test
+          "$EXTRACTED" --gui --lang en --smoke-test
+          "$EXTRACTED" --gui --lang zh-CN --smoke-test
       - name: Upload macOS archive
         uses: actions/upload-artifact@v4
         with:

@@ -19,17 +19,26 @@ uv run python scripts/check.py --full
 uv run python main.py --cli --help
 uv run python main.py --cli run --help
 uv run python main.py --cli doctor --json
-QT_QPA_PLATFORM=offscreen uv run python main.py --gui --smoke-test
+QT_QPA_PLATFORM=offscreen uv run captioner-gui --lang en --smoke-test
+QT_QPA_PLATFORM=offscreen uv run captioner-gui --lang zh-CN --smoke-test
 uv run python scripts/build_nuitka.py --clean --version 0.0.0
 ```
 
+Phase 5 desktop workflow pages: Create, Queue, History, Settings, and
+Diagnostics. English and Simplified Chinese catalogs are required. Diagnostics
+exports a redacted aggregate ZIP (no credentials, media paths, source text, or
+subtitles). Overall branch coverage hard floor is 80%; 85% remains an
+engineering target.
+
 Compiled smoke tests must run from a temporary working directory outside the
 repository so a broken resource resolver cannot use `resources/` from the
-source tree. The Release Full Gate archives and then extracts the exact tested
-outputs: Linux `captioner-linux.tar.gz`, Windows `captioner-windows.zip`, and
-macOS `Captioner-macos.zip` containing `Captioner.app`. These are portable
-artifacts; the project does not sign or notarize them, create an installer, or
-publish a GitHub Release automatically.
+source tree. Packaged GUI smoke also uses isolated temporary home/config
+directories and both `--lang en` and `--lang zh-CN`. The Release Full Gate
+archives and then extracts the exact tested outputs: Linux
+`captioner-linux.tar.gz`, Windows `captioner-windows.zip`, and macOS
+`Captioner-macos.zip` containing `Captioner.app`. These are portable artifacts;
+the project does not sign or notarize them, create an installer, or publish a
+GitHub Release automatically.
 
 FFmpeg and FFprobe must be available on `PATH` for a real run. Faster Whisper
 is optional and is installed separately:

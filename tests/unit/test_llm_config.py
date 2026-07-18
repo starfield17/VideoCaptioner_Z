@@ -103,12 +103,45 @@ def test_credential_rejects_empty_value() -> None:
     ],
 )
 def test_provider_file_rejects_malformed_or_incomplete_profiles(
-    tmp_path: Path, content: str
+    tmp_path: Path, content: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "llm.toml"
     write_llm_config(path, content)
+    monkeypatch.delenv("CAPTIONER_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("CAPTIONER_LLM_API_KEY_DEFAULT", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with pytest.raises(AppError, match=r"llm\.(config_invalid|provider_not_found)"):
-        load_provider_config(path)
+        load_provider_config(path, environment={})
+
+
+def test_provider_config_accepts_environment_fallback(
+    tmp_path: Path,
+) -> None:
+    write_llm_config(
+        tmp_path / "llm.toml",
+        (
+            '[providers.default]\nkind = "openai-compatible"\n'
+            'base_url = "https://example.com/v1"\nmodel = "model"\n'
+        ),
+    )
+    provider = load_provider_config(
+        tmp_path,
+        environment={"CAPTIONER_LLM_API_KEY": "from-env"},
+    )
+    assert provider.api_key == "from-env"
+    assert "from-env" not in repr(provider)
+
+
+def test_config_api_key_wins_over_environment(tmp_path: Path) -> None:
+    write_llm_config(tmp_path / "llm.toml", _TOML)
+    provider = load_provider_config(
+        tmp_path,
+        environment={
+            "CAPTIONER_LLM_API_KEY": "env-key",
+            "OPENAI_API_KEY": "openai-key",
+        },
+    )
+    assert provider.api_key == "unit-test-key"
 
 
 def test_empty_config_write_is_rejected_and_url_identity_is_normalized() -> None:
