@@ -12,6 +12,8 @@ from captioner.core.domain.worker_protocol import (
     WORKER_PROTOCOL_VERSION,
     CancelAcknowledged,
     CancelRequest,
+    DoctorRequest,
+    DoctorResponse,
     HandshakeRequest,
     JsonlProtocolCodec,
     OperationCancelled,
@@ -62,6 +64,12 @@ def _envelope(message_type: str) -> WorkerEnvelope:
         ).to_payload(),
         WorkerMessageType.SHUTDOWN_REQUEST.value: ShutdownRequest().to_payload(),
         WorkerMessageType.SHUTDOWN_ACKNOWLEDGED.value: ShutdownAcknowledged(True).to_payload(),
+        WorkerMessageType.DOCTOR_REQUEST.value: DoctorRequest(
+            "nonce-1", "doctor-probe.json"
+        ).to_payload(),
+        WorkerMessageType.DOCTOR_RESPONSE.value: DoctorResponse(
+            "nonce-1", True, "cpu", result_descriptor()
+        ).to_payload(),
     }
     payload = payload_by_type[message_type]
     kwargs: dict[str, str] = {}

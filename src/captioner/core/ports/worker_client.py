@@ -9,6 +9,8 @@ from typing import Protocol
 from captioner.core.domain.runtime import RuntimeInstallation
 from captioner.core.domain.worker_protocol import (
     CancelResult,
+    DoctorRequest,
+    DoctorResponse,
     HandshakeRequest,
     ShutdownResult,
     TranscribeRequest,
@@ -30,6 +32,8 @@ class WorkerClient(Protocol):
     def transcribe(self, request: TranscribeRequest) -> AsyncIterator[WorkerEvent]: ...
 
     async def cancel(self, request_id: str) -> CancelResult: ...
+
+    async def doctor(self, request: DoctorRequest) -> DoctorResponse: ...
 
     async def shutdown(self) -> ShutdownResult: ...
 
