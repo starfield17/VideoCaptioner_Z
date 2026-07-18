@@ -7,6 +7,7 @@ from typing import Protocol
 from captioner.core.domain.model import (
     ModelSourceCandidate,
     ModelSourceCapabilities,
+    ModelSourceReference,
 )
 
 
@@ -19,7 +20,7 @@ class ModelSource(Protocol):
 
     def resolve_exact(
         self, repository_id: str, revision: str, backend_id: str
-    ) -> ModelSourceCandidate | None: ...
+    ) -> ModelSourceReference | None: ...
 
 
 ModelSourcePort = ModelSource

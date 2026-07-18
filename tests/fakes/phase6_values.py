@@ -186,7 +186,7 @@ def model_installation(
     display_name: str = "large-v3",
     state: ModelState = ModelState.INSTALLED,
     managed: bool | None = None,
-    load_verified: bool = False,
+    load_verified: bool | None = None,
     source_metadata: Mapping[str, JsonValue] | None = None,
     description: str = "",
     required_capabilities: tuple[str, ...] = (),

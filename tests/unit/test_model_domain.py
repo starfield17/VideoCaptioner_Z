@@ -8,10 +8,15 @@ from tests.fakes.phase6_values import model_installation, model_manifest
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.model import (
+    LocalModelInspection,
     ModelFileEntry,
     ModelIdentity,
     ModelManifest,
+    ModelSourceCandidate,
+    ModelSourceReference,
     ModelState,
+    ModelValidationCheck,
+    ModelValidationReport,
     compute_model_manifest_sha256,
     model_manifest_digest_payload,
     required_files_for_format,
@@ -90,6 +95,89 @@ def test_managed_and_external_delete_semantics_are_separate() -> None:
     assert not external.is_load_verified
     verified = model_installation(state=ModelState.LOAD_VERIFIED)
     assert verified.is_load_verified
+
+
+@pytest.mark.parametrize(
+    ("state", "load_verified", "validation_passed"),
+    [
+        (ModelState.INSTALLED, False, False),
+        (ModelState.LOAD_VERIFIED, False, False),
+        (ModelState.INSTALLED, True, None),
+        (ModelState.STAGED, True, None),
+        (ModelState.FAILED, False, True),
+    ],
+)
+def test_model_installation_rejects_contradictory_state_flags(
+    state: ModelState,
+    load_verified: bool,
+    validation_passed: bool | None,
+) -> None:
+    with pytest.raises(AppError, match=r"model\.installation_invalid"):
+        model_installation(
+            state=state,
+            load_verified=load_verified,
+            validation_passed=validation_passed,
+        )
+
+
+def test_validated_external_model_can_be_load_verified_without_managed_delete() -> None:
+    external = model_installation(
+        state=ModelState.EXTERNAL_UNMANAGED,
+        managed=False,
+        load_verified=True,
+        validation_passed=True,
+    )
+    assert external.is_validated
+    assert external.is_load_verified
+    assert not external.can_delete_files
+
+
+def test_source_candidate_and_resolved_reference_do_not_contain_final_identity() -> None:
+    candidate = ModelSourceCandidate(
+        source_id="huggingface",
+        repository_id="org/model",
+        revision=None,
+        backend_id="faster-whisper",
+        model_format_hint="faster-whisper-ct2",
+        display_name="large-v3",
+    )
+    reference = ModelSourceReference(
+        source_id="huggingface",
+        repository_id="org/model",
+        revision="revision-a",
+        backend_id="faster-whisper",
+        model_format_hint="faster-whisper-ct2",
+    )
+    assert candidate.revision is None
+    assert reference.revision == "revision-a"
+    assert "manifest_sha256" not in candidate.to_dict()
+    assert "manifest_sha256" not in reference.to_dict()
+    assert "/" not in repr(reference).split("repository_id=")[0]
+
+
+def test_local_inspection_keeps_validation_and_format_projection_separate() -> None:
+    inspection = LocalModelInspection(
+        detected_backend_id="mlx-whisper",
+        detected_model_format="mlx-whisper",
+        required_files_present=True,
+        file_inventory=(ModelFileEntry("config.json", 1, "b" * 64),),
+        validation_report=ModelValidationReport(
+            False,
+            (
+                ModelValidationCheck(
+                    "weights",
+                    False,
+                    error_code="model.mlx_required_files",
+                    message_code="model.mlx_required_files",
+                ),
+            ),
+            error_code="model.mlx_required_files",
+            message_code="model.mlx_required_files",
+        ),
+        display_name_suggestion="large-v3",
+    )
+    assert inspection.files == inspection.file_inventory
+    assert not inspection.validation_passed
 
 
 def test_model_file_rejects_path_traversal() -> None:

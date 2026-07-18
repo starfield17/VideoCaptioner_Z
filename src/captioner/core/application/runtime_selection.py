@@ -10,7 +10,7 @@ from typing import cast
 from captioner.core.application.model_compatibility import check_model_compatibility
 from captioner.core.domain.asr_backend import DeviceKind
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.model import ModelIdentity, ModelInstallation, ModelManifest, ModelState
+from captioner.core.domain.model import ModelIdentity, ModelInstallation, ModelState
 from captioner.core.domain.runtime import (
     SUPPORTED_RUNTIME_ARCHITECTURES,
     SUPPORTED_RUNTIME_PLATFORMS,
@@ -104,7 +104,7 @@ def select_runtime(
     requested_device: str = "auto",
     host: HostFacts,
     active_runtimes: Sequence[RuntimeInstallation],
-    model: ModelInstallation | ModelManifest,
+    model: ModelInstallation,
 ) -> RuntimeSelection:
     """Select a compatible available Runtime without side effects."""
     result = try_select_runtime(
@@ -128,7 +128,7 @@ def try_select_runtime(
     requested_device: str = "auto",
     host: HostFacts,
     active_runtimes: Sequence[RuntimeInstallation],
-    model: ModelInstallation | ModelManifest,
+    model: ModelInstallation,
 ) -> RuntimeSelectionResult:
     """Return a typed failure rather than installing, downloading, or mutating state."""
     raw_backend_id = cast(object, requested_backend_id)
@@ -147,10 +147,10 @@ def try_select_runtime(
         DeviceKind.METAL.value,
     }:
         return _failure("requested_device_invalid")
-    model_result = _validate_model_for_selection(model)
+    model_result = _validate_model_for_selection(cast(object, model))
     if model_result is not None:
         return _failure(model_result)
-    model_manifest = model.manifest if isinstance(model, ModelInstallation) else model
+    model_manifest = model.manifest
     model_backend = model_manifest.identity.backend_id
     if requested_backend_id != "auto" and requested_backend_id != model_backend:
         return _failure("explicit_backend_model_mismatch")
@@ -286,9 +286,9 @@ def _failure_with_code(reason: str, error_code: str) -> RuntimeSelectionResult:
     )
 
 
-def _validate_model_for_selection(model: ModelInstallation | ModelManifest) -> str | None:
+def _validate_model_for_selection(model: object) -> str | None:
     if not isinstance(model, ModelInstallation):
-        return None
+        return "model_not_installed"
     if model.state is ModelState.STAGED:
         return "model_not_installed"
     if model.state is ModelState.FAILED:
@@ -301,6 +301,8 @@ def _validate_model_for_selection(model: ModelInstallation | ModelManifest) -> s
         ModelState.EXTERNAL_UNMANAGED,
     }:
         return "model_not_installed"
+    if not model.is_validated:
+        return "model_not_validated"
     return None
 
 

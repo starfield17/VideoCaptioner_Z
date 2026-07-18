@@ -84,6 +84,21 @@ class BackendCapability:
         object.__setattr__(self, "supported_model_formats", formats)
         object.__setattr__(self, "additional_capabilities", additional)
 
+    @property
+    def advertised_capabilities(self) -> frozenset[str]:
+        """Return the capability names this manifest promises to its Worker."""
+        values = {
+            capability
+            for capability, advertised in (
+                ("word_timestamps", self.word_timestamps),
+                ("language_detection", self.language_detection),
+                ("translation_task", self.translation_task),
+            )
+            if advertised
+        }
+        values.update(self.additional_capabilities)
+        return frozenset(values)
+
 
 def _require_text(value: object, field: str) -> None:
     if not isinstance(value, str) or not value.strip() or value != value.strip():

@@ -59,6 +59,17 @@ name while remaining different identities. A local absolute path never enters
 the durable identity; it belongs only to an installation record or a single
 Worker request.
 
+Search results use `ModelSourceCandidate`, which contains safe display and
+repository metadata and may have no revision yet. Exact resolution returns a
+`ModelSourceReference` with an immutable revision. Neither type contains a
+local directory or `manifest_sha256`, and neither is a durable Job model
+identity. A final identity is created only after revision resolution,
+materialization/import, file inventory, validation, and canonical Manifest
+digest computation. `LocalModelInspector` is the separate Port for directories
+that do not have a Captioner Manifest yet; its inspection projection carries
+detection and validation results, while local import and external-path
+registration remain later Model Manager work.
+
 Managed models may be removed by a later repository implementation. External
 models are advanced-mode references: Captioner does not copy or delete their
 files. `installed` means file, size, hash, and manifest verification passed;

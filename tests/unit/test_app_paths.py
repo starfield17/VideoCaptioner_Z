@@ -140,8 +140,12 @@ def test_default_platformdirs_paths_are_not_bundle_relative() -> None:
     assert paths.data_dir != paths.resource_root
 
 
-def test_platformdirs_macos_paths_keep_config_and_data_namespaces_separate() -> None:
-    paths = resolve_app_paths(platform_name="darwin")
+def test_platformdirs_macos_paths_keep_config_and_data_namespaces_separate(
+    tmp_path: Path,
+) -> None:
+    # Inject the home seam so this cross-platform shape test does not depend on
+    # the runner's actual operating system.
+    paths = resolve_app_paths(platform_name="darwin", home_dir=tmp_path / "home")
     assert paths.config_dir.name == "config"
     assert paths.data_dir.name == "data"
     assert paths.config_dir.parent == paths.data_dir.parent

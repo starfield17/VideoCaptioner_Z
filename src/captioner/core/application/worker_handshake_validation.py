@@ -74,7 +74,9 @@ def validate_worker_handshake(
     ):
         reasons.append("required_backend_mismatch")
     advertised_capabilities = set(worker_handshake.capabilities)
-    for required in handshake_request.required_capabilities:
+    required_capabilities = _manifest_capabilities(runtime_manifest)
+    required_capabilities.update(handshake_request.required_capabilities)
+    for required in sorted(required_capabilities):
         if required not in advertised_capabilities:
             reasons.append(f"missing_capability:{required}")
     advertised_schemas = set(worker_handshake.supported_result_schema_versions)
@@ -96,6 +98,10 @@ def validate_worker_handshake(
             reasons=unique_reasons,
         )
     return HandshakeValidationResult(ok=True)
+
+
+def _manifest_capabilities(runtime_manifest: RuntimeManifest) -> set[str]:
+    return set(runtime_manifest.capabilities.advertised_capabilities)
 
 
 def _backend_version_compatible(expected: str, actual: str) -> bool:

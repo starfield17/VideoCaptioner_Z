@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from tests.fakes.fake_local_model_inspector import FakeLocalModelInspector
 from tests.fakes.fake_model_source import FakeModelSource
 from tests.fakes.fake_runtime_doctor import FakeRuntimeDoctor
 from tests.fakes.in_memory_model_repository import InMemoryModelRepository
@@ -20,7 +21,14 @@ from tests.fakes.phase6_values import (
 from tests.fakes.scripted_worker_client import ScriptedWorkerClient
 
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.model import ModelSourceCandidate, ModelState
+from captioner.core.domain.model import (
+    LocalModelInspection,
+    ModelSourceCandidate,
+    ModelSourceReference,
+    ModelState,
+    ModelValidationCheck,
+    ModelValidationReport,
+)
 from captioner.core.domain.operation_progress import OperationProgress
 from captioner.core.domain.runtime import DoctorCheck, DoctorPhase, DoctorReport, RuntimeState
 from captioner.core.domain.worker_protocol import (
@@ -37,6 +45,7 @@ def test_phase6_core_layers_do_not_import_adapters() -> None:
         "captioner.core.domain.worker_protocol",
         "captioner.core.ports.runtime_repository",
         "captioner.core.ports.worker_client",
+        "captioner.core.ports.local_model_inspector",
         "captioner.core.application.runtime_selection",
         "captioner.core.application.model_compatibility",
         "captioner.core.application.worker_handshake_validation",
@@ -114,18 +123,104 @@ def test_model_repository_preserves_external_delete_boundary() -> None:
 
 
 def test_modelscope_source_supports_exact_lookup_but_not_search() -> None:
-    candidate = model_installation().manifest
+    candidate = ModelSourceCandidate(
+        source_id="modelscope",
+        repository_id="org/model",
+        revision=None,
+        backend_id="faster-whisper",
+        model_format_hint="faster-whisper-ct2",
+        display_name="large-v3",
+    )
+    reference = ModelSourceReference(
+        source_id="modelscope",
+        repository_id=candidate.repository_id,
+        revision="revision-a",
+        backend_id=candidate.backend_id,
+        model_format_hint=candidate.model_format_hint,
+    )
     source = FakeModelSource(
         "modelscope",
         search_supported=False,
-        exact_results=(ModelSourceCandidate(candidate.identity, candidate.display_name),),
+        exact_results=(reference,),
     )
     assert not source.capabilities().search
     with pytest.raises(AppError, match=r"model\.source_search_unsupported"):
         source.search("model", "faster-whisper", 10)
-    assert source.resolve_exact(
-        candidate.identity.repository_id, candidate.identity.revision, "faster-whisper"
+    assert source.resolve_exact(reference.repository_id, reference.revision, reference.backend_id)
+
+
+def test_huggingface_source_search_returns_revision_optional_candidates() -> None:
+    candidate = ModelSourceCandidate(
+        source_id="huggingface",
+        repository_id="org/model",
+        revision=None,
+        backend_id="faster-whisper",
+        model_format_hint="faster-whisper-ct2",
+        display_name="large-v3",
     )
+    source = FakeModelSource(
+        "huggingface",
+        search_supported=True,
+        search_results=(candidate,),
+    )
+    assert source.search("model", "faster-whisper", 10) == (candidate,)
+    assert candidate.revision is None
+
+
+def test_model_source_candidate_is_search_projection_not_model_identity() -> None:
+    candidate = ModelSourceCandidate(
+        source_id="huggingface",
+        repository_id="org/model",
+        revision=None,
+        backend_id="faster-whisper",
+        model_format_hint="faster-whisper-ct2",
+        display_name="large-v3",
+    )
+    assert candidate.revision is None
+    assert "manifest_sha256" not in candidate.to_dict()
+    assert "identity" not in candidate.to_dict()
+
+
+def test_local_model_inspector_is_a_callable_boundary_without_durable_path_identity() -> None:
+    report = ModelValidationReport(True, (ModelValidationCheck("files", True),))
+    inspection = LocalModelInspection(
+        detected_backend_id="faster-whisper",
+        detected_model_format="faster-whisper-ct2",
+        required_files_present=True,
+        file_inventory=(),
+        validation_report=report,
+        display_name_suggestion="large-v3",
+    )
+    inspector = FakeLocalModelInspector(inspection)
+    local_path = Path("/private/external-model")
+    assert inspector.inspect(local_path).validation_passed
+    assert inspector.calls == [(local_path, None, None)]
+    assert "/private/external-model" not in repr(inspection)
+
+
+def test_unknown_local_model_format_is_a_typed_validation_failure() -> None:
+    report = ModelValidationReport(
+        False,
+        (
+            ModelValidationCheck(
+                "model_format",
+                False,
+                error_code="model.format_unknown",
+                message_code="model.format_unknown",
+            ),
+        ),
+        error_code="model.format_unknown",
+        message_code="model.format_unknown",
+    )
+    inspection = LocalModelInspection(
+        detected_backend_id=None,
+        detected_model_format=None,
+        required_files_present=False,
+        file_inventory=(),
+        validation_report=report,
+    )
+    assert not inspection.validation_passed
+    assert inspection.validation_report.error_code == "model.format_unknown"
 
 
 def test_fake_runtime_doctor_exposes_static_and_activation_reports() -> None:

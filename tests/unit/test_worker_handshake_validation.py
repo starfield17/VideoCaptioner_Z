@@ -92,6 +92,42 @@ def test_handshake_required_capability_and_schema_are_checked() -> None:
     assert "missing_result_schema_version:2" in result.reasons
 
 
+def test_empty_request_cannot_bypass_runtime_manifest_capabilities() -> None:
+    runtime_manifest, _, handshake = _valid()
+    result = validate_worker_handshake(
+        runtime_manifest,
+        HandshakeRequest(),
+        replace(handshake, capabilities=("word_timestamps",)),
+    )
+    assert not result.ok
+    assert "missing_capability:language_detection" in result.reasons
+    assert "missing_capability:translation_task" in result.reasons
+
+
+def test_manifest_additional_capabilities_are_required() -> None:
+    runtime = runtime_installation(additional_capabilities=("diarization",))
+    result = validate_worker_handshake(
+        runtime.manifest,
+        HandshakeRequest(),
+        worker_handshake(),
+    )
+    assert not result.ok
+    assert "missing_capability:diarization" in result.reasons
+
+
+def test_worker_may_advertise_capabilities_beyond_manifest_requirements() -> None:
+    runtime_manifest, request, handshake = _valid()
+    result = validate_worker_handshake(
+        runtime_manifest,
+        request,
+        replace(
+            handshake,
+            capabilities=(*handshake.capabilities, "future_capability"),
+        ),
+    )
+    assert result.ok
+
+
 def test_handshake_advertised_device_and_model_format_are_required() -> None:
     runtime_manifest, request, handshake = _valid()
     result = validate_worker_handshake(

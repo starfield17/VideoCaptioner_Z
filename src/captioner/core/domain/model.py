@@ -374,7 +374,7 @@ class ModelInstallation:
     model_directory: Path
     state: ModelState = ModelState.STAGED
     managed: bool | None = None
-    load_verified: bool = False
+    load_verified: bool | None = None
     validation_passed: bool | None = None
 
     def __post_init__(self) -> None:
@@ -382,32 +382,56 @@ class ModelInstallation:
             raise AppError("model.installation_invalid", {"field": "identity"})
         if not self.model_directory.is_absolute():
             raise AppError("model.installation_invalid", {"field": "model_directory"})
+        if not isinstance(cast(object, self.state), ModelState):
+            raise AppError("model.installation_invalid", {"field": "state"})
         managed = (
             self.state is not ModelState.EXTERNAL_UNMANAGED
             if self.managed is None
             else self.managed
         )
-        if type(managed) is not bool or type(self.load_verified) is not bool:
+        if type(managed) is not bool:
             raise AppError("model.installation_invalid", {"field": "ownership"})
+        if self.load_verified is not None and type(self.load_verified) is not bool:
+            raise AppError("model.installation_invalid", {"field": "load_verified"})
         if self.validation_passed is not None and type(self.validation_passed) is not bool:
             raise AppError("model.installation_invalid", {"field": "validation_passed"})
-        if managed and self.state is ModelState.EXTERNAL_UNMANAGED:
+        expected_managed = self.state is not ModelState.EXTERNAL_UNMANAGED
+        if managed != expected_managed:
             raise AppError("model.installation_invalid", {"field": "managed"})
-        if not managed and self.state is not ModelState.EXTERNAL_UNMANAGED:
-            raise AppError("model.installation_invalid", {"field": "state"})
-        verified = self.state is ModelState.LOAD_VERIFIED or self.load_verified
+        if self.state is ModelState.LOAD_VERIFIED:
+            if self.load_verified is False:
+                raise AppError("model.installation_invalid", {"field": "load_verified"})
+            verified = True
+        else:
+            verified = False if self.load_verified is None else self.load_verified
+        if (
+            self.state
+            in {
+                ModelState.STAGED,
+                ModelState.INSTALLED,
+                ModelState.FAILED,
+            }
+            and verified
+        ):
+            raise AppError("model.installation_invalid", {"field": "load_verified"})
         validation_passed = (
             self.state in {ModelState.INSTALLED, ModelState.LOAD_VERIFIED}
             if self.validation_passed is None
             else self.validation_passed
         )
+        if self.state in {ModelState.INSTALLED, ModelState.LOAD_VERIFIED} and not validation_passed:
+            raise AppError("model.installation_invalid", {"field": "validation_passed"})
+        if self.state in {ModelState.STAGED, ModelState.FAILED} and validation_passed:
+            raise AppError("model.installation_invalid", {"field": "validation_passed"})
+        if self.state is ModelState.EXTERNAL_UNMANAGED and verified and not validation_passed:
+            raise AppError("model.installation_invalid", {"field": "validation_passed"})
         object.__setattr__(self, "managed", managed)
         object.__setattr__(self, "load_verified", verified)
         object.__setattr__(self, "validation_passed", validation_passed)
 
     @property
     def is_load_verified(self) -> bool:
-        return self.load_verified
+        return self.load_verified is True
 
     @property
     def is_validated(self) -> bool:
@@ -430,16 +454,63 @@ class ModelSourceCapabilities:
 
 @dataclass(frozen=True, slots=True)
 class ModelSourceCandidate:
-    """Safe source metadata returned by search or exact resolution."""
+    """Search metadata that is not yet a durable model identity."""
 
-    identity: ModelIdentity
+    source_id: str
+    repository_id: str
+    revision: str | None
+    backend_id: str
+    model_format_hint: str | None
     display_name: str
     description: str = ""
 
     def __post_init__(self) -> None:
+        _require_text(self.source_id, "source_id", "model.source_result_invalid")
+        _require_repository_id(self.repository_id, "model.source_result_invalid")
+        _optional_source_text(self.revision, "revision")
+        _require_text(self.backend_id, "backend_id", "model.source_result_invalid")
+        _optional_source_text(self.model_format_hint, "model_format_hint")
         _require_text(self.display_name, "display_name", "model.source_result_invalid")
         if self.description and self.description != self.description.strip():
             raise AppError("model.source_result_invalid", {"field": "description"})
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "source_id": self.source_id,
+            "repository_id": self.repository_id,
+            "revision": self.revision,
+            "backend_id": self.backend_id,
+            "model_format_hint": self.model_format_hint,
+            "display_name": self.display_name,
+            "description": self.description,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSourceReference:
+    """Immutable source reference returned after exact revision resolution."""
+
+    source_id: str
+    repository_id: str
+    revision: str
+    backend_id: str
+    model_format_hint: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.source_id, "source_id", "model.source_result_invalid")
+        _require_repository_id(self.repository_id, "model.source_result_invalid")
+        _require_text(self.revision, "revision", "model.source_result_invalid")
+        _require_text(self.backend_id, "backend_id", "model.source_result_invalid")
+        _optional_source_text(self.model_format_hint, "model_format_hint")
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "source_id": self.source_id,
+            "repository_id": self.repository_id,
+            "revision": self.revision,
+            "backend_id": self.backend_id,
+            "model_format_hint": self.model_format_hint,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,6 +554,45 @@ class ModelValidationReport:
         object.__setattr__(self, "details", _freeze_metadata(self.details))
 
 
+@dataclass(frozen=True, slots=True)
+class LocalModelInspection:
+    """Safe projection for inspecting a local model directory before import."""
+
+    detected_backend_id: str | None
+    detected_model_format: str | None
+    required_files_present: bool
+    file_inventory: tuple[ModelFileEntry, ...]
+    validation_report: ModelValidationReport
+    display_name_suggestion: str | None = None
+
+    def __post_init__(self) -> None:
+        _optional_source_text(self.detected_backend_id, "detected_backend_id")
+        _optional_source_text(self.detected_model_format, "detected_model_format")
+        if type(self.required_files_present) is not bool:
+            raise AppError("model.local_inspection_invalid", {"field": "required_files_present"})
+        inventory = tuple(self.file_inventory)
+        if any(not isinstance(cast(object, entry), ModelFileEntry) for entry in inventory):
+            raise AppError("model.local_inspection_invalid", {"field": "file_inventory"})
+        if len({entry.relative_path for entry in inventory}) != len(inventory):
+            raise AppError(
+                "model.local_inspection_invalid",
+                {"field": "file_inventory", "reason": "duplicate"},
+            )
+        if not isinstance(cast(object, self.validation_report), ModelValidationReport):
+            raise AppError("model.local_inspection_invalid", {"field": "validation_report"})
+        _optional_source_text(self.display_name_suggestion, "display_name_suggestion")
+        object.__setattr__(self, "file_inventory", inventory)
+
+    @property
+    def files(self) -> tuple[ModelFileEntry, ...]:
+        """Compatibility alias for callers that call the inventory ``files``."""
+        return self.file_inventory
+
+    @property
+    def validation_passed(self) -> bool:
+        return self.validation_report.ok
+
+
 def required_files_for_format(model_format: str) -> tuple[frozenset[str], ...]:
     """Return alternative required-file groups for one model format."""
     if model_format == "mlx-whisper":
@@ -512,8 +622,8 @@ def _required_string(value: Mapping[object, object], field: str) -> str:
     return item
 
 
-def _require_repository_id(value: object) -> None:
-    _require_text(value, "repository_id", "model.identity_invalid")
+def _require_repository_id(value: object, code: str = "model.identity_invalid") -> None:
+    _require_text(value, "repository_id", code)
     assert isinstance(value, str)
     if (
         "\\" in value
@@ -523,7 +633,7 @@ def _require_repository_id(value: object) -> None:
         or PureWindowsPath(value).drive
         or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
-        raise AppError("model.identity_invalid", {"field": "repository_id"})
+        raise AppError(code, {"field": "repository_id"})
 
 
 def _require_sha256(value: object, field: str, code: str) -> None:
@@ -547,6 +657,11 @@ def _validate_relative_posix_path(value: object) -> None:
 def _optional_text(value: object, field: str) -> None:
     if value is not None:
         _require_text(value, field, "model.manifest_invalid")
+
+
+def _optional_source_text(value: object, field: str) -> None:
+    if value is not None:
+        _require_text(value, field, "model.source_result_invalid")
 
 
 def _freeze_metadata(value: object) -> Mapping[str, JsonValue]:
@@ -585,6 +700,7 @@ def _contains_sensitive_key(value: object) -> bool:
 
 
 __all__ = [
+    "LocalModelInspection",
     "ModelFile",
     "ModelFileEntry",
     "ModelIdentity",
@@ -594,6 +710,7 @@ __all__ = [
     "ModelSourceCandidate",
     "ModelSourceCapabilities",
     "ModelSourceKind",
+    "ModelSourceReference",
     "ModelState",
     "ModelStatus",
     "ModelValidationCheck",

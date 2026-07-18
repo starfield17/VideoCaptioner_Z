@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 from tests.fakes.phase6_values import model_installation, runtime_installation
 
@@ -9,7 +11,7 @@ from captioner.core.application.runtime_selection import (
     try_select_runtime,
 )
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.model import ModelState
+from captioner.core.domain.model import ModelInstallation, ModelState
 from captioner.core.domain.runtime import RuntimeState, RuntimeTarget
 
 
@@ -265,6 +267,35 @@ def test_selector_requires_external_model_validation() -> None:
     )
     assert not result.ok
     assert result.reasons == ("model_not_validated",)
+
+
+def test_selector_accepts_validated_external_model() -> None:
+    selection = select_runtime(
+        host=_host(),
+        active_runtimes=(_faster_runtime(),),
+        model=model_installation(
+            state=ModelState.EXTERNAL_UNMANAGED,
+            managed=False,
+            validation_passed=True,
+        ),
+    )
+    assert selection.effective_backend_id == "faster-whisper"
+
+
+def test_selector_rejects_bare_manifest_before_effective_selection() -> None:
+    result = try_select_runtime(
+        host=_host(),
+        active_runtimes=(_faster_runtime(),),
+        model=cast(ModelInstallation, model_installation().manifest),
+    )
+    assert not result.ok
+    assert result.reasons == ("model_not_installed",)
+
+
+@pytest.mark.parametrize("state", [ModelState.INSTALLED, ModelState.LOAD_VERIFIED])
+def test_invalid_managed_validation_projection_is_rejected(state: ModelState) -> None:
+    with pytest.raises(AppError, match=r"model\.installation_invalid"):
+        model_installation(state=state, validation_passed=False)
 
 
 def test_same_active_slot_is_ambiguous_without_version_guessing() -> None:
