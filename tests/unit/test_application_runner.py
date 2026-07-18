@@ -731,133 +731,115 @@ def test_all_request_paths_and_failures() -> None:
     assert bridge.stop(timeout_ms=5000)
 
 
-def test_worker_slots_on_main_thread_for_coverage() -> None:
-    """Exercise worker methods on the main thread so coverage records them."""
+def test_failed_shutdown_preserves_boundary_and_allows_retry() -> None:
+    """Active serial work: first stop fails, boundary stays usable, second stop succeeds."""
     from captioner.core.application.batch_commands import (
-        BatchActionRequest,
-        BatchCommandKind,
         CancelLocalWorkRequest,
-        JobActionRequest,
-        SubmitBatchRequest,
+        LocalExecutionSnapshot,
     )
-    from captioner.core.application.configuration import (
-        ExecutionPreset,
-        GlobalSettings,
-        ProviderSettingsUpdate,
-    )
-    from captioner.core.application.input_selection import BatchDraft, InputSelectionRequest
-    from captioner.core.application.job_detail import JobDetailRequest
-    from captioner.core.application.recovery import RecoveryRequest
-    from captioner.core.domain.stage import PipelineProfile
-    from captioner.gui import application_runner as runner_mod
+    from captioner.gui.application_boundary import ExecutionPoll
 
     main_id = threading.get_ident()
-    boundary = FakeBoundary(
-        main_thread_id=main_id,
-        factory_thread_ids=[],
-        refresh_thread_ids=[],
-        get_calls=[],
-        refresh_calls=[],
-        snapshots=[_empty_snapshot(1)],
-        operation_thread_ids=[],
-    )
+    cancel_calls: list[int] = []
+    poll_states: list[LocalExecutionSnapshot] = []
+    failures: list[RunnerFailure] = []
+    stopped_count = {"n": 0}
+    active = {"has_work": True}
+    shutdown_attempts = {"n": 0}
+
+    class BusyBoundary(FakeBoundary):
+        def poll_execution(self) -> Any:
+            state = LocalExecutionSnapshot(
+                "batch-a" if active["has_work"] else None,
+                (),
+            )
+            return ExecutionPoll(state=state, completions=())
+
+        def cancel_local_work(self, request: object) -> Any:
+            cancel_calls.append(threading.get_ident())
+            self._record_op()
+            active["has_work"] = False
+            from captioner.core.application.batch_commands import (
+                BatchCommandAck,
+                BatchCommandKind,
+            )
+
+            return BatchCommandAck(
+                request_id=getattr(request, "request_id", "req"),
+                kind=BatchCommandKind.CANCEL_LOCAL_WORK,
+                batch_id=None,
+                job_id=None,
+                accepted_at_utc="t0",
+                scheduled=False,
+            )
+
+        def shutdown(self) -> None:
+            shutdown_attempts["n"] += 1
+            if active["has_work"]:
+                # Simulate coordinator rejecting shutdown while work is active.
+                raise AppError("batch.execution_active")
+            return None
+
+    def factory() -> BusyBoundary:
+        return BusyBoundary(
+            main_thread_id=main_id,
+            factory_thread_ids=[],
+            refresh_thread_ids=[],
+            get_calls=[],
+            refresh_calls=[],
+            snapshots=[_empty_snapshot(1), _empty_snapshot(2)],
+            operation_thread_ids=[],
+        )
+
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
+    bridge.failure.connect(failures.append)
+    bridge.local_execution_state_changed.connect(poll_states.append)
+    bridge.stopped.connect(lambda: stopped_count.__setitem__("n", stopped_count["n"] + 1))
+    ready = QSignalSpy(bridge.snapshot_ready)
+    cancel_ready = QSignalSpy(bridge.batch_command_ready)
+    try:
+        bridge.start()
+        assert _wait_until(lambda: ready.count() >= 1)
+        # First stop while "work" active → fails, boundary retained.
+        assert bridge.stop(timeout_ms=800) is False
+        assert stopped_count["n"] == 0
+        assert _wait_until(lambda: shutdown_attempts["n"] >= 1)
+        assert _wait_until(lambda: any(f.code == "batch.execution_active" for f in failures))
+        for failure in failures:
+            assert "Traceback" not in failure.code
+            assert "secret" not in repr(failure)
+        # Refresh still works after failed stop (same Worker thread).
+        bridge.request_refresh()
+        assert _wait_until(lambda: ready.count() >= 2)
+        # Cancel still processed on worker thread.
+        bridge.request_cancel_local_work(CancelLocalWorkRequest(request_id="req-cancel-all"))
+        assert _wait_until(lambda: cancel_ready.count() >= 1)
+        assert cancel_calls
+        assert cancel_calls[0] != main_id
+        assert active["has_work"] is False
+        # Polling should eventually emit idle after cancel.
+        assert _wait_until(
+            lambda: any(not state.has_work for state in poll_states),
+            timeout_ms=3000,
+        )
+        # Second stop succeeds once idle; no second Worker thread.
+        thread_before = bridge._thread  # pyright: ignore[reportPrivateUsage]
+        assert bridge.stop(timeout_ms=5000) is True
+        assert stopped_count["n"] == 1
+        assert bridge._thread is None  # pyright: ignore[reportPrivateUsage]
+        assert thread_before is not None
+        assert shutdown_attempts["n"] >= 2
+    finally:
+        if bridge.running:
+            active["has_work"] = False
+            bridge.stop(timeout_ms=5000)
+
+
+def test_malformed_request_emits_safe_failure_on_worker() -> None:
+    """Malformed request objects emit stable codes without raw exception text."""
+    main_id = threading.get_ident()
 
     def factory() -> FakeBoundary:
-        return boundary
-
-    worker = runner_mod._ApplicationRunnerWorker(factory)  # pyright: ignore[reportPrivateUsage]
-    worker.initialize()
-    worker.refresh()
-    worker.preview_inputs(InputSelectionRequest(entries=("/a.wav",)))
-    worker.load_configuration()
-    worker.save_global(GlobalSettings())
-    worker.save_provider(
-        ProviderSettingsUpdate(
-            profile_name="default",
-            base_url="https://example.com",
-            model="m",
-        )
-    )
-    worker.save_preset(
-        ExecutionPreset(
-            name="user-a",
-            display_name="User A",
-            built_in=False,
-            pipeline_profile=PipelineProfile.DETERMINISTIC,
-            model_ref="tiny",
-            device="cpu",
-            compute_type="int8",
-            source_language=None,
-            target_language=None,
-            provider_profile="default",
-        )
-    )
-    worker.delete_preset("user-a")
-    worker.test_provider(
-        ProviderSettingsUpdate(
-            profile_name="default",
-            base_url="https://example.com",
-            model="m",
-        )
-    )
-    draft = BatchDraft(
-        input_paths=("/tmp/a.wav",),
-        output_root="/tmp/out",
-        preset_name="deterministic",
-        pipeline_profile=PipelineProfile.DETERMINISTIC,
-        model_ref="tiny",
-        device="cpu",
-        compute_type="int8",
-        source_language="en",
-        target_language=None,
-        provider_profile="default",
-        ffmpeg_bin="ffmpeg",
-        ffprobe_bin="ffprobe",
-        collision_policy="unique_subdir",
-    )
-    worker.submit_batch(SubmitBatchRequest(request_id="req-s", draft=draft))
-    worker.perform_batch_action(
-        BatchActionRequest(
-            request_id="req-b",
-            kind=BatchCommandKind.PAUSE_BATCH,
-            batch_id="batch-a",
-        )
-    )
-    worker.perform_job_action(
-        JobActionRequest(
-            request_id="req-j",
-            kind=BatchCommandKind.CANCEL_JOB,
-            batch_id="batch-a",
-            job_id="job-000001",
-        )
-    )
-    worker.cancel_local_work(CancelLocalWorkRequest(request_id="req-c"))
-    worker.load_job_detail(
-        JobDetailRequest(request_id="req-d", batch_id="batch-a", job_id="job-000001")
-    )
-    worker.scan_recovery(RecoveryRequest(request_id="req-r"))
-    worker.poll_execution()
-    # invalid payloads
-    worker.preview_inputs("bad")
-    worker.save_global("bad")
-    worker.save_provider("bad")
-    worker.save_preset("bad")
-    worker.test_provider("bad")
-    worker.submit_batch("bad")
-    worker.perform_batch_action("bad")
-    worker.perform_job_action("bad")
-    worker.cancel_local_work("bad")
-    worker.load_job_detail("bad")
-    worker.scan_recovery("bad")
-    worker.shutdown()
-
-
-def test_worker_error_paths_for_coverage() -> None:
-    from captioner.gui import application_runner as runner_mod
-
-    main_id = threading.get_ident()
-
-    def factory_ok() -> FakeBoundary:
         return FakeBoundary(
             main_thread_id=main_id,
             factory_thread_ids=[],
@@ -866,49 +848,54 @@ def test_worker_error_paths_for_coverage() -> None:
             refresh_calls=[],
             snapshots=[_empty_snapshot(1)],
             operation_thread_ids=[],
-            get_error=AppError("queue.read_failed"),
-            refresh_error=AppError("queue.refresh_failed"),
-            preview_error=AppError("input.failed"),
-            config_error=AppError("config.failed"),
-            provider_test_error=AppError("llm.connection_failed"),
         )
 
-    worker = runner_mod._ApplicationRunnerWorker(factory_ok)  # pyright: ignore[reportPrivateUsage]
-    worker.initialize()  # get_error path
-    # Reset boundary without error for partial coverage of None-boundary paths:
-    object.__setattr__(worker, "_boundary", None)
-    worker.refresh()
-    worker.preview_inputs(object())
-    worker.load_configuration()
-    worker.save_global(object())
-    worker.save_provider(object())
-    worker.save_preset(object())
-    worker.delete_preset("x")
-    worker.test_provider(object())
-    worker.submit_batch(object())
-    worker.perform_batch_action(object())
-    worker.perform_job_action(object())
-    worker.cancel_local_work(object())
-    worker.load_job_detail(object())
-    worker.scan_recovery(object())
-    worker.poll_execution()
-    worker.shutdown()
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
+    failures: list[object] = []
+    bridge.batch_command_failure.connect(failures.append)
+    ready = QSignalSpy(bridge.snapshot_ready)
+    try:
+        bridge.start()
+        assert _wait_until(lambda: ready.count() >= 1)
+        # Emit malformed payload through the same queued path as real callers.
+        bridge._submit_batch_requested.emit("not-a-request")  # pyright: ignore[reportPrivateUsage]
+        assert _wait_until(lambda: len(failures) >= 1)
+        failure = failures[0]
+        code = getattr(failure, "code", "")
+        assert code == "gui.application_bridge_failed"
+        assert "Traceback" not in repr(failure)
+        assert "Exception" not in repr(failure)
+    finally:
+        assert bridge.stop(timeout_ms=5000)
 
-    # exception paths with boundary present
-    boundary = factory_ok()
-    worker2 = runner_mod._ApplicationRunnerWorker(lambda: boundary)  # type: ignore[attr-defined]
-    worker2.initialize()
-    object.__setattr__(worker2, "_boundary", boundary)
-    worker2.refresh()
-    from captioner.core.application.input_selection import InputSelectionRequest
 
-    worker2.preview_inputs(InputSelectionRequest(entries=("/a.wav",)))
-    worker2.load_configuration()
-    from captioner.core.application.configuration import ProviderSettingsUpdate
+def test_worker_command_thread_differs_from_main() -> None:
+    """Worker slots run on the dedicated QThread, not the main GUI thread."""
+    main_id = threading.get_ident()
+    op_ids: list[int] = []
 
-    worker2.save_provider(
-        ProviderSettingsUpdate(profile_name="default", base_url="https://x", model="m")
-    )
-    worker2.test_provider(
-        ProviderSettingsUpdate(profile_name="default", base_url="https://x", model="m")
-    )
+    def factory() -> FakeBoundary:
+        return FakeBoundary(
+            main_thread_id=main_id,
+            factory_thread_ids=[],
+            refresh_thread_ids=[],
+            get_calls=[],
+            refresh_calls=[],
+            snapshots=[_empty_snapshot(1)],
+            operation_thread_ids=op_ids,
+        )
+
+    bridge = ApplicationRunnerBridge(factory)  # type: ignore[arg-type]
+    ready = QSignalSpy(bridge.batch_command_ready)
+    snap = QSignalSpy(bridge.snapshot_ready)
+    try:
+        bridge.start()
+        assert _wait_until(lambda: snap.count() >= 1)
+        from captioner.core.application.batch_commands import CancelLocalWorkRequest
+
+        bridge.request_cancel_local_work(CancelLocalWorkRequest(request_id="req-thread"))
+        assert _wait_until(lambda: ready.count() >= 1)
+        assert op_ids
+        assert all(tid != main_id for tid in op_ids)
+    finally:
+        assert bridge.stop(timeout_ms=5000)

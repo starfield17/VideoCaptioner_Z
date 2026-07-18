@@ -72,11 +72,10 @@ class RecoveryService:
     coordinator: SerialExecutionCoordinator
 
     def scan(self, request: RecoveryRequest) -> RecoverySnapshot:
-        sources = self.gateway.read_recovery_sources()
+        read = self.gateway.read_recovery_sources()
         scheduled = self.coordinator.scheduled_batch_ids()
         items: list[RecoveryItem] = []
-        issues: list[RecoveryIssue] = []
-        for source in sources:
+        for source in read.sources:
             if source.batch_id in scheduled:
                 continue
             if source.lease_state not in _STALE_LEASE_STATES:
@@ -113,11 +112,21 @@ class RecoveryService:
                 )
             )
         items.sort(key=lambda item: (item.created_at_utc, item.batch_id))
+        # Propagate catalog issues; keep stable ordering by batch_name then code.
+        issues = tuple(
+            sorted(
+                (
+                    RecoveryIssue(batch_name=issue.batch_name, code=issue.code)
+                    for issue in read.issues
+                ),
+                key=lambda issue: (issue.batch_name, issue.code),
+            )
+        )
         return RecoverySnapshot(
             schema_version=RECOVERY_SCHEMA_VERSION,
             request_id=request.request_id,
             items=tuple(items),
-            issues=tuple(issues),
+            issues=issues,
         )
 
 

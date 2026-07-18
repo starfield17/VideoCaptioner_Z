@@ -367,24 +367,44 @@ class _ApplicationRunnerWorker(QObject):
         for completion in poll.completions:
             self.execution_completion.emit(completion)
 
-    @Slot()
-    def shutdown(self) -> None:
+    def _ensure_execution_polling(self) -> None:
+        timer = self._poll_timer
+        if timer is not None and timer.isActive():
+            return
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(_EXECUTION_POLL_MS)
+            timer.timeout.connect(self.poll_execution)
+            self._poll_timer = timer
+        timer.start()
+
+    def _stop_execution_polling(self) -> None:
         timer = self._poll_timer
         if timer is not None:
             timer.stop()
-            self._poll_timer = None
+
+    @Slot()
+    def shutdown(self) -> None:
         boundary = self._boundary
-        shutdown_ok = True
-        if boundary is not None:
-            try:
-                boundary.shutdown()
-            except Exception as exc:
-                shutdown_ok = False
-                self.failure.emit(_failure_from_exception(exc))
-        self._boundary = None
-        if shutdown_ok:
+        if boundary is None:
+            self._stop_execution_polling()
             self.shutdown_finished.emit()
             self.thread().quit()
+            return
+
+        try:
+            boundary.shutdown()
+        except Exception as exc:
+            # Keep boundary and polling so stop/cancel/refresh remain retryable.
+            self.failure.emit(_failure_from_exception(exc))
+            self._ensure_execution_polling()
+            return
+
+        self._stop_execution_polling()
+        self._poll_timer = None
+        self._boundary = None
+        self.shutdown_finished.emit()
+        self.thread().quit()
 
 
 def _command_failure(request: object, code: str) -> object:

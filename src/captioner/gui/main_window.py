@@ -143,6 +143,7 @@ class MainWindow(QMainWindow):
         controllers.create.batch_submitted.connect(self._on_batch_submitted)
         controllers.operations.notification_changed.connect(self._on_notification)
         controllers.operations.local_execution_state_changed.connect(self._on_execution_state)
+        controllers.operations.close_cancellation_failed.connect(self._on_close_cancellation_failed)
         controllers.recovery.prompt_requested.connect(self._on_recovery_prompt)
 
         self._create_page = create_page
@@ -237,6 +238,20 @@ class MainWindow(QMainWindow):
         if self._close_when_idle and not state.has_work:
             self._close_when_idle = False
             self.close()
+
+    def _on_close_cancellation_failed(self, failure: object) -> None:
+        # CancelLocalWork failed: abort close-when-idle and keep the window usable.
+        self._close_when_idle = False
+        code = getattr(failure, "code", "gui.application_bridge_failed")
+        if not isinstance(code, str):
+            code = "gui.application_bridge_failed"
+        self._show_notification(
+            self._service.translate(
+                "gui.notification.command_failed",
+                {"code": code},
+            ),
+            auto_hide=False,
+        )
 
     def _on_recovery_prompt(self, items: object) -> None:
         if not isinstance(items, tuple) or not items:

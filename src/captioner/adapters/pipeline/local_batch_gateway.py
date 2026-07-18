@@ -28,7 +28,13 @@ from captioner.core.domain.journal import JournalEvent, replay
 from captioner.core.domain.result import FrozenJsonValue
 from captioner.core.domain.stage import PipelineProfile, StageName, StageState
 from captioner.core.ports.batch_catalog import LeaseExecutionState
-from captioner.core.ports.batch_gateway import CreatedBatch, JobDetailSource, RecoverySource
+from captioner.core.ports.batch_gateway import (
+    CreatedBatch,
+    JobDetailSource,
+    RecoveryReadResult,
+    RecoverySource,
+    RecoverySourceIssue,
+)
 from captioner.infrastructure.app_paths import AppPaths, resolve_safe_child
 from captioner.infrastructure.ids import new_id
 
@@ -98,17 +104,28 @@ class LocalBatchGateway:
     def execute_created_batch(self, batch_id: str) -> None:
         self._run_with_lease(batch_id, operation="execute")
 
+    def validate_resume(self, batch_id: str) -> None:
+        """Read-only Resume preflight; never repairs or mutates Journal."""
+        validate_identifier(batch_id, field="batch_id")
+        projection = self._read_projection(batch_id, repair=False)
+        self._validate_resume_state(batch_id, projection)
+
     def resume_batch(self, batch_id: str) -> None:
-        self._validate_inputs_present(batch_id)
+        # Lease-protected path revalidates after repair under the writer lease.
         self._run_with_lease(batch_id, operation="resume")
 
-    def retry_job(self, batch_id: str, job_id: str) -> StageName:
+    def resolve_retry_stage(self, batch_id: str, job_id: str) -> StageName:
+        """Read-only Retry preflight; never repairs or mutates Journal."""
         validate_identifier(batch_id, field="batch_id")
         validate_identifier(job_id, field="job_id")
-        self._validate_inputs_present(batch_id, job_id=job_id)
-        stage = self._earliest_retry_stage(batch_id, job_id)
+        projection = self._read_projection(batch_id, repair=False)
+        return self._resolve_retry_stage_from_projection(batch_id, projection, job_id)
+
+    def retry_job(self, batch_id: str, job_id: str, stage: StageName) -> None:
+        validate_identifier(batch_id, field="batch_id")
+        validate_identifier(job_id, field="job_id")
+        # Lease-protected path revalidates that stage remains earliest retryable.
         self._run_with_lease(batch_id, operation="retry", job_id=job_id, stage=stage)
-        return stage
 
     def request_cancel(
         self,
@@ -231,6 +248,8 @@ class LocalBatchGateway:
         if state is JobState.INTERRUPTED and active_stage_state is StageState.RUNNING:
             active_stage_state = StageState.INTERRUPTED
         manifest_status = JsonManifestStore(batch_dir / "manifest.json").inspect(projection)
+        nonterminal = [item for item in projection.jobs if item.state not in _TERMINAL_JOB_STATES]
+        batch_inputs_available = all(Path(item.input_path).is_file() for item in nonterminal)
         return JobDetailSource(
             batch_id=batch_id,
             job_id=job_id,
@@ -244,9 +263,8 @@ class LocalBatchGateway:
             cancel_requested=cancel_requested,
             pause_requested=pause_requested,
             input_exists=Path(job.input_path).is_file(),
-            batch_has_nonterminal=any(
-                item.state not in _TERMINAL_JOB_STATES for item in projection.jobs
-            ),
+            batch_inputs_available=batch_inputs_available,
+            batch_has_nonterminal=bool(nonterminal),
             batch_cancel_requested=batch_cancel,
             job_cancel_requested=job_cancel,
             events=snapshot.events,
@@ -256,7 +274,7 @@ class LocalBatchGateway:
             pipeline_profile=job.config.pipeline_profile.value,
         )
 
-    def read_recovery_sources(self) -> tuple[RecoverySource, ...]:
+    def read_recovery_sources(self) -> RecoveryReadResult:
         catalog = FilesystemBatchCatalog(self.paths.batches_dir).read_snapshot()
         sources: list[RecoverySource] = []
         for entry in catalog.batches:
@@ -279,7 +297,11 @@ class LocalBatchGateway:
                     projection=entry.projection,
                 )
             )
-        return tuple(sources)
+        issues = tuple(
+            RecoverySourceIssue(batch_name=issue.batch_name, code=issue.code)
+            for issue in catalog.issues
+        )
+        return RecoveryReadResult(sources=tuple(sources), issues=issues)
 
     def close_shared_runtime(self) -> None:
         runtime = self._shared_runtime
@@ -380,12 +402,29 @@ class LocalBatchGateway:
 
         validate_identifier(batch_id, field="batch_id")
         batch_dir = resolve_safe_child(self.paths.batches_dir, batch_id, field="batch_id")
-        projection = self._read_projection(batch_id, repair=operation != "execute")
-        config = projection.jobs[0].config
-        runtime = self._runtime_for(config)
+        # Writer lease must precede any Journal repair (repair truncates incomplete tails).
         lease = create_batch_lease(batch_dir)
         lease.acquire()
         try:
+            projection = self._read_projection(
+                batch_id,
+                repair=operation != "execute",
+            )
+            if operation == "resume":
+                self._validate_resume_state(batch_id, projection, check_lease=False)
+            elif operation == "retry":
+                if job_id is None or stage is None:
+                    raise AppError("batch.retry_invalid", {"reason": "missing_stage"})
+                resolved = self._resolve_retry_stage_from_projection(
+                    batch_id,
+                    projection,
+                    job_id,
+                    check_lease=False,
+                )
+                if resolved is not stage:
+                    raise AppError("batch.retry_invalid", {"reason": "stage_changed"})
+            config = projection.jobs[0].config
+            runtime = self._runtime_for(config)
             bundle = build_durable_service(
                 batch_id,
                 model_ref=config.model_ref,
@@ -447,11 +486,12 @@ class LocalBatchGateway:
         from captioner.bootstrap import build_durable_service, create_batch_lease
 
         batch_dir = resolve_safe_child(self.paths.batches_dir, batch_id, field="batch_id")
-        projection = self._read_projection(batch_id, repair=True)
-        config = projection.jobs[0].config
+        # Durable cancellation acknowledgement repairs Journal under the writer lease.
         lease = create_batch_lease(batch_dir)
         lease.acquire()
         try:
+            projection = self._read_projection(batch_id, repair=True)
+            config = projection.jobs[0].config
             bundle = build_durable_service(
                 batch_id,
                 model_ref=config.model_ref,
@@ -474,9 +514,45 @@ class LocalBatchGateway:
         finally:
             lease.release()
 
-    def _earliest_retry_stage(self, batch_id: str, job_id: str) -> StageName:
-        projection = self._read_projection(batch_id, repair=False)
+    def _validate_resume_state(
+        self,
+        batch_id: str,
+        projection: BatchProjection,
+        *,
+        check_lease: bool = True,
+    ) -> None:
+        batch_dir = resolve_safe_child(self.paths.batches_dir, batch_id, field="batch_id")
+        if check_lease:
+            lease_state = inspect_batch_lease(batch_dir / "lease.json")
+            if lease_state in {"active_local", "active_remote"}:
+                raise AppError("batch.busy", {"batch_id": batch_id, "lease": lease_state})
+        if (batch_dir / "control" / "cancel-batch").exists():
+            raise AppError("batch.resume_invalid", {"reason": "cancel_requested"})
+        nonterminal = [job for job in projection.jobs if job.state not in _TERMINAL_JOB_STATES]
+        if not nonterminal:
+            raise AppError("batch.resume_invalid", {"reason": "terminal"})
+        missing = [job.input_path for job in nonterminal if not Path(job.input_path).is_file()]
+        if missing:
+            raise AppError("recovery.input_missing", {"paths": list(missing)})
+
+    def _resolve_retry_stage_from_projection(
+        self,
+        batch_id: str,
+        projection: BatchProjection,
+        job_id: str,
+        *,
+        check_lease: bool = True,
+    ) -> StageName:
+        batch_dir = resolve_safe_child(self.paths.batches_dir, batch_id, field="batch_id")
+        if check_lease:
+            lease_state = inspect_batch_lease(batch_dir / "lease.json")
+            if lease_state in {"active_local", "active_remote"}:
+                raise AppError("batch.busy", {"batch_id": batch_id, "lease": lease_state})
         job = projection.job(job_id)
+        if job.state not in {JobState.FAILED, JobState.CANCELLED, JobState.INTERRUPTED}:
+            raise AppError("batch.retry_invalid", {"reason": "job_state"})
+        if not Path(job.input_path).is_file():
+            raise AppError("recovery.input_missing", {"paths": [job.input_path]})
         return resolve_earliest_retry_stage(
             tuple((stage.name, stage.state) for stage in job.stages),
             job.config.pipeline_profile.value,

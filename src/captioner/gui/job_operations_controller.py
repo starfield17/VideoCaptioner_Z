@@ -30,6 +30,8 @@ class JobOperationsController(QObject):
     notification_changed = Signal(object)
     local_execution_state_changed = Signal(object)
     refresh_requested = Signal()
+    # Emitted when CancelLocalWork fails while a close-when-idle workflow is active.
+    close_cancellation_failed = Signal(object)
 
     def __init__(
         self,
@@ -47,6 +49,10 @@ class JobOperationsController(QObject):
         self._command_busy = False
         self._pending_request_id: str | None = None
         self._pending_kind: BatchCommandKind | None = None
+        # Independent shutdown-cancellation state: never swallowed by ordinary commands.
+        self._cancel_local_work_pending = False
+        self._cancel_local_work_request_id: str | None = None
+        self._close_cancellation_in_flight = False
         self._execution = LocalExecutionSnapshot(active_batch_id=None, queued_batch_ids=())
         self._last_notification: str | None = None
         self._last_command_failure: RunnerFailure | None = None
@@ -73,6 +79,14 @@ class JobOperationsController(QObject):
     @property
     def command_busy(self) -> bool:
         return self._command_busy
+
+    @property
+    def cancel_local_work_pending(self) -> bool:
+        return self._cancel_local_work_pending
+
+    @property
+    def close_cancellation_in_flight(self) -> bool:
+        return self._close_cancellation_in_flight
 
     @property
     def has_local_work(self) -> bool:
@@ -125,18 +139,22 @@ class JobOperationsController(QObject):
     def run_again(self) -> None:
         self._dispatch_job_action(BatchCommandKind.RUN_AGAIN)
 
-    def cancel_all_local_work(self) -> None:
-        if self._command_busy:
-            return
-        request_id = new_id("req-")
-        self._pending_request_id = request_id
-        self._pending_kind = BatchCommandKind.CANCEL_LOCAL_WORK
-        self._command_busy = True
-        self.command_busy_changed.emit(True)
-        self._runner.request_cancel_local_work(CancelLocalWorkRequest(request_id=request_id))
+    def cancel_all_local_work(self) -> bool:
+        """Queue or dispatch CancelLocalWork without dropping close-when-idle intent.
+
+        Returns True when cancel-all is already pending, in flight, or newly dispatched.
+        """
+        if self._close_cancellation_in_flight or self._cancel_local_work_pending:
+            return True
+        if self._command_busy and self._pending_kind is not BatchCommandKind.CANCEL_LOCAL_WORK:
+            # Ordinary command in flight: mark pending and dispatch after it settles.
+            self._cancel_local_work_pending = True
+            return True
+        self._dispatch_cancel_local_work()
+        return True
 
     def resume_batch_id(self, batch_id: str) -> None:
-        if self._command_busy:
+        if self._mutation_blocked():
             return
         request_id = new_id("req-")
         self._pending_request_id = request_id
@@ -152,7 +170,7 @@ class JobOperationsController(QObject):
         )
 
     def cancel_batch_id(self, batch_id: str) -> None:
-        if self._command_busy:
+        if self._mutation_blocked():
             return
         request_id = new_id("req-")
         self._pending_request_id = request_id
@@ -166,6 +184,26 @@ class JobOperationsController(QObject):
                 batch_id=batch_id,
             )
         )
+
+    def _mutation_blocked(self) -> bool:
+        return (
+            self._command_busy
+            or self._cancel_local_work_pending
+            or self._close_cancellation_in_flight
+        )
+
+    def _dispatch_cancel_local_work(self) -> None:
+        if self._close_cancellation_in_flight:
+            return
+        request_id = new_id("req-")
+        self._cancel_local_work_request_id = request_id
+        self._close_cancellation_in_flight = True
+        self._cancel_local_work_pending = False
+        self._runner.request_cancel_local_work(CancelLocalWorkRequest(request_id=request_id))
+
+    def _maybe_dispatch_pending_cancel_local_work(self) -> None:
+        if self._cancel_local_work_pending and not self._close_cancellation_in_flight:
+            self._dispatch_cancel_local_work()
 
     def _dispatch_detail(self) -> None:
         item = self._selected
@@ -186,7 +224,7 @@ class JobOperationsController(QObject):
 
     def _dispatch_job_action(self, kind: BatchCommandKind) -> None:
         item = self._selected
-        if item is None or self._command_busy:
+        if item is None or self._mutation_blocked():
             return
         request_id = new_id("req-")
         self._pending_request_id = request_id
@@ -204,7 +242,7 @@ class JobOperationsController(QObject):
 
     def _dispatch_batch_action(self, kind: BatchCommandKind) -> None:
         item = self._selected
-        if item is None or self._command_busy:
+        if item is None or self._mutation_blocked():
             return
         request_id = new_id("req-")
         self._pending_request_id = request_id
@@ -262,6 +300,19 @@ class JobOperationsController(QObject):
     def _on_command(self, ack: object) -> None:
         if not isinstance(ack, BatchCommandAck):
             return
+        # Independent CancelLocalWork correlation (not ordinary selected-Job command).
+        if (
+            self._cancel_local_work_request_id is not None
+            and ack.request_id == self._cancel_local_work_request_id
+        ):
+            self._cancel_local_work_request_id = None
+            self._close_cancellation_in_flight = False
+            self._cancel_local_work_pending = False
+            self._last_notification = f"command.accepted:{ack.kind.value}"
+            self.notification_changed.emit(self._last_notification)
+            self.command_succeeded.emit(ack)
+            self.refresh_requested.emit()
+            return
         if ack.request_id != self._pending_request_id:
             return
         if self._pending_kind is not None and ack.kind is not self._pending_kind:
@@ -275,10 +326,25 @@ class JobOperationsController(QObject):
         self.command_succeeded.emit(ack)
         self.refresh_requested.emit()
         self.refresh_detail()
+        self._maybe_dispatch_pending_cancel_local_work()
 
     @Slot(object)
     def _on_command_failure(self, failure: object) -> None:
         if not isinstance(failure, BatchCommandFailure):
+            return
+        if (
+            self._cancel_local_work_request_id is not None
+            and failure.request_id == self._cancel_local_work_request_id
+        ):
+            self._cancel_local_work_request_id = None
+            self._close_cancellation_in_flight = False
+            self._cancel_local_work_pending = False
+            safe = RunnerFailure(code=failure.code, retryable=failure.retryable)
+            self._last_command_failure = safe
+            self.command_failed.emit(safe)
+            self.close_cancellation_failed.emit(safe)
+            self._last_notification = f"command.failed:{failure.code}"
+            self.notification_changed.emit(self._last_notification)
             return
         if failure.request_id != self._pending_request_id:
             return
@@ -290,6 +356,8 @@ class JobOperationsController(QObject):
         self.command_failed.emit(self._last_command_failure)
         self._last_notification = f"command.failed:{failure.code}"
         self.notification_changed.emit(self._last_notification)
+        # Still dispatch pending cancel-all after ordinary command failure.
+        self._maybe_dispatch_pending_cancel_local_work()
 
     @Slot(object)
     def _on_execution_state(self, state: object) -> None:

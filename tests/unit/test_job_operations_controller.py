@@ -37,6 +37,7 @@ class FakeRunner(QObject):
         self.detail_requests: list[object] = []
         self.job_actions: list[JobActionRequest] = []
         self.batch_actions: list[BatchActionRequest] = []
+        self.cancel_local_work_requests: list[object] = []
 
     def request_job_detail(self, request: object) -> None:
         self.detail_requests.append(request)
@@ -50,7 +51,7 @@ class FakeRunner(QObject):
         self.batch_actions.append(request)
 
     def request_cancel_local_work(self, request: object) -> None:
-        return None
+        self.cancel_local_work_requests.append(request)
 
 
 def _item() -> JobQueueItem:
@@ -230,4 +231,96 @@ def test_detail_coalesce_and_execution_completion() -> None:
             code="gui.application_bridge_failed",
         )
     )
-    assert True
+    assert controller.last_notification == "execution.failed:gui.application_bridge_failed"
+
+
+def test_cancel_all_pending_after_ordinary_success() -> None:
+    runner = FakeRunner()
+    controller = JobOperationsController(runner)  # type: ignore[arg-type]
+    controller.select_job(_item())
+    controller.resume_batch()
+    assert controller.command_busy is True
+    assert len(runner.cancel_local_work_requests) == 0
+    controller.cancel_all_local_work()
+    assert controller.cancel_local_work_pending is True
+    assert len(runner.cancel_local_work_requests) == 0
+    # Ordinary command completes → cancel-all dispatched exactly once.
+    action = runner.batch_actions[-1]
+    runner.batch_command_ready.emit(
+        BatchCommandAck(
+            request_id=action.request_id,
+            kind=BatchCommandKind.RESUME_BATCH,
+            batch_id=action.batch_id,
+            job_id=None,
+            accepted_at_utc="t0",
+            scheduled=True,
+        )
+    )
+    assert len(runner.cancel_local_work_requests) == 1
+    assert controller.close_cancellation_in_flight is True
+    # Second cancel-all is suppressed.
+    controller.cancel_all_local_work()
+    assert len(runner.cancel_local_work_requests) == 1
+
+
+def test_cancel_all_pending_after_ordinary_failure() -> None:
+    from captioner.core.application.batch_commands import BatchCommandFailure
+
+    runner = FakeRunner()
+    controller = JobOperationsController(runner)  # type: ignore[arg-type]
+    controller.select_job(_item())
+    controller.retry_job()
+    controller.cancel_all_local_work()
+    assert controller.cancel_local_work_pending is True
+    action = runner.job_actions[-1]
+    runner.batch_command_failure.emit(
+        BatchCommandFailure(
+            request_id=action.request_id,
+            kind=BatchCommandKind.RETRY_JOB,
+            code="batch.retry_invalid",
+        )
+    )
+    assert len(runner.cancel_local_work_requests) == 1
+
+
+def test_cancel_all_failure_emits_close_signal() -> None:
+    from captioner.core.application.batch_commands import BatchCommandFailure
+
+    runner = FakeRunner()
+    controller = JobOperationsController(runner)  # type: ignore[arg-type]
+    failures: list[object] = []
+    controller.close_cancellation_failed.connect(failures.append)
+    controller.cancel_all_local_work()
+    assert len(runner.cancel_local_work_requests) == 1
+    req = runner.cancel_local_work_requests[0]
+    runner.batch_command_failure.emit(
+        BatchCommandFailure(
+            request_id=getattr(req, "request_id", "req"),
+            kind=BatchCommandKind.CANCEL_LOCAL_WORK,
+            code="batch.execution_active",
+        )
+    )
+    assert controller.close_cancellation_in_flight is False
+    assert controller.cancel_local_work_pending is False
+    assert len(failures) == 1
+    assert getattr(failures[0], "code", None) == "batch.execution_active"
+
+
+def test_cancel_all_success_independent_of_ordinary() -> None:
+    runner = FakeRunner()
+    controller = JobOperationsController(runner)  # type: ignore[arg-type]
+    controller.cancel_all_local_work()
+    req = runner.cancel_local_work_requests[0]
+    runner.batch_command_ready.emit(
+        BatchCommandAck(
+            request_id=getattr(req, "request_id", "req"),
+            kind=BatchCommandKind.CANCEL_LOCAL_WORK,
+            batch_id=None,
+            job_id=None,
+            accepted_at_utc="t0",
+            scheduled=False,
+            affected_batch_ids=("batch-a",),
+        )
+    )
+    assert controller.close_cancellation_in_flight is False
+    assert controller.command_busy is False

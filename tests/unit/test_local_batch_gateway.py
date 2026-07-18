@@ -178,9 +178,10 @@ def test_job_detail_and_recovery_sources(tmp_path: Path) -> None:
     assert detail.batch_id == created.batch_id
     assert detail.job_id == "job-000001"
     assert detail.input_exists is True
+    assert detail.batch_inputs_available is True
     assert detail.events
-    sources = gateway.read_recovery_sources()
-    assert any(source.batch_id == created.batch_id for source in sources)
+    read = gateway.read_recovery_sources()
+    assert any(source.batch_id == created.batch_id for source in read.sources)
     gateway.close_shared_runtime()
 
 
@@ -329,6 +330,7 @@ def test_pause_terminal_rejected(tmp_path: Path) -> None:
 
 
 def test_missing_input_on_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    del monkeypatch
     paths = _paths(tmp_path)
     gateway = LocalBatchGateway(paths)
     media = tmp_path / "gone.wav"
@@ -352,4 +354,316 @@ def test_missing_input_on_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     )
     media.unlink()
     with pytest.raises(AppError, match=r"recovery\.input_missing"):
+        gateway.validate_resume(created.batch_id)
+    with pytest.raises(AppError, match=r"recovery\.input_missing"):
         gateway.resume_batch(created.batch_id)
+
+
+def test_resume_lease_before_repair_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _paths(tmp_path)
+    gateway = LocalBatchGateway(paths)
+    created = gateway.create_batch(_draft(tmp_path, "a.wav"))
+    order: list[str] = []
+
+    class FakeLease:
+        def acquire(self) -> None:
+            order.append("lease.acquire")
+
+        def release(self) -> None:
+            order.append("lease.release")
+
+    class FakeService:
+        async def resume(self) -> object:
+            order.append("service.resume")
+            return object()
+
+        async def run(self, projection: object) -> object:
+            del projection
+            return object()
+
+        async def retry(self, job_id: str, stage: object) -> object:
+            del job_id, stage
+            return object()
+
+        def acknowledge_cancel_requests(
+            self, projection: object, *, active_job_id: str | None
+        ) -> object:
+            del projection, active_job_id
+            return object()
+
+    class FakeBundle:
+        def __init__(self) -> None:
+            self.service = FakeService()
+
+    real_repair = None
+
+    def _lease(_batch_dir: Path) -> FakeLease:
+        return FakeLease()
+
+    def _bundle(*_args: object, **_kwargs: object) -> FakeBundle:
+        return FakeBundle()
+
+    from captioner.adapters.persistence import jsonl_journal
+
+    original_repair = jsonl_journal.JsonlJournal.repair_and_read
+
+    def tracked_repair(self: object) -> object:
+        order.append("journal.repair_and_read")
+        return original_repair(self)  # type: ignore[misc]
+
+    monkeypatch.setattr("captioner.bootstrap.create_batch_lease", _lease)
+    monkeypatch.setattr("captioner.bootstrap.build_durable_service", _bundle)
+    monkeypatch.setattr(jsonl_journal.JsonlJournal, "repair_and_read", tracked_repair)
+    del real_repair
+    gateway.resume_batch(created.batch_id)
+    assert order == [
+        "lease.acquire",
+        "journal.repair_and_read",
+        "service.resume",
+        "lease.release",
+    ]
+
+
+def test_retry_lease_before_repair_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from captioner.adapters.persistence.jsonl_journal import JsonlJournal
+    from captioner.core.domain.journal import JournalEvent, replay
+    from captioner.core.domain.stage import StageName
+
+    paths = _paths(tmp_path)
+    gateway = LocalBatchGateway(paths)
+    created = gateway.create_batch(_draft(tmp_path, "a.wav"))
+    batch_dir = paths.batches_dir / created.batch_id
+    # Mark job failed at segment so retry is valid.
+    journal = JsonlJournal(batch_dir / "journal.jsonl")
+    events = list(journal.read_snapshot().events)
+    # Append synthetic failure via direct journal append is heavy; use cancel finalize then
+    # force state through request_cancel which finalizes. For retry we need failed stages.
+    # Use monkeypatched resolve path: create terminal cancelled job then re-open as interrupted
+    # is complex. Instead patch _resolve_retry_stage_from_projection after lease.
+    order: list[str] = []
+
+    class FakeLease:
+        def acquire(self) -> None:
+            order.append("lease.acquire")
+
+        def release(self) -> None:
+            order.append("lease.release")
+
+    class FakeService:
+        async def retry(self, job_id: str, stage: object) -> object:
+            order.append(f"service.retry:{job_id}:{getattr(stage, 'value', stage)}")
+            return object()
+
+        async def run(self, projection: object) -> object:
+            del projection
+            return object()
+
+        async def resume(self) -> object:
+            return object()
+
+        def acknowledge_cancel_requests(
+            self, projection: object, *, active_job_id: str | None
+        ) -> object:
+            del projection, active_job_id
+            return object()
+
+    class FakeBundle:
+        def __init__(self) -> None:
+            self.service = FakeService()
+
+    original_repair = JsonlJournal.repair_and_read
+
+    def tracked_repair(self: object) -> object:
+        order.append("journal.repair_and_read")
+        return original_repair(self)  # type: ignore[misc]
+
+    def fake_resolve(
+        self: object,
+        batch_id: str,
+        projection: object,
+        job_id: str,
+        *,
+        check_lease: bool = True,
+    ) -> StageName:
+        del self, batch_id, projection, check_lease
+        order.append(f"retry-stage-resolution:{job_id}")
+        return StageName.SEGMENT
+
+    def _make_lease(_batch_dir: Path) -> FakeLease:
+        return FakeLease()
+
+    def _make_bundle(*_args: object, **_kwargs: object) -> FakeBundle:
+        return FakeBundle()
+
+    monkeypatch.setattr("captioner.bootstrap.create_batch_lease", _make_lease)
+    monkeypatch.setattr("captioner.bootstrap.build_durable_service", _make_bundle)
+    monkeypatch.setattr(JsonlJournal, "repair_and_read", tracked_repair)
+    monkeypatch.setattr(
+        LocalBatchGateway,
+        "_resolve_retry_stage_from_projection",
+        fake_resolve,
+    )
+    del events, replay, JournalEvent
+    gateway.retry_job(created.batch_id, "job-000001", StageName.SEGMENT)
+    assert order[0] == "lease.acquire"
+    assert "journal.repair_and_read" in order
+    assert order.index("lease.acquire") < order.index("journal.repair_and_read")
+    assert any(item.startswith("retry-stage-resolution:") for item in order)
+    assert any(item.startswith("service.retry:") for item in order)
+    assert order[-1] == "lease.release"
+    assert order.index("journal.repair_and_read") < next(
+        i for i, item in enumerate(order) if item.startswith("service.retry:")
+    )
+
+
+def test_inactive_cancel_lease_before_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from captioner.adapters.persistence.jsonl_journal import JsonlJournal
+
+    paths = _paths(tmp_path)
+    gateway = LocalBatchGateway(paths)
+    created = gateway.create_batch(_draft(tmp_path, "a.wav"))
+    order: list[str] = []
+
+    class FakeLease:
+        def acquire(self) -> None:
+            order.append("lease.acquire")
+
+        def release(self) -> None:
+            order.append("lease.release")
+
+    class FakeService:
+        def acknowledge_cancel_requests(
+            self, projection: object, *, active_job_id: str | None
+        ) -> object:
+            order.append("acknowledge_cancel_requests")
+            return projection
+
+        async def run(self, projection: object) -> object:
+            del projection
+            return object()
+
+        async def resume(self) -> object:
+            return object()
+
+        async def retry(self, job_id: str, stage: object) -> object:
+            del job_id, stage
+            return object()
+
+    class FakeBundle:
+        def __init__(self) -> None:
+            self.service = FakeService()
+
+    original_repair = JsonlJournal.repair_and_read
+
+    def tracked_repair(self: object) -> object:
+        order.append("journal.repair_and_read")
+        return original_repair(self)  # type: ignore[misc]
+
+    def _make_lease(_batch_dir: Path) -> FakeLease:
+        return FakeLease()
+
+    def _make_bundle(*_args: object, **_kwargs: object) -> FakeBundle:
+        return FakeBundle()
+
+    monkeypatch.setattr("captioner.bootstrap.create_batch_lease", _make_lease)
+    monkeypatch.setattr("captioner.bootstrap.build_durable_service", _make_bundle)
+    monkeypatch.setattr(JsonlJournal, "repair_and_read", tracked_repair)
+
+    gateway.request_cancel(created.batch_id, job_id=None, execution_scheduled=False)
+    # Marker write is lock-free; under the lease, repair then acknowledge then release.
+    assert "lease.acquire" in order
+    assert "journal.repair_and_read" in order
+    assert "acknowledge_cancel_requests" in order
+    assert "lease.release" in order
+    assert order.index("lease.acquire") < order.index("journal.repair_and_read")
+    assert order.index("journal.repair_and_read") < order.index("acknowledge_cancel_requests")
+    assert order.index("acknowledge_cancel_requests") < order.index("lease.release")
+
+
+def test_busy_lease_skips_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from captioner.adapters.persistence.jsonl_journal import JsonlJournal
+
+    paths = _paths(tmp_path)
+    gateway = LocalBatchGateway(paths)
+    created = gateway.create_batch(_draft(tmp_path, "a.wav"))
+    order: list[str] = []
+    repaired = {"count": 0}
+
+    class BusyLease:
+        def acquire(self) -> None:
+            order.append("lease.acquire")
+            raise AppError("batch.busy", {"batch_id": created.batch_id})
+
+        def release(self) -> None:
+            order.append("lease.release")
+
+    original_repair = JsonlJournal.repair_and_read
+
+    def tracked_repair(self: object) -> object:
+        repaired["count"] += 1
+        order.append("journal.repair_and_read")
+        return original_repair(self)  # type: ignore[misc]
+
+    def _make_busy_lease(_batch_dir: Path) -> BusyLease:
+        return BusyLease()
+
+    monkeypatch.setattr("captioner.bootstrap.create_batch_lease", _make_busy_lease)
+    monkeypatch.setattr(JsonlJournal, "repair_and_read", tracked_repair)
+
+    with pytest.raises(AppError, match=r"batch\.busy"):
+        gateway.resume_batch(created.batch_id)
+    assert repaired["count"] == 0
+    assert "journal.repair_and_read" not in order
+    assert "lease.release" not in order  # acquire never succeeded
+
+
+def test_batch_inputs_available_false_when_sibling_missing(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    gateway = LocalBatchGateway(paths)
+    media_a = tmp_path / "a.wav"
+    media_b = tmp_path / "b.wav"
+    media_a.write_bytes(b"a")
+    media_b.write_bytes(b"b")
+    created = gateway.create_batch(
+        BatchDraft(
+            input_paths=(str(media_a), str(media_b)),
+            output_root=str(tmp_path / "out"),
+            preset_name="deterministic",
+            pipeline_profile=PipelineProfile.DETERMINISTIC,
+            model_ref="tiny",
+            device="cpu",
+            compute_type="int8",
+            source_language="en",
+            target_language=None,
+            provider_profile="default",
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+            collision_policy="unique_subdir",
+        )
+    )
+    media_b.unlink()
+    detail = gateway.read_job_detail_source(created.batch_id, "job-000001")
+    assert detail.input_exists is True
+    assert detail.batch_inputs_available is False
+
+
+def test_validate_resume_rejects_cancel_marker(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    gateway = LocalBatchGateway(paths)
+    created = gateway.create_batch(_draft(tmp_path, "a.wav"))
+    control = paths.batches_dir / created.batch_id / "control"
+    control.mkdir(parents=True, exist_ok=True)
+    (control / "cancel-batch").write_text("1", encoding="utf-8")
+    with pytest.raises(AppError, match=r"batch\.resume_invalid"):
+        gateway.validate_resume(created.batch_id)
+
+
+def test_validate_resume_rejects_terminal(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    gateway = LocalBatchGateway(paths)
+    created = gateway.create_batch(_draft(tmp_path, "a.wav"))
+    gateway.request_cancel(created.batch_id, job_id=None, execution_scheduled=False)
+    with pytest.raises(AppError, match=r"batch\.resume_invalid"):
+        gateway.validate_resume(created.batch_id)

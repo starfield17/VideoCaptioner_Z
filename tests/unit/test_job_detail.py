@@ -30,10 +30,16 @@ class FakeGateway:
     def execute_created_batch(self, batch_id: str) -> None:
         raise NotImplementedError
 
+    def validate_resume(self, batch_id: str) -> None:
+        raise NotImplementedError
+
     def resume_batch(self, batch_id: str) -> None:
         raise NotImplementedError
 
-    def retry_job(self, batch_id: str, job_id: str) -> StageName:
+    def resolve_retry_stage(self, batch_id: str, job_id: str) -> StageName:
+        raise NotImplementedError
+
+    def retry_job(self, batch_id: str, job_id: str, stage: StageName) -> None:
         raise NotImplementedError
 
     def request_cancel(
@@ -47,8 +53,10 @@ class FakeGateway:
     def create_run_again(self, batch_id: str, job_id: str) -> object:
         raise NotImplementedError
 
-    def read_recovery_sources(self) -> tuple[object, ...]:
-        return ()
+    def read_recovery_sources(self) -> object:
+        from captioner.core.ports.batch_gateway import RecoveryReadResult
+
+        return RecoveryReadResult(sources=(), issues=())
 
     def close_shared_runtime(self) -> None:
         return None
@@ -103,6 +111,7 @@ def test_activity_filters_siblings_and_limits() -> None:
         cancel_requested=False,
         pause_requested=False,
         input_exists=True,
+        batch_inputs_available=True,
         batch_has_nonterminal=True,
         batch_cancel_requested=False,
         job_cancel_requested=False,
@@ -148,6 +157,7 @@ def test_action_matrix_pause_and_run_again() -> None:
         cancel_requested=False,
         pause_requested=False,
         input_exists=True,
+        batch_inputs_available=True,
         batch_has_nonterminal=False,
         batch_cancel_requested=False,
         job_cancel_requested=False,
@@ -173,3 +183,44 @@ def test_action_matrix_pause_and_run_again() -> None:
     )
     assert JobAction.RUN_AGAIN in detail.available_actions
     assert JobAction.CANCEL_JOB not in detail.available_actions
+
+
+def test_resume_uses_batch_inputs_available() -> None:
+    events = (_event(1, "batch.created"), _event(2, "job.created", job_id="job-000001"))
+    source = JobDetailSource(
+        batch_id="batch-a",
+        job_id="job-000001",
+        input_path="/media/a.wav",
+        output_dir="/tmp/out",
+        state=JobState.INTERRUPTED,
+        active_stage=StageName.NORMALIZE,
+        active_stage_state=StageState.INTERRUPTED,
+        active_stage_attempt=1,
+        lease_state="missing",
+        cancel_requested=False,
+        pause_requested=False,
+        input_exists=True,
+        batch_inputs_available=False,
+        batch_has_nonterminal=True,
+        batch_cancel_requested=False,
+        job_cancel_requested=False,
+        events=events,
+        journal_tail_status="clean",
+        manifest_status="missing",
+        stage_states=(
+            (StageName.INSPECT, StageState.COMMITTED),
+            (StageName.NORMALIZE, StageState.INTERRUPTED),
+            (StageName.TRANSCRIBE, StageState.PENDING),
+            (StageName.SEGMENT, StageState.PENDING),
+            (StageName.EXPORT, StageState.PENDING),
+            (StageName.PUBLISH, StageState.PENDING),
+        ),
+        pipeline_profile="deterministic",
+    )
+    service = JobDetailService(cast(Any, FakeGateway(source)), SerialExecutionCoordinator())
+    detail = service.load(
+        JobDetailRequest(request_id="req-3", batch_id="batch-a", job_id="job-000001")
+    )
+    # Selected Job input exists so Retry may remain available; Resume uses Batch inputs.
+    assert JobAction.RESUME_BATCH not in detail.available_actions
+    assert JobAction.RETRY_JOB in detail.available_actions

@@ -205,6 +205,8 @@ class BatchCommandService:
         batch_id = request.batch_id
         if batch_id in self.coordinator.scheduled_batch_ids():
             raise AppError("batch.operation_conflict", {"batch_id": batch_id})
+        # Preflight rejects invalid Resume before ACK; executor revalidates under lease.
+        self.gateway.validate_resume(batch_id)
         self.coordinator.schedule(
             batch_id=batch_id,
             kind=BatchCommandKind.RESUME_BATCH,
@@ -276,10 +278,11 @@ class BatchCommandService:
         job_id = request.job_id
         if batch_id in self.coordinator.scheduled_batch_ids():
             raise AppError("batch.operation_conflict", {"batch_id": batch_id})
+        # Resolve the exact Stage before ACK so the scheduled operation retries it.
+        stage = self.gateway.resolve_retry_stage(batch_id, job_id)
 
-        # Resolve earliest stage under gateway validation during schedule.
         def _retry() -> None:
-            self.gateway.retry_job(batch_id, job_id)
+            self.gateway.retry_job(batch_id, job_id, stage)
 
         self.coordinator.schedule(
             batch_id=batch_id,

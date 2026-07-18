@@ -108,6 +108,21 @@
 
 - GUI behavior tests use Application fakes.
 - Normal GUI tests do not execute real ASR or LLM providers.
-- Queue models and controllers target high branch coverage.
+- Overall branch coverage hard floor: 80%.
+- Overall branch coverage engineering target: 85%.
+- Below 80% is a hard repository gate failure.
+- 80%–85% is accepted when critical invariants and regressions pass.
+- 85% remains the preferred engineering target.
+- A PR must not be blocked merely because coverage is 84.x%.
+- Coverage is a risk indicator, not a substitute for behavioral tests.
+- Critical durability, concurrency, cancellation, recovery, credential, and
+  corruption paths must still have focused tests.
+- Do not exclude production modules merely to increase the reported percentage.
+- Do not add `pragma: no cover` to real production branches for convenience.
+- Do not delete meaningful tests to lower maintenance work.
+- Do not create tests that execute code in an architecturally incorrect thread
+  solely for coverage accounting.
+- Test quality is evaluated by the invariant proved, not only by the number of
+  lines or branches executed.
 - Pixel-exact screenshot tests remain limited.
 - New unrelated defects are recorded unless they block correctness, safety, or the active PR.

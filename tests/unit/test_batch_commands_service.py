@@ -37,6 +37,10 @@ def _empty_pairs() -> list[tuple[str, str]]:
     return []
 
 
+def _empty_stage_retries() -> list[tuple[str, str, StageName]]:
+    return []
+
+
 def _empty_cancels() -> list[tuple[str, str | None, bool]]:
     return []
 
@@ -50,10 +54,15 @@ class FakeGateway:
     created: list[BatchDraft] = field(default_factory=_empty_drafts)
     executed: list[str] = field(default_factory=_empty_strings)
     resumed: list[str] = field(default_factory=_empty_strings)
-    retried: list[tuple[str, str]] = field(default_factory=_empty_pairs)
+    retried: list[tuple[str, str, StageName]] = field(default_factory=_empty_stage_retries)
     cancelled: list[tuple[str, str | None, bool]] = field(default_factory=_empty_cancels)
     paused: list[tuple[str, bool]] = field(default_factory=_empty_pauses)
     run_again: list[tuple[str, str]] = field(default_factory=_empty_pairs)
+    validate_resume_error: AppError | None = None
+    resolve_retry_error: AppError | None = None
+    resolved_retry_stage: StageName = StageName.SEGMENT
+    validate_resume_calls: list[str] = field(default_factory=_empty_strings)
+    resolve_retry_calls: list[tuple[str, str]] = field(default_factory=_empty_pairs)
 
     def create_batch(self, draft: BatchDraft) -> CreatedBatch:
         self.created.append(draft)
@@ -62,12 +71,22 @@ class FakeGateway:
     def execute_created_batch(self, batch_id: str) -> None:
         self.executed.append(batch_id)
 
+    def validate_resume(self, batch_id: str) -> None:
+        self.validate_resume_calls.append(batch_id)
+        if self.validate_resume_error is not None:
+            raise self.validate_resume_error
+
     def resume_batch(self, batch_id: str) -> None:
         self.resumed.append(batch_id)
 
-    def retry_job(self, batch_id: str, job_id: str) -> StageName:
-        self.retried.append((batch_id, job_id))
-        return StageName.SEGMENT
+    def resolve_retry_stage(self, batch_id: str, job_id: str) -> StageName:
+        self.resolve_retry_calls.append((batch_id, job_id))
+        if self.resolve_retry_error is not None:
+            raise self.resolve_retry_error
+        return self.resolved_retry_stage
+
+    def retry_job(self, batch_id: str, job_id: str, stage: StageName) -> None:
+        self.retried.append((batch_id, job_id, stage))
 
     def request_cancel(
         self,
@@ -88,8 +107,10 @@ class FakeGateway:
     def read_job_detail_source(self, batch_id: str, job_id: str) -> Any:
         raise NotImplementedError
 
-    def read_recovery_sources(self) -> tuple[Any, ...]:
-        return ()
+    def read_recovery_sources(self) -> Any:
+        from captioner.core.ports.batch_gateway import RecoveryReadResult
+
+        return RecoveryReadResult(sources=(), issues=())
 
     def close_shared_runtime(self) -> None:
         return None
@@ -250,12 +271,84 @@ def test_retry_job_schedules() -> None:
         )
     )
     assert ack.scheduled is True
+    assert gateway.resolve_retry_calls == [("batch-r", "job-000001")]
     import time
 
     deadline = time.monotonic() + 2
     while service.coordinator.snapshot().has_work and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert gateway.retried == [("batch-r", "job-000001")]
+    assert gateway.retried == [("batch-r", "job-000001", StageName.SEGMENT)]
+    service.coordinator.drain_completions()
+    service.coordinator.shutdown()
+
+
+def test_resume_preflight_fails_before_ack() -> None:
+    gateway = FakeGateway(validate_resume_error=AppError("recovery.input_missing"))
+    service = _service(gateway)
+    with pytest.raises(AppError, match=r"recovery\.input_missing"):
+        service.perform_batch_action(
+            BatchActionRequest(
+                request_id="req-bad-resume",
+                kind=BatchCommandKind.RESUME_BATCH,
+                batch_id="batch-missing",
+            )
+        )
+    assert gateway.validate_resume_calls == ["batch-missing"]
+    assert not service.coordinator.snapshot().has_work
+    service.coordinator.shutdown()
+
+
+def test_resume_active_lease_fails_before_ack() -> None:
+    gateway = FakeGateway(validate_resume_error=AppError("batch.busy"))
+    service = _service(gateway)
+    with pytest.raises(AppError, match=r"batch\.busy"):
+        service.perform_batch_action(
+            BatchActionRequest(
+                request_id="req-busy",
+                kind=BatchCommandKind.RESUME_BATCH,
+                batch_id="batch-busy",
+            )
+        )
+    assert not service.coordinator.snapshot().has_work
+    service.coordinator.shutdown()
+
+
+def test_retry_preflight_fails_before_ack() -> None:
+    gateway = FakeGateway(
+        resolve_retry_error=AppError("batch.retry_invalid", {"reason": "no_retryable_stage"})
+    )
+    service = _service(gateway)
+    with pytest.raises(AppError, match=r"batch\.retry_invalid"):
+        service.perform_job_action(
+            JobActionRequest(
+                request_id="req-bad-retry",
+                kind=BatchCommandKind.RETRY_JOB,
+                batch_id="batch-r",
+                job_id="job-000001",
+            )
+        )
+    assert gateway.resolve_retry_calls == [("batch-r", "job-000001")]
+    assert gateway.retried == []
+    assert not service.coordinator.snapshot().has_work
+    service.coordinator.shutdown()
+
+
+def test_retry_schedules_resolved_stage() -> None:
+    gateway = FakeGateway(resolved_retry_stage=StageName.TRANSCRIBE)
+    service = _service(gateway)
+    ack = service.perform_job_action(
+        JobActionRequest(
+            request_id="req-retry-stage",
+            kind=BatchCommandKind.RETRY_JOB,
+            batch_id="batch-r",
+            job_id="job-000002",
+        )
+    )
+    assert ack.scheduled is True
+    deadline = time.monotonic() + 2
+    while service.coordinator.snapshot().has_work and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert gateway.retried == [("batch-r", "job-000002", StageName.TRANSCRIBE)]
     service.coordinator.drain_completions()
     service.coordinator.shutdown()
 

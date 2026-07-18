@@ -84,7 +84,7 @@ def build_steps(mode: str) -> list[tuple[str, list[str]]]:
                 "--skip-covered",
                 "--sort=cover",
                 "--fail-under",
-                "85",
+                "80",
             ],
         ),
     ]

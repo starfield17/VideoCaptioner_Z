@@ -327,12 +327,14 @@ def test_batch_submitted_navigates() -> None:
 def test_close_without_local_work() -> None:
     from PySide6.QtGui import QCloseEvent
 
-    window, _controllers, _runner = _window("en")
+    window, controllers, runner = _window("en")
     window.start()
+    # Fake runner stop succeeds by default.
     event = QCloseEvent()
     window.closeEvent(event)
-    # stop may succeed with fake runner
-    assert event.isAccepted() or not event.isAccepted()
+    assert event.isAccepted()
+    assert runner.stop_calls == 1
+    assert controllers.queue is not None
 
 
 def test_close_with_local_work_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -353,9 +355,13 @@ def test_close_with_local_work_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
     event = QCloseEvent()
     window.closeEvent(event)
     assert not event.isAccepted()
-    # idle then close
+    assert window._close_when_idle is True  # type: ignore[attr-defined]
+    # CancelLocalWork acknowledged while still active → window remains open.
+    assert controllers.operations.has_local_work is True
+    # Idle then close
     controllers.operations._execution = LocalExecutionSnapshot(None, ())  # type: ignore[attr-defined]
     window._on_execution_state(LocalExecutionSnapshot(None, ()))  # type: ignore[attr-defined]
+    assert window._close_when_idle is False  # type: ignore[attr-defined]
     controllers.queue.stop()
 
 
@@ -375,4 +381,36 @@ def test_close_with_local_work_keep_open(monkeypatch: pytest.MonkeyPatch) -> Non
     event = QCloseEvent()
     window.closeEvent(event)
     assert not event.isAccepted()
+    assert window._close_when_idle is False  # type: ignore[attr-defined]
+    controllers.queue.stop()
+
+
+def test_close_cancel_failure_clears_close_when_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QMessageBox
+
+    from captioner.core.application.batch_commands import LocalExecutionSnapshot
+    from captioner.gui.application_runner import RunnerFailure
+
+    window, controllers, _runner = _window("en")
+    window.start()
+    controllers.operations._execution = LocalExecutionSnapshot("batch-a", ())  # type: ignore[attr-defined]
+
+    def _yes(*_a: object, **_k: object) -> QMessageBox.StandardButton:
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", _yes)
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert not event.isAccepted()
+    assert window._close_when_idle is True  # type: ignore[attr-defined]
+    window._on_close_cancellation_failed(RunnerFailure(code="batch.execution_active"))  # type: ignore[attr-defined]
+    assert window._close_when_idle is False  # type: ignore[attr-defined]
+    label = window.findChild(QObject, "globalNotificationLabel")
+    assert label is not None
+    # Parent window may be unshown; isHidden tracks the explicit setVisible path.
+    assert not label.isHidden()  # type: ignore[attr-defined]
+    text = label.property("text") if hasattr(label, "property") else ""
+    label_text = str(getattr(label, "text", lambda: text)())
+    assert "batch.execution_active" in label_text or label_text != ""
     controllers.queue.stop()

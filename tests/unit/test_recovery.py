@@ -49,11 +49,27 @@ def _job(job_id: str, *, state: JobState, input_path: str) -> JobProjection:
 
 
 class FakeGateway:
-    def __init__(self, sources: tuple[RecoverySource, ...]) -> None:
+    def __init__(
+        self,
+        sources: tuple[RecoverySource, ...],
+        issues: tuple[object, ...] = (),
+    ) -> None:
         self.sources = sources
+        self.issues = issues
 
-    def read_recovery_sources(self) -> tuple[RecoverySource, ...]:
-        return self.sources
+    def read_recovery_sources(self) -> object:
+        from captioner.core.ports.batch_gateway import RecoveryReadResult, RecoverySourceIssue
+
+        typed_issues = tuple(
+            issue
+            if isinstance(issue, RecoverySourceIssue)
+            else RecoverySourceIssue(
+                batch_name=getattr(issue, "batch_name", "x"),
+                code=getattr(issue, "code", "queue.batch_read_failed"),
+            )
+            for issue in self.issues
+        )
+        return RecoveryReadResult(sources=self.sources, issues=typed_issues)
 
     def create_batch(self, draft: object) -> object:
         raise NotImplementedError
@@ -61,10 +77,16 @@ class FakeGateway:
     def execute_created_batch(self, batch_id: str) -> None:
         raise NotImplementedError
 
+    def validate_resume(self, batch_id: str) -> None:
+        raise NotImplementedError
+
     def resume_batch(self, batch_id: str) -> None:
         raise NotImplementedError
 
-    def retry_job(self, batch_id: str, job_id: str) -> StageName:
+    def resolve_retry_stage(self, batch_id: str, job_id: str) -> StageName:
+        raise NotImplementedError
+
+    def retry_job(self, batch_id: str, job_id: str, stage: StageName) -> None:
         raise NotImplementedError
 
     def request_cancel(
@@ -144,3 +166,45 @@ def test_recovery_filters_active_and_blocks_missing_input(tmp_path: Path) -> Non
     blocked = next(item for item in snapshot.items if item.batch_id == "batch-missing")
     assert blocked.can_resume is False
     assert blocked.blocked_code == "recovery.input_missing"
+
+
+def test_recovery_propagates_catalog_issues(tmp_path: Path) -> None:
+    from captioner.core.ports.batch_gateway import RecoverySourceIssue
+
+    present = tmp_path / "ok.wav"
+    present.write_bytes(b"x")
+    sources = (
+        RecoverySource(
+            batch_id="batch-valid",
+            created_at_utc="2026-01-01T00:00:00+00:00",
+            state=BatchState.PENDING,
+            job_count=1,
+            pause_requested=False,
+            missing_input_paths=(),
+            last_event_seq=1,
+            lease_state="missing",
+            projection=BatchProjection(
+                "batch-valid",
+                (_job("job-000001", state=JobState.PENDING, input_path=str(present)),),
+                last_event_seq=1,
+            ),
+        ),
+    )
+    issues = (
+        RecoverySourceIssue(batch_name="batch-corrupt", code="queue.batch_read_failed"),
+        RecoverySourceIssue(batch_name="batch-a-corrupt", code="queue.journal_corrupt"),
+    )
+    service = RecoveryService(
+        cast(Any, FakeGateway(sources, issues=issues)),
+        SerialExecutionCoordinator(),
+    )
+    snapshot = service.scan(RecoveryRequest(request_id="req-2"))
+    assert any(item.batch_id == "batch-valid" for item in snapshot.items)
+    assert len(snapshot.issues) == 2
+    # Stable ordering by batch_name then code.
+    assert snapshot.issues[0].batch_name == "batch-a-corrupt"
+    assert snapshot.issues[1].batch_name == "batch-corrupt"
+    for issue in snapshot.issues:
+        assert "/" not in issue.batch_name
+        assert "Traceback" not in issue.code
+        assert "Exception" not in issue.code

@@ -228,7 +228,7 @@ def _available_actions(
         not scheduled
         and source.lease_state in _STALE_LEASE_STATES
         and source.batch_has_nonterminal
-        and source.input_exists
+        and source.batch_inputs_available
         and not source.batch_cancel_requested
         and (paused or pause_requested or source.state in {JobState.PENDING, JobState.INTERRUPTED})
     ):

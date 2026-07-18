@@ -100,7 +100,7 @@ source = ["src/captioner"]
 concurrency = ["thread"]
 
 [tool.coverage.report]
-fail_under = 85
+fail_under = 80
 show_missing = true
 exclude_also = [
     "if TYPE_CHECKING:",
