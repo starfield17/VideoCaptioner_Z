@@ -12,13 +12,18 @@ from captioner import __version__
 from captioner.adapters.subtitles.corpus import run_project_subtitle_corpus
 from captioner.cli.commands import batch as batch_command
 from captioner.cli.commands import doctor
+from captioner.cli.commands import runtime as runtime_command
 from captioner.cli.outcomes import exit_code_for_error
 from captioner.cli.output import doctor_labels, render
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.result import JsonValue
 from captioner.core.domain.stage import PipelineProfile, StageName
 from captioner.i18n.service import I18nService
-from captioner.infrastructure.app_paths import CompiledRuntime, resolve_app_paths
+from captioner.infrastructure.app_paths import (
+    CompiledRuntime,
+    ensure_runtime_layout,
+    resolve_app_paths,
+)
 
 
 class _SourceLanguageArgumentError(argparse.ArgumentTypeError):
@@ -121,6 +126,42 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_parser.add_argument("batch_id")
     cancel_parser.add_argument("--job")
     cancel_parser.add_argument("--json", action="store_true")
+    runtime_parser = subparsers.add_parser("runtime", help="Manage isolated ASR Runtimes")
+    runtime_subparsers = runtime_parser.add_subparsers(dest="runtime_command", required=True)
+    runtime_list = runtime_subparsers.add_parser("list", help="List installed Runtimes")
+    runtime_list.add_argument("--json", action="store_true")
+    runtime_install = runtime_subparsers.add_parser("install", help="Install a Runtime package")
+    runtime_install.add_argument("reference")
+    runtime_install.add_argument("--no-activate", action="store_true")
+    runtime_install.add_argument("--json", action="store_true")
+    runtime_doctor = runtime_subparsers.add_parser("doctor", help="Run Runtime Doctor")
+    runtime_doctor.add_argument("runtime_id")
+    runtime_doctor.add_argument("--version", dest="runtime_version", required=True)
+    runtime_doctor.add_argument("--activation", action="store_true")
+    runtime_doctor.add_argument("--json", action="store_true")
+    runtime_activate = runtime_subparsers.add_parser("activate", help="Activate a Runtime")
+    runtime_activate.add_argument("runtime_id")
+    runtime_activate.add_argument("--version", dest="runtime_version", required=True)
+    runtime_activate.add_argument("--json", action="store_true")
+    runtime_rollback = runtime_subparsers.add_parser("rollback", help="Rollback an active Runtime")
+    runtime_rollback.add_argument("--backend", required=True)
+    runtime_rollback.add_argument(
+        "--platform", choices=("macos", "windows", "linux"), required=True
+    )
+    runtime_rollback.add_argument("--architecture", choices=("arm64", "x86_64"), required=True)
+    runtime_rollback.add_argument("--device", choices=("cpu", "cuda", "metal"), required=True)
+    runtime_rollback.add_argument("--json", action="store_true")
+    runtime_remove = runtime_subparsers.add_parser("remove", help="Remove a managed Runtime")
+    runtime_remove.add_argument("runtime_id")
+    runtime_remove.add_argument("--version", dest="runtime_version", required=True)
+    runtime_remove.add_argument("--json", action="store_true")
+    runtime_external = runtime_subparsers.add_parser(
+        "register-external", help="Register a developer-managed Runtime"
+    )
+    runtime_external.add_argument("--manifest", type=Path, required=True)
+    runtime_external.add_argument("--root", type=Path, required=True)
+    runtime_external.add_argument("--developer-mode", action="store_true")
+    runtime_external.add_argument("--json", action="store_true")
     return parser
 
 
@@ -144,6 +185,7 @@ def main(
             "retry",
             "cancel",
             "subtitle-corpus",
+            "runtime",
         ):
             parser.error(f"unknown command: {namespace.command}")
         paths = resolve_app_paths(compiled_runtime=compiled_runtime)
@@ -228,6 +270,10 @@ def main(
             payload = cast(
                 dict[str, JsonValue], batch_command.projection_payload(projection, paths=paths)
             )
+            labels = None
+        elif namespace.command == "runtime":
+            ensure_runtime_layout(paths)
+            payload = runtime_command.execute(namespace, paths=paths)
             labels = None
         else:
             marker = batch_command.cancel(namespace.batch_id, namespace.job, paths=paths)
