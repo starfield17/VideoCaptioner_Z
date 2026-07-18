@@ -3,26 +3,77 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import platform
 import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from captioner.core.domain.errors import AppError
-from captioner.infrastructure.app_paths import validate_resource_root
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = PROJECT_ROOT / "src"
+
+source_root_text = str(SOURCE_ROOT)
+
+if source_root_text not in sys.path:
+    sys.path.insert(0, source_root_text)
+
+# SOURCE_ROOT must be on sys.path before project imports when not installed.
+from captioner.core.domain.errors import AppError  # noqa: E402
+from captioner.infrastructure.app_paths import validate_resource_root  # noqa: E402
+
 DIST_ROOT = PROJECT_ROOT / "dist"
 VERSION_PATTERN = re.compile(
     r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
 BuildTarget = Literal["cli", "desktop"]
+REQUIRED_PYTHON = (3, 13)
+MSVC_COMPONENT = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+VSWHERE_RELATIVE = Path("Microsoft Visual Studio") / "Installer" / "vswhere.exe"
+
+NUITKA_MISSING_MESSAGE = """\
+Nuitka is not installed in the selected Python environment.
+
+Recommended:
+  uv sync --frozen
+
+Optional pip setup:
+  python -m pip install -e .
+  python -m pip install "nuitka==2.8.10"
+"""
+
+PYSIDE6_MISSING_MESSAGE = """\
+PySide6 is not installed; it is required for the desktop target.
+
+Recommended:
+  uv sync --frozen
+
+Optional:
+  python -m pip install -e .
+"""
+
+PYTHON_VERSION_MESSAGE = """\
+Unsupported Python version: {version}.
+
+Captioner builds require Python 3.13.
+"""
+
+MSVC_MISSING_MESSAGE = """\
+No supported Windows C compiler was found.
+
+Install Visual Studio 2022 Build Tools with:
+- Desktop development with C++
+- MSVC v143 x64/x86 build tools
+- Windows 10 or Windows 11 SDK
+
+uv installs Python packages only; it does not install the native C compiler.
+"""
 
 
 class BuildError(RuntimeError):
@@ -75,6 +126,23 @@ class BuildError(RuntimeError):
     @classmethod
     def resource_copy_failed(cls, source: Path, destination: Path, detail: str) -> BuildError:
         return cls(f"failed to stage resources {source} -> {destination}: {detail}")
+
+    @classmethod
+    def nuitka_missing(cls) -> BuildError:
+        return cls(NUITKA_MISSING_MESSAGE.strip())
+
+    @classmethod
+    def pyside6_missing(cls) -> BuildError:
+        return cls(PYSIDE6_MISSING_MESSAGE.strip())
+
+    @classmethod
+    def unsupported_python(cls, version_info: tuple[int, ...]) -> BuildError:
+        version = ".".join(str(part) for part in version_info[:3])
+        return cls(PYTHON_VERSION_MESSAGE.format(version=version).strip())
+
+    @classmethod
+    def msvc_missing(cls) -> BuildError:
+        return cls(MSVC_MISSING_MESSAGE.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +242,139 @@ def artifact_suffix(layout: BuildLayout) -> str:
     if layout.target == "desktop" and layout.platform_name == "macos":
         return ".app"
     return ".dist"
+
+
+def build_environment(
+    *,
+    project_root: Path = PROJECT_ROOT,
+) -> dict[str, str]:
+    """Copy the process environment with the source tree prepended to PYTHONPATH."""
+    environment = os.environ.copy()
+    source_root = str((project_root / "src").resolve())
+    current = environment.get("PYTHONPATH")
+
+    environment["PYTHONPATH"] = (
+        source_root if not current else os.pathsep.join((source_root, current))
+    )
+    return environment
+
+
+def module_available(name: str) -> bool:
+    """Return whether an importable module exists in the current environment."""
+    return importlib.util.find_spec(name) is not None
+
+
+def preflight_python_version(
+    *,
+    version_info: tuple[int, ...] | None = None,
+) -> None:
+    """Reject interpreters other than Python 3.13."""
+    if version_info is None:
+        current = (sys.version_info.major, sys.version_info.minor, sys.version_info.micro)
+    else:
+        current = version_info
+    if current[:2] != REQUIRED_PYTHON:
+        raise BuildError.unsupported_python(current)
+
+
+def preflight_dependencies(
+    target: BuildTarget,
+    *,
+    find_module: Callable[[str], bool] = module_available,
+) -> None:
+    """Reject missing Nuitka (all targets) or PySide6 (desktop) before compilation."""
+    if not find_module("nuitka"):
+        raise BuildError.nuitka_missing()
+    if target == "desktop" and not find_module("PySide6"):
+        raise BuildError.pyside6_missing()
+
+
+def detect_msvc(
+    *,
+    which: Callable[[str], str | None] = shutil.which,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    environ: dict[str, str] | None = None,
+) -> bool:
+    """Return True when MSVC x64 tools are available for Windows Python 3.13 builds."""
+    if which("cl") is not None:
+        return True
+
+    env = os.environ if environ is None else environ
+    candidates: list[Path] = []
+    which_vswhere = which("vswhere")
+    if which_vswhere is not None:
+        candidates.append(Path(which_vswhere))
+    program_files_x86 = env.get("ProgramFiles(x86)")
+    if program_files_x86:
+        candidates.append(Path(program_files_x86) / VSWHERE_RELATIVE)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not resolved.is_file():
+            continue
+        try:
+            completed = run(
+                [
+                    str(resolved),
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    MSVC_COMPONENT,
+                    "-property",
+                    "installationPath",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            continue
+        if completed.returncode != 0:
+            continue
+        if completed.stdout.strip():
+            return True
+    return False
+
+
+def preflight_windows_compiler(
+    platform_name: str,
+    *,
+    architecture: str | None = None,
+    detect: Callable[[], bool] = detect_msvc,
+) -> None:
+    """Fail early when Windows x64 builds lack MSVC; leave ARM64 policy unchanged."""
+    if platform_name != "windows":
+        return
+    normalized = (platform.machine() if architecture is None else architecture).lower()
+    if normalized not in {"x86_64", "amd64", "x64"}:
+        return
+    if not detect():
+        raise BuildError.msvc_missing()
+
+
+def preflight_build(
+    target: BuildTarget,
+    *,
+    platform_name: str | None = None,
+    architecture: str | None = None,
+    version_info: tuple[int, ...] | None = None,
+    find_module: Callable[[str], bool] = module_available,
+    detect_compiler: Callable[[], bool] = detect_msvc,
+) -> None:
+    """Run deterministic startup checks before invoking Nuitka."""
+    preflight_python_version(version_info=version_info)
+    preflight_dependencies(target, find_module=find_module)
+    normalized = normalize_platform(platform_name)
+    preflight_windows_compiler(
+        normalized,
+        architecture=architecture,
+        detect=detect_compiler,
+    )
 
 
 def safe_remove_owned(path: Path, owned_paths: tuple[Path, ...]) -> None:
@@ -391,12 +592,18 @@ def build(
     """Compile, stage, and verify the local platform artifact."""
     validate_version(version)
     layout = layout_for_platform(platform_name, target=target)
+    preflight_build(target, platform_name=layout.platform_name)
     if clean:
         clean_owned_paths(layout)
     layout.work_root.mkdir(parents=True, exist_ok=True)
     command = build_command(version, layout)
     print("==> " + " ".join(command), flush=True)
-    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+    subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        check=True,
+        env=build_environment(),
+    )
     artifact = find_unique_artifact(layout.work_root, artifact_suffix(layout))
     stage_artifact(layout, artifact)
     print(f"Nuitka output: {layout.final_root}")
@@ -419,7 +626,7 @@ def main(argv: list[str] | None = None) -> int:
     namespace = parser.parse_args(argv)
     try:
         build(namespace.version, clean=namespace.clean, target=namespace.target)
-    except (BuildError, ValueError, subprocess.CalledProcessError) as exc:
+    except (BuildError, ValueError, subprocess.CalledProcessError, OSError) as exc:
         print(f"Nuitka build failed: {exc}", file=sys.stderr)
         return 1
     return 0

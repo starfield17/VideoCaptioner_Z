@@ -21,8 +21,47 @@ uv run python main.py --cli run --help
 uv run python main.py --cli doctor --json
 QT_QPA_PLATFORM=offscreen uv run captioner-gui --lang en --smoke-test
 QT_QPA_PLATFORM=offscreen uv run captioner-gui --lang zh-CN --smoke-test
+```
+
+### Recommended Nuitka build (`uv`)
+
+```bash
+uv sync --frozen
+
 uv run python scripts/build_nuitka.py --clean --target cli --version 0.0.0
 uv run python scripts/build_nuitka.py --clean --target desktop --version 0.0.0
+```
+
+On Windows PowerShell:
+
+```powershell
+uv sync --frozen
+
+uv run python scripts/build_nuitka.py `
+  --clean `
+  --target desktop `
+  --version 0.0.0
+```
+
+### Optional standard Python build
+
+`uv` is recommended but not mandatory. A prepared Python 3.13 environment can
+invoke the wrapper directly without an editable install of `captioner` being
+strictly required for import resolution (the wrapper bootstraps `src/`), but
+project dependencies, Nuitka, and a supported native compiler are still required.
+
+```powershell
+py -3.13 -m venv .venv-pip
+.\.venv-pip\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m pip install "nuitka==2.8.10"
+
+python scripts/build_nuitka.py `
+  --clean `
+  --target desktop `
+  --version 0.0.0
 ```
 
 Without `uv`, install the locked runtime dependencies with pip (Python 3.13):
@@ -35,6 +74,11 @@ python main.py --cli --help
 
 `requirements.txt` is exported from `uv.lock` and does not include dev tools or the
 optional Faster Whisper ASR extra. Prefer `uv sync --frozen` for development and CI.
+
+Both build methods require a supported native compiler. On Windows with Python
+3.13, install Visual Studio 2022 Build Tools with the Desktop development with
+C++ workload, MSVC v143, and a Windows SDK. Scoop/MSYS2 GCC and MinGW are not
+supported for this Python version.
 
 Phase 5 desktop workflow pages: Create, Queue, History, Settings, and
 Diagnostics. English and Simplified Chinese catalogs are required. Diagnostics
