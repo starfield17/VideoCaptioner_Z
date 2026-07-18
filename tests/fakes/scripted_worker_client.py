@@ -10,9 +10,11 @@ from captioner.core.domain.errors import AppError
 from captioner.core.domain.runtime import RuntimeInstallation
 from captioner.core.domain.worker_protocol import (
     CancelResult,
+    HandshakeRequest,
     ResultDescriptor,
     ShutdownResult,
     TranscribeRequest,
+    WorkerCancelledEvent,
     WorkerError,
     WorkerErrorEvent,
     WorkerEvent,
@@ -24,7 +26,11 @@ from captioner.core.domain.worker_protocol import (
 )
 
 
-def _empty_start_calls() -> list[tuple[RuntimeInstallation, Path]]:
+def _empty_handshake_requests() -> list[HandshakeRequest]:
+    return []
+
+
+def _empty_start_calls() -> list[tuple[RuntimeInstallation, Path, HandshakeRequest]]:
     return []
 
 
@@ -48,7 +54,10 @@ class ScriptedWorkerClient:
     error: WorkerError | None = None
     cancel_timed_out: bool = False
     contaminated_stdout_lines: tuple[str | bytes, ...] = ()
-    start_calls: list[tuple[RuntimeInstallation, Path]] = field(default_factory=_empty_start_calls)
+    start_calls: list[tuple[RuntimeInstallation, Path, HandshakeRequest]] = field(
+        default_factory=_empty_start_calls
+    )
+    handshake_requests: list[HandshakeRequest] = field(default_factory=_empty_handshake_requests)
     transcribe_requests: list[TranscribeRequest] = field(default_factory=_empty_requests)
     cancel_calls: list[str] = field(default_factory=_empty_cancel_calls)
     shutdown_calls: list[bool] = field(default_factory=_empty_shutdown_calls)
@@ -56,19 +65,27 @@ class ScriptedWorkerClient:
     _started: bool = field(default=False, init=False)
     _shutdown: bool = field(default=False, init=False)
     _last_sequence: int | None = field(default=None, init=False)
+    _cancel_requested: str | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.result is not None and self.error is not None:
             raise ValueError("result_and_error_are_mutually_exclusive")
 
-    async def start(self, runtime: RuntimeInstallation, workspace: Path) -> WorkerHandshake:
+    async def start(
+        self,
+        runtime: RuntimeInstallation,
+        workspace: Path,
+        request: HandshakeRequest,
+    ) -> WorkerHandshake:
         if self._shutdown:
             raise AppError("worker.shutdown")
         if not workspace.is_absolute():
             raise AppError("worker.workspace_invalid")
-        self.start_calls.append((runtime, workspace))
+        self.start_calls.append((runtime, workspace, request))
+        self.handshake_requests.append(request)
         self._started = True
         self._last_sequence = None
+        self._cancel_requested = None
         return self.handshake
 
     def transcribe(self, request: TranscribeRequest) -> AsyncIterator[WorkerEvent]:
@@ -84,8 +101,35 @@ class ScriptedWorkerClient:
                 for line in self.contaminated_stdout_lines:
                     decode_stdout_line(line)
                 for event in self.progress_events:
+                    _validate_event_correlation(event, request)
+                    if self._cancel_requested == request.request_id:
+                        sequence = 0 if self._last_sequence is None else self._last_sequence + 1
+                        self._last_sequence = validate_sequence(self._last_sequence, sequence)
+                        cancelled = WorkerCancelledEvent(
+                            request.request_id,
+                            request.job_id,
+                            request.stage_attempt_id,
+                            sequence,
+                        )
+                        self._active_request_id = None
+                        self._cancel_requested = None
+                        yield cancelled
+                        return
                     self._last_sequence = validate_sequence(self._last_sequence, event.sequence)
                     yield event
+                if self._cancel_requested == request.request_id:
+                    sequence = 0 if self._last_sequence is None else self._last_sequence + 1
+                    self._last_sequence = validate_sequence(self._last_sequence, sequence)
+                    cancelled = WorkerCancelledEvent(
+                        request.request_id,
+                        request.job_id,
+                        request.stage_attempt_id,
+                        sequence,
+                    )
+                    self._active_request_id = None
+                    self._cancel_requested = None
+                    yield cancelled
+                    return
                 if self.error is not None:
                     sequence = 0 if self._last_sequence is None else self._last_sequence + 1
                     self._last_sequence = validate_sequence(self._last_sequence, sequence)
@@ -108,6 +152,7 @@ class ScriptedWorkerClient:
                     )
             finally:
                 self._active_request_id = None
+                self._cancel_requested = None
 
         return scripted_events()
 
@@ -117,6 +162,7 @@ class ScriptedWorkerClient:
             raise AppError("worker.request_not_found")
         if self.cancel_timed_out:
             return CancelResult(request_id, acknowledged=False, timed_out=True)
+        self._cancel_requested = request_id
         return CancelResult(request_id, acknowledged=True, cancelled=True)
 
     async def shutdown(self) -> ShutdownResult:
@@ -124,7 +170,17 @@ class ScriptedWorkerClient:
         self._shutdown = True
         self._started = False
         self._active_request_id = None
+        self._cancel_requested = None
         return ShutdownResult(acknowledged=True)
+
+
+def _validate_event_correlation(event: WorkerEvent, request: TranscribeRequest) -> None:
+    if (
+        event.request_id != request.request_id
+        or event.job_id != request.job_id
+        or event.stage_attempt_id != request.stage_attempt_id
+    ):
+        raise AppError("worker.event_correlation_invalid")
 
 
 __all__ = ["ScriptedWorkerClient"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,8 @@ from captioner.core.domain.model import (
     ModelIdentity,
     ModelManifest,
     ModelState,
+    compute_model_manifest_sha256,
+    model_manifest_digest_payload,
     required_files_for_format,
 )
 
@@ -92,3 +95,76 @@ def test_managed_and_external_delete_semantics_are_separate() -> None:
 def test_model_file_rejects_path_traversal() -> None:
     with pytest.raises(AppError, match=r"model\.file_invalid"):
         ModelFileEntry("../weights.bin", 1, "a" * 64)
+
+
+def test_model_manifest_digest_is_canonical_and_excludes_itself() -> None:
+    first = model_manifest(
+        source_metadata={"z": "last", "a": "first"},
+        required_capabilities=("translation_task", "word_timestamps"),
+        files=(
+            ModelFileEntry("model.bin", 1, "c" * 64),
+            ModelFileEntry("config.json", 1, "b" * 64),
+        ),
+        compatible_runtime_backends=("future-backend", "faster-whisper"),
+        required_device_kind="cpu",
+        required_platform="linux",
+    )
+    second = model_manifest(
+        source_metadata={"a": "first", "z": "last"},
+        required_capabilities=("word_timestamps", "translation_task"),
+        files=(
+            ModelFileEntry("config.json", 1, "b" * 64),
+            ModelFileEntry("model.bin", 1, "c" * 64),
+        ),
+        compatible_runtime_backends=("faster-whisper", "future-backend"),
+        required_device_kind="cpu",
+        required_platform="linux",
+    )
+    first_payload = model_manifest_digest_payload(first)
+    assert "manifest_sha256" not in first_payload
+    assert first.identity.manifest_sha256 == compute_model_manifest_sha256(first)
+    assert first.identity.manifest_sha256 == second.identity.manifest_sha256
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        lambda: model_manifest(revision="revision-b"),
+        lambda: model_manifest(source_metadata={"source": "changed"}),
+        lambda: model_manifest(model_format="other-format"),
+        lambda: model_manifest(
+            files=(
+                ModelFileEntry("config.json", 2, "b" * 64),
+                ModelFileEntry("model.bin", 1, "c" * 64),
+            )
+        ),
+    ],
+)
+def test_semantic_manifest_changes_change_digest(
+    changed: Callable[[], ModelManifest],
+) -> None:
+    baseline = model_manifest()
+    assert baseline.identity.manifest_sha256 != changed().identity.manifest_sha256
+
+
+def test_model_manifest_rejects_a_self_or_stale_digest() -> None:
+    identity = ModelIdentity(
+        "faster-whisper",
+        "huggingface",
+        "org/model",
+        "revision-a",
+        "faster-whisper-ct2",
+        "0" * 64,
+    )
+    with pytest.raises(AppError, match=r"model\.manifest_digest_mismatch"):
+        ModelManifest(
+            1,
+            identity,
+            "large-v3",
+            (
+                ModelFileEntry("config.json", 1, "b" * 64),
+                ModelFileEntry("model.bin", 1, "c" * 64),
+            ),
+            ("faster-whisper",),
+            "faster-whisper-ct2",
+        )

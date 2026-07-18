@@ -5,6 +5,7 @@ from captioner.core.domain.worker_protocol import (
     WorkerEnvelope,
     decode_jsonl,
     decode_stdout_line,
+    decode_typed_message,
     encode_jsonl,
 )
 
@@ -19,6 +20,7 @@ __all__ = [
     "decode_line",
     "decode_stdout",
     "decode_stdout_line",
+    "decode_typed_message",
     "encode_jsonl",
     "encode_line",
 ]

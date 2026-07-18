@@ -110,7 +110,7 @@ def _capability_present(runtime: RuntimeManifest, required: str) -> bool:
         "language_detection": capability.language_detection,
         "translation_task": capability.translation_task,
     }
-    return values.get(required, required in runtime.supported_model_formats)
+    return values.get(required, required in capability.additional_capabilities)
 
 
 __all__ = [

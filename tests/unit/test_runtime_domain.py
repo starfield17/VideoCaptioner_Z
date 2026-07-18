@@ -13,6 +13,7 @@ from captioner.core.domain.runtime import (
     RuntimeFileEntry,
     RuntimeIdentity,
     RuntimeState,
+    RuntimeTarget,
 )
 
 
@@ -79,3 +80,22 @@ def test_runtime_manifest_does_not_create_or_reference_install_path(tmp_path: Pa
     manifest = runtime_manifest()
     assert "install_path" not in manifest.to_dict()
     assert str(tmp_path) not in repr(manifest)
+
+
+def test_runtime_target_key_ignores_minimum_os_version() -> None:
+    first = RuntimeTarget("macos", "arm64", "cpu", "13.0")
+    second = RuntimeTarget("macos", "arm64", "cpu", "14.0")
+    assert first.key == second.key == ("macos", "arm64", "cpu")
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ("darwin", "arm64", "cpu"),
+        ("windows", "amd64", "cpu"),
+        ("linux", "x86_64", "gpu"),
+    ],
+)
+def test_runtime_target_requires_normalized_values(values: tuple[str, str, str]) -> None:
+    with pytest.raises(AppError, match=r"runtime\.target_invalid"):
+        RuntimeTarget(*values, "1.0")

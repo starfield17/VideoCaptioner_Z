@@ -18,7 +18,7 @@ def _empty_installations() -> dict[RuntimeIdentity, RuntimeInstallation]:
     return {}
 
 
-def _empty_active() -> dict[tuple[str, tuple[str, str, str, str]], RuntimeIdentity]:
+def _empty_active() -> dict[tuple[str, tuple[str, str, str]], RuntimeIdentity]:
     return {}
 
 
@@ -32,7 +32,7 @@ class InMemoryRuntimeRepository:
     _installations: dict[RuntimeIdentity, RuntimeInstallation] = field(
         default_factory=_empty_installations, init=False
     )
-    _active: dict[tuple[str, tuple[str, str, str, str]], RuntimeIdentity] = field(
+    _active: dict[tuple[str, tuple[str, str, str]], RuntimeIdentity] = field(
         default_factory=_empty_active, init=False
     )
     _in_use: set[RuntimeIdentity] = field(default_factory=_empty_in_use, init=False)

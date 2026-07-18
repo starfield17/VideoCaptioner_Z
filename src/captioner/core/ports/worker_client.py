@@ -9,6 +9,7 @@ from typing import Protocol
 from captioner.core.domain.runtime import RuntimeInstallation
 from captioner.core.domain.worker_protocol import (
     CancelResult,
+    HandshakeRequest,
     ShutdownResult,
     TranscribeRequest,
     WorkerEvent,
@@ -19,7 +20,12 @@ from captioner.core.domain.worker_protocol import (
 class WorkerClient(Protocol):
     """One Worker session; implementations must serialize active requests."""
 
-    async def start(self, runtime: RuntimeInstallation, workspace: Path) -> WorkerHandshake: ...
+    async def start(
+        self,
+        runtime: RuntimeInstallation,
+        workspace: Path,
+        request: HandshakeRequest,
+    ) -> WorkerHandshake: ...
 
     def transcribe(self, request: TranscribeRequest) -> AsyncIterator[WorkerEvent]: ...
 

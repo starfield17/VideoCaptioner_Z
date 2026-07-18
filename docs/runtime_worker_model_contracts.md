@@ -42,6 +42,11 @@ device checks, workspace round-trip, and clean shutdown passed activation
 Doctor. An `external_unmanaged` record is not managed by Captioner for upgrade
 or deletion. It can be active only after the same activation checks pass.
 
+The active-runtime slot is `(backend_id, platform, architecture, device)`;
+minimum OS version is a compatibility constraint, not a second slot key.
+Selectors consume the repository's active pointers and do not guess between
+multiple versions. A duplicate active candidate is an ambiguity error.
+
 Static Doctor and Activation Doctor are separate Port operations. Phase 6.0
 defines their structured reports and deterministic fake only; it does not run
 either real Doctor.
@@ -58,7 +63,12 @@ Managed models may be removed by a later repository implementation. External
 models are advanced-mode references: Captioner does not copy or delete their
 files. `installed` means file, size, hash, and manifest verification passed;
 `load_verified` is a separate state earned after a compatible Runtime has
-loaded the model.
+loaded the model. External models must first have a local validation projection
+before they can be selected. A canonical Manifest digest is computed from
+schema, stable identity fields (excluding `manifest_sha256` itself), display
+metadata, sorted file entries, sorted backend/capability sets, source metadata,
+and model constraints. JSON uses sorted keys, compact separators, UTF-8, and
+finite values only; local absolute paths are never included.
 
 Faster Whisper and MLX Whisper are separate backends and formats:
 
@@ -77,15 +87,34 @@ files are not hosted by this repository.
 Selection is a pure preflight policy. It never downloads, installs, mutates an
 active pointer, converts a model, or reinterprets a persisted effective
 selection. On native Apple Silicon with macOS 14 or later, `device=auto`
-selects an available compatible MLX Metal Runtime for an MLX model. Otherwise,
-an available compatible Faster Whisper CPU Runtime is selected for a Faster
-Whisper model. An MLX model never falls back to Faster Whisper, and a Faster
-Whisper model is never silently converted to MLX. Windows and Linux cannot
-select the MLX Metal Runtime.
+selects an available compatible MLX Metal Runtime for an MLX model. A Faster
+Whisper CT2 model selects an available compatible CUDA Runtime first and then
+CPU. An MLX model never falls back to Faster Whisper, and a Faster Whisper
+model is never silently converted to MLX. Windows and Linux cannot select the
+MLX Metal Runtime.
 
 `auto` selection produces effective backend, Runtime identity, device, and
 model identity values. Job creation will persist those values; Resume uses
 the persisted effective values rather than running auto selection again.
+For a Faster Whisper CT2 model, an available compatible CUDA Runtime is chosen
+before CPU; if CUDA is unavailable, CPU is chosen. This priority applies on
+Windows, Linux, and any host where a compatible CUDA Runtime is active. MLX
+models remain MLX-only and never fall back to CPU/CUDA.
+
+## Protocol and handshake
+
+Every JSONL envelope is decoded against the typed payload schema for its
+`message_type`; a valid envelope with an arbitrary placeholder object is not
+accepted. Same-major protocol versions may add optional fields, but required
+fields and field types remain validated. Core sends a `HandshakeRequest`, and
+the activation policy checks the Worker Runtime identity, compatible backend
+version, normalized platform/architecture, required capabilities and result
+schemas, model formats, and target device before the Runtime becomes usable.
+
+The scripted Worker fake models one active request, correlated request/job/
+attempt IDs, strictly increasing event sequences, terminal cancellation, and
+the distinction between acknowledged cancellation and a timeout. A timeout
+keeps the request busy until shutdown/termination simulation.
 
 ## Progress and errors
 

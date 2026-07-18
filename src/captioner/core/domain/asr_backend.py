@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import cast
 
 from captioner.core.domain.errors import AppError
 
@@ -54,6 +55,7 @@ class BackendCapability:
     word_timestamps: bool
     language_detection: bool
     translation_task: bool
+    additional_capabilities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.backend_id, "backend_id")
@@ -68,7 +70,19 @@ class BackendCapability:
                 "runtime.capability_invalid",
                 {"field": "supported_model_formats", "reason": "duplicate"},
             )
+        additional = tuple(self.additional_capabilities)
+        if any(
+            not isinstance(cast(object, value), str) or not value.strip() or value != value.strip()
+            for value in additional
+        ):
+            raise AppError("runtime.capability_invalid", {"field": "additional_capabilities"})
+        if len(set(additional)) != len(additional):
+            raise AppError(
+                "runtime.capability_invalid",
+                {"field": "additional_capabilities", "reason": "duplicate"},
+            )
         object.__setattr__(self, "supported_model_formats", formats)
+        object.__setattr__(self, "additional_capabilities", additional)
 
 
 def _require_text(value: object, field: str) -> None:

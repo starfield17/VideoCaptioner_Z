@@ -18,9 +18,9 @@ from captioner.core.domain.result import (
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_KNOWN_PLATFORMS = frozenset({"macos", "windows", "linux"})
-_KNOWN_ARCHITECTURES = frozenset({"arm64", "x86_64"})
-_KNOWN_DEVICES = frozenset({"cpu", "cuda", "metal"})
+SUPPORTED_RUNTIME_PLATFORMS = frozenset({"macos", "windows", "linux"})
+SUPPORTED_RUNTIME_ARCHITECTURES = frozenset({"arm64", "x86_64"})
+SUPPORTED_RUNTIME_DEVICES = frozenset({"cpu", "cuda", "metal"})
 
 
 def _empty_json_mapping() -> dict[str, JsonValue]:
@@ -62,6 +62,19 @@ class RuntimeIdentity:
     def to_dict(self) -> dict[str, JsonValue]:
         return {"runtime_id": self.runtime_id, "version": self.version}
 
+    @classmethod
+    def from_dict(cls, value: object) -> RuntimeIdentity:
+        if not isinstance(value, Mapping):
+            raise AppError("runtime.identity_invalid", {"field": "identity"})
+        raw = cast(Mapping[object, object], value)
+        runtime_id = raw.get("runtime_id")
+        version = raw.get("version")
+        if not isinstance(runtime_id, str):
+            raise AppError("runtime.identity_invalid", {"field": "runtime_id"})
+        if not isinstance(version, str):
+            raise AppError("runtime.identity_invalid", {"field": "version"})
+        return cls(runtime_id, version)
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeTarget:
@@ -76,18 +89,21 @@ class RuntimeTarget:
         _require_text(self.platform, "platform", "runtime.target_invalid")
         _require_text(self.architecture, "architecture", "runtime.target_invalid")
         _require_text(self.device_kind, "device_kind", "runtime.target_invalid")
-        if self.device_kind == "auto":
+        if self.platform not in SUPPORTED_RUNTIME_PLATFORMS:
+            raise AppError("runtime.target_invalid", {"field": "platform"})
+        if self.architecture not in SUPPORTED_RUNTIME_ARCHITECTURES:
+            raise AppError("runtime.target_invalid", {"field": "architecture"})
+        if self.device_kind not in SUPPORTED_RUNTIME_DEVICES:
             raise AppError("runtime.target_invalid", {"field": "device_kind"})
         _require_version(self.minimum_os_version, "minimum_os_version", "runtime.target_invalid")
 
     @property
-    def key(self) -> tuple[str, str, str, str]:
+    def key(self) -> tuple[str, str, str]:
         """Return the stable key used by an active-runtime pointer."""
         return (
             self.platform,
             self.architecture,
             self.device_kind,
-            self.minimum_os_version,
         )
 
     def to_dict(self) -> dict[str, JsonValue]:
@@ -195,6 +211,7 @@ class RuntimeManifest:
                 "word_timestamps": self.capabilities.word_timestamps,
                 "language_detection": self.capabilities.language_detection,
                 "translation_task": self.capabilities.translation_task,
+                "additional_capabilities": list(self.capabilities.additional_capabilities),
             },
             "supported_model_formats": list(self.supported_model_formats),
             "archive_sha256": self.archive_sha256,
@@ -364,6 +381,9 @@ def _freeze_details(value: object, code: str) -> Mapping[str, JsonValue]:
 
 
 __all__ = [
+    "SUPPORTED_RUNTIME_ARCHITECTURES",
+    "SUPPORTED_RUNTIME_DEVICES",
+    "SUPPORTED_RUNTIME_PLATFORMS",
     "DoctorCheck",
     "DoctorPhase",
     "DoctorReport",

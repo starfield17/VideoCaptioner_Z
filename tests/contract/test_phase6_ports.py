@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,11 @@ from captioner.core.domain.errors import AppError
 from captioner.core.domain.model import ModelSourceCandidate, ModelState
 from captioner.core.domain.operation_progress import OperationProgress
 from captioner.core.domain.runtime import DoctorCheck, DoctorPhase, DoctorReport, RuntimeState
-from captioner.core.domain.worker_protocol import WorkerProgressEvent
+from captioner.core.domain.worker_protocol import (
+    HandshakeRequest,
+    WorkerCancelledEvent,
+    WorkerProgressEvent,
+)
 
 
 def test_phase6_core_layers_do_not_import_adapters() -> None:
@@ -34,6 +39,7 @@ def test_phase6_core_layers_do_not_import_adapters() -> None:
         "captioner.core.ports.worker_client",
         "captioner.core.application.runtime_selection",
         "captioner.core.application.model_compatibility",
+        "captioner.core.application.worker_handshake_validation",
     )
     for module_name in modules:
         source = inspect.getsource(importlib.import_module(module_name))
@@ -145,15 +151,137 @@ def test_scripted_worker_is_ordered_single_request_and_shutdown_is_idempotent() 
             handshake=worker_handshake(),
             progress_events=(progress,),
         )
-        await client.start(runtime_installation(), Path("/workspace"))
+        await client.start(
+            runtime_installation(),
+            Path("/workspace"),
+            HandshakeRequest(
+                required_capabilities=("word_timestamps",),
+                required_backend_id="faster-whisper",
+                required_result_schema_versions=(1,),
+            ),
+        )
         first = client.transcribe(request)
         with pytest.raises(AppError, match=r"worker\.busy"):
             client.transcribe(request)
         events = [event async for event in first]
         assert events == [progress]
+        assert client.handshake_requests == [
+            HandshakeRequest(
+                required_capabilities=("word_timestamps",),
+                required_backend_id="faster-whisper",
+                required_result_schema_versions=(1,),
+            )
+        ]
         assert client.transcribe_requests == [request]
         await client.shutdown()
         await client.shutdown()
         assert client.shutdown_calls == [False, True]
+
+    asyncio.run(scenario())
+
+
+def test_scripted_worker_cancellation_is_terminal_and_releases_request() -> None:
+    async def scenario() -> None:
+        request = transcribe_request()
+        progress = WorkerProgressEvent(
+            request.request_id,
+            request.job_id,
+            request.stage_attempt_id,
+            0,
+            OperationProgress("asr", "transcribing", "worker.transcribing", {}),
+        )
+        client = ScriptedWorkerClient(
+            handshake=worker_handshake(),
+            progress_events=(progress,),
+        )
+        handshake_request = HandshakeRequest(
+            required_capabilities=("word_timestamps",),
+            required_backend_id="faster-whisper",
+            required_result_schema_versions=(1,),
+        )
+        await client.start(runtime_installation(), Path("/workspace"), handshake_request)
+        events = client.transcribe(request)
+        assert await anext(events) == progress
+        cancellation = await client.cancel(request.request_id)
+        assert cancellation.acknowledged
+        assert cancellation.cancelled
+        cancelled = await anext(events)
+        assert isinstance(cancelled, WorkerCancelledEvent)
+        with pytest.raises(StopAsyncIteration):
+            await anext(events)
+        # A terminal cancellation releases the session for a new request.
+        second_progress = replace(progress, sequence=2)
+        client.progress_events = (second_progress,)
+        second_events = client.transcribe(request)
+        assert [event async for event in second_events] == [second_progress]
+
+    asyncio.run(scenario())
+
+
+def test_scripted_worker_cancel_timeout_keeps_request_busy_until_shutdown() -> None:
+    async def scenario() -> None:
+        request = transcribe_request()
+        client = ScriptedWorkerClient(
+            handshake=worker_handshake(),
+            cancel_timed_out=True,
+        )
+        await client.start(runtime_installation(), Path("/workspace"), HandshakeRequest())
+        client.transcribe(request)
+        result = await client.cancel(request.request_id)
+        assert not result.acknowledged
+        assert result.timed_out
+        with pytest.raises(AppError, match=r"worker\.busy"):
+            client.transcribe(request)
+        await client.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_scripted_worker_cancel_requires_matching_request_id() -> None:
+    async def scenario() -> None:
+        request = transcribe_request()
+        client = ScriptedWorkerClient(handshake=worker_handshake())
+        await client.start(runtime_installation(), Path("/workspace"), HandshakeRequest())
+        events = client.transcribe(request)
+        with pytest.raises(AppError, match=r"worker\.request_not_found"):
+            await client.cancel("other-request")
+        with pytest.raises(StopAsyncIteration):
+            await anext(events)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("non_monotonic", [True, False])
+def test_scripted_worker_validates_event_correlation_and_sequence(
+    non_monotonic: bool,
+) -> None:
+    async def scenario() -> None:
+        request = transcribe_request()
+        first = WorkerProgressEvent(
+            request.request_id,
+            request.job_id,
+            request.stage_attempt_id,
+            0,
+            OperationProgress("asr", "preparing_audio", "worker.preparing", {}),
+        )
+        second = WorkerProgressEvent(
+            request.request_id if non_monotonic else "wrong-request",
+            request.job_id,
+            request.stage_attempt_id,
+            0,
+            OperationProgress("asr", "transcribing", "worker.transcribing", {}),
+        )
+        client = ScriptedWorkerClient(
+            handshake=worker_handshake(),
+            progress_events=(first, second),
+        )
+        await client.start(runtime_installation(), Path("/workspace"), HandshakeRequest())
+        events = client.transcribe(request)
+        assert await anext(events) == first
+        expected_error = (
+            "worker.sequence_invalid" if non_monotonic else "worker.event_correlation_invalid"
+        )
+        with pytest.raises(AppError, match=expected_error):
+            await anext(events)
 
     asyncio.run(scenario())

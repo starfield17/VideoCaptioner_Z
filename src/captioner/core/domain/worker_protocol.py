@@ -96,6 +96,55 @@ class CancelRequest:
     def to_payload(self) -> dict[str, JsonValue]:
         return {"target_request_id": self.target_request_id}
 
+    @classmethod
+    def from_payload(cls, value: object) -> CancelRequest:
+        raw = _object(value, "cancel_request")
+        return cls(_required_str(raw, "target_request_id"))
+
+
+@dataclass(frozen=True, slots=True)
+class CancelAcknowledged:
+    """Minimal typed payload confirming a cancellation request was accepted."""
+
+    target_request_id: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty(
+            self.target_request_id,
+            "target_request_id",
+            "worker.cancel_invalid",
+        )
+
+    def to_payload(self) -> dict[str, JsonValue]:
+        return {"target_request_id": self.target_request_id}
+
+    @classmethod
+    def from_payload(cls, value: object) -> CancelAcknowledged:
+        raw = _object(value, "cancel_acknowledged")
+        return cls(_required_str(raw, "target_request_id"))
+
+
+@dataclass(frozen=True, slots=True)
+class OperationCancelled:
+    """Minimal typed terminal payload for a cancelled operation."""
+
+    target_request_id: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty(
+            self.target_request_id,
+            "target_request_id",
+            "worker.cancel_invalid",
+        )
+
+    def to_payload(self) -> dict[str, JsonValue]:
+        return {"target_request_id": self.target_request_id}
+
+    @classmethod
+    def from_payload(cls, value: object) -> OperationCancelled:
+        raw = _object(value, "operation_cancelled")
+        return cls(_required_str(raw, "target_request_id"))
+
 
 @dataclass(frozen=True, slots=True)
 class ShutdownRequest:
@@ -108,6 +157,30 @@ class ShutdownRequest:
 
     def to_payload(self) -> dict[str, JsonValue]:
         return {"reason": self.reason}
+
+    @classmethod
+    def from_payload(cls, value: object) -> ShutdownRequest:
+        raw = _object(value, "shutdown_request")
+        return cls(_required_str(raw, "reason"))
+
+
+@dataclass(frozen=True, slots=True)
+class ShutdownAcknowledged:
+    """Minimal typed payload confirming orderly shutdown."""
+
+    acknowledged: bool
+
+    def __post_init__(self) -> None:
+        if type(self.acknowledged) is not bool:
+            raise AppError("worker.shutdown_invalid", {"field": "acknowledged"})
+
+    def to_payload(self) -> dict[str, JsonValue]:
+        return {"acknowledged": self.acknowledged}
+
+    @classmethod
+    def from_payload(cls, value: object) -> ShutdownAcknowledged:
+        raw = _object(value, "shutdown_acknowledged")
+        return cls(_required_bool(raw, "acknowledged"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +221,13 @@ class WorkerEnvelope:
             raise AppError("worker.progress_invalid", {"field": "payload"})
         object.__setattr__(self, "message_type", message_type)
         object.__setattr__(self, "payload", payload)
+        _decode_typed_payload(
+            message_type,
+            payload,
+            request_id=self.request_id,
+            job_id=self.job_id,
+            stage_attempt_id=self.stage_attempt_id,
+        )
 
     def to_dict(self) -> dict[str, JsonValue]:
         """Return a fresh JSON-compatible envelope."""
@@ -216,6 +296,15 @@ class HandshakeRequest:
             "required_backend_id": self.required_backend_id,
             "required_result_schema_versions": list(self.required_result_schema_versions),
         }
+
+    @classmethod
+    def from_payload(cls, value: object) -> HandshakeRequest:
+        raw = _object(value, "handshake_request")
+        return cls(
+            required_capabilities=_string_tuple(raw, "required_capabilities"),
+            required_backend_id=_optional_str(raw, "required_backend_id"),
+            required_result_schema_versions=_int_tuple(raw, "required_result_schema_versions"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +447,39 @@ class TranscribeRequest:
             "initial_prompt": self.initial_prompt,
             "backend_options": _thaw_public_mapping(self.backend_options),
         }
+
+    @classmethod
+    def from_payload(
+        cls,
+        value: object,
+        *,
+        request_id: str = "request-1",
+        job_id: str = "job-1",
+        stage_attempt_id: str = "attempt-1",
+    ) -> TranscribeRequest:
+        raw = _object(value, "transcribe_request")
+        runtime_identity = RuntimeIdentity.from_dict(raw.get("runtime_identity"))
+        model_identity = ModelIdentity.from_dict(raw.get("model_identity"))
+        backend_options = raw.get("backend_options", {})
+        if not isinstance(backend_options, Mapping):
+            raise AppError("worker.transcribe_request_invalid", {"field": "backend_options"})
+        return cls(
+            normalized_audio_path=Path(_required_str(raw, "normalized_audio_path")),
+            attempt_workspace=Path(_required_str(raw, "attempt_workspace")),
+            model_directory=Path(_required_str(raw, "model_directory")),
+            backend_id=_required_str(raw, "backend_id"),
+            runtime_identity=runtime_identity,
+            model_identity=model_identity,
+            result_schema_version=_required_int(raw, "result_schema_version"),
+            language=_optional_str(raw, "language"),
+            task=_required_str(raw, "task"),
+            word_timestamps=_required_bool(raw, "word_timestamps"),
+            initial_prompt=_optional_str(raw, "initial_prompt"),
+            backend_options=cast(Mapping[str, JsonValue], backend_options),
+            request_id=request_id,
+            job_id=job_id,
+            stage_attempt_id=stage_attempt_id,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,6 +631,70 @@ class WorkerCancelledEvent:
 
 
 type WorkerEvent = WorkerProgressEvent | WorkerResultEvent | WorkerErrorEvent | WorkerCancelledEvent
+type WorkerProtocolMessage = (
+    HandshakeRequest
+    | WorkerHandshake
+    | TranscribeRequest
+    | OperationProgress
+    | CancelRequest
+    | CancelAcknowledged
+    | OperationCancelled
+    | ResultDescriptor
+    | WorkerError
+    | ShutdownRequest
+    | ShutdownAcknowledged
+)
+
+
+def decode_typed_message(envelope: WorkerEnvelope) -> WorkerProtocolMessage:
+    """Validate and decode an envelope payload into its typed domain message."""
+    return _decode_typed_payload(
+        envelope.message_type,
+        envelope.payload,
+        request_id=envelope.request_id,
+        job_id=envelope.job_id,
+        stage_attempt_id=envelope.stage_attempt_id,
+    )
+
+
+def _decode_typed_payload(
+    message_type: str,
+    payload: Mapping[str, JsonValue],
+    *,
+    request_id: str,
+    job_id: str | None,
+    stage_attempt_id: str | None,
+) -> WorkerProtocolMessage:
+    if message_type == WorkerMessageType.HANDSHAKE_REQUEST.value:
+        return HandshakeRequest.from_payload(payload)
+    if message_type == WorkerMessageType.HANDSHAKE_RESPONSE.value:
+        return WorkerHandshake.from_payload(payload)
+    if message_type == WorkerMessageType.TRANSCRIBE_REQUEST.value:
+        if job_id is None or stage_attempt_id is None:
+            raise AppError("worker.envelope_invalid", {"field": "job_id"})
+        return TranscribeRequest.from_payload(
+            payload,
+            request_id=request_id,
+            job_id=job_id,
+            stage_attempt_id=stage_attempt_id,
+        )
+    if message_type == WorkerMessageType.OPERATION_PROGRESS.value:
+        return OperationProgress.from_payload(payload)
+    if message_type == WorkerMessageType.CANCEL_REQUEST.value:
+        return CancelRequest.from_payload(payload)
+    if message_type == WorkerMessageType.CANCEL_ACKNOWLEDGED.value:
+        return CancelAcknowledged.from_payload(payload)
+    if message_type == WorkerMessageType.OPERATION_CANCELLED.value:
+        return OperationCancelled.from_payload(payload)
+    if message_type == WorkerMessageType.OPERATION_RESULT.value:
+        return ResultDescriptor.from_payload(payload)
+    if message_type == WorkerMessageType.OPERATION_ERROR.value:
+        return WorkerError.from_payload(payload)
+    if message_type == WorkerMessageType.SHUTDOWN_REQUEST.value:
+        return ShutdownRequest.from_payload(payload)
+    if message_type == WorkerMessageType.SHUTDOWN_ACKNOWLEDGED.value:
+        return ShutdownAcknowledged.from_payload(payload)
+    raise AppError("worker.message_type_unknown", {"field": "message_type"})
 
 
 def check_protocol_compatibility(core_version: str, worker_version: str) -> bool:
@@ -587,6 +773,9 @@ class JsonlProtocolCodec:
 
     def decode(self, line: str | bytes) -> WorkerEnvelope:
         return decode_jsonl(line)
+
+    def decode_typed(self, line: str | bytes) -> WorkerProtocolMessage:
+        return decode_typed_message(decode_jsonl(line))
 
     def decode_stdout(self, line: str | bytes) -> WorkerEnvelope:
         return decode_stdout_line(line)
@@ -724,9 +913,9 @@ def _required_bool(value: Mapping[object, object], key: str) -> bool:
 
 def _string_tuple(value: Mapping[object, object], key: str) -> tuple[str, ...]:
     item = value.get(key)
-    if not isinstance(item, list):
+    if not isinstance(item, (list, tuple)):
         raise AppError("worker.message_invalid", {"field": key})
-    entries = cast(list[object], item)
+    entries = cast(list[object] | tuple[object, ...], item)
     result: list[str] = []
     for entry in entries:
         if not isinstance(entry, str):
@@ -737,9 +926,9 @@ def _string_tuple(value: Mapping[object, object], key: str) -> tuple[str, ...]:
 
 def _int_tuple(value: Mapping[object, object], key: str) -> tuple[int, ...]:
     item = value.get(key)
-    if not isinstance(item, list):
+    if not isinstance(item, (list, tuple)):
         raise AppError("worker.message_invalid", {"field": key})
-    entries = cast(list[object], item)
+    entries = cast(list[object] | tuple[object, ...], item)
     result: list[int] = []
     for entry in entries:
         if type(entry) is not int:
@@ -772,12 +961,15 @@ def _reject_json_constant(value: str) -> None:
 __all__ = [
     "WORKER_PROTOCOL_NAME",
     "WORKER_PROTOCOL_VERSION",
+    "CancelAcknowledged",
     "CancelRequest",
     "CancelResult",
     "HandshakeRequest",
     "JsonlProtocolCodec",
+    "OperationCancelled",
     "OperationProgress",
     "ResultDescriptor",
+    "ShutdownAcknowledged",
     "ShutdownRequest",
     "ShutdownResult",
     "TranscribeRequest",
@@ -789,6 +981,7 @@ __all__ = [
     "WorkerHandshake",
     "WorkerMessageType",
     "WorkerProgressEvent",
+    "WorkerProtocolMessage",
     "WorkerResultDescriptor",
     "WorkerResultEvent",
     "check_protocol_compatibility",
@@ -796,6 +989,7 @@ __all__ = [
     "decode_message",
     "decode_protocol_line",
     "decode_stdout_line",
+    "decode_typed_message",
     "encode_jsonl",
     "encode_message",
     "require_protocol_compatibility",

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -88,6 +90,20 @@ class ModelIdentity:
             "model_format": self.model_format,
             "manifest_sha256": self.manifest_sha256,
         }
+
+    @classmethod
+    def from_dict(cls, value: object) -> ModelIdentity:
+        if not isinstance(value, Mapping):
+            raise AppError("model.identity_invalid", {"field": "identity"})
+        raw = cast(Mapping[object, object], value)
+        return cls(
+            _required_string(raw, "backend_id"),
+            _required_string(raw, "source_id"),
+            _required_string(raw, "repository_id"),
+            _required_string(raw, "revision"),
+            _required_string(raw, "model_format"),
+            _required_string(raw, "manifest_sha256"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +194,8 @@ class ModelManifest:
         object.__setattr__(self, "files", files)
         object.__setattr__(self, "required_capabilities", capabilities)
         object.__setattr__(self, "source_metadata", frozen_metadata)
+        if self.identity.manifest_sha256 != compute_model_manifest_sha256(self):
+            raise AppError("model.manifest_digest_mismatch", {"field": "manifest_sha256"})
 
     def has_file(self, relative_path: str) -> bool:
         return relative_path in {entry.relative_path for entry in self.files}
@@ -198,6 +216,155 @@ class ModelManifest:
         }
 
 
+def model_manifest_digest_payload(
+    manifest: ModelManifest | None = None,
+    *,
+    schema_version: int | None = None,
+    identity: ModelIdentity | None = None,
+    display_name: str | None = None,
+    files: Sequence[ModelFileEntry] | None = None,
+    compatible_runtime_backends: Sequence[str] | None = None,
+    model_format: str | None = None,
+    source_metadata: Mapping[str, JsonValue] | None = None,
+    description: str | None = None,
+    required_capabilities: Sequence[str] | None = None,
+    required_device_kind: str | None = None,
+    required_platform: str | None = None,
+) -> dict[str, JsonValue]:
+    """Return the canonical model digest input without the digest itself."""
+    if manifest is not None:
+        if any(
+            value is not None
+            for value in (
+                schema_version,
+                identity,
+                display_name,
+                files,
+                compatible_runtime_backends,
+                model_format,
+                source_metadata,
+                description,
+                required_capabilities,
+                required_device_kind,
+                required_platform,
+            )
+        ):
+            raise AppError("model.manifest_digest_invalid", {"reason": "mixed_arguments"})
+        schema_version = manifest.schema_version
+        identity = manifest.identity
+        display_name = manifest.display_name
+        files = manifest.files
+        compatible_runtime_backends = manifest.compatible_runtime_backends
+        model_format = manifest.model_format
+        source_metadata = manifest.source_metadata
+        description = manifest.description
+        required_capabilities = manifest.required_capabilities
+        required_device_kind = manifest.required_device_kind
+        required_platform = manifest.required_platform
+    if (
+        schema_version is None
+        or identity is None
+        or display_name is None
+        or files is None
+        or compatible_runtime_backends is None
+        or model_format is None
+        or source_metadata is None
+        or description is None
+        or required_capabilities is None
+    ):
+        raise AppError("model.manifest_digest_invalid", {"reason": "missing_fields"})
+    return {
+        "schema_version": schema_version,
+        "backend_id": identity.backend_id,
+        "source_id": identity.source_id,
+        "repository_id": identity.repository_id,
+        "revision": identity.revision,
+        "model_format": model_format,
+        "display_name": display_name,
+        "description": description,
+        "files": [entry.to_dict() for entry in sorted(files, key=lambda item: item.relative_path)],
+        "compatible_runtime_backends": cast(list[JsonValue], sorted(compatible_runtime_backends)),
+        "source_metadata": _thaw_metadata(source_metadata),
+        "required_capabilities": cast(list[JsonValue], sorted(required_capabilities)),
+        "required_device_kind": required_device_kind,
+        "required_platform": required_platform,
+    }
+
+
+def compute_model_manifest_sha256(
+    manifest: ModelManifest | None = None,
+    *,
+    schema_version: int | None = None,
+    identity: ModelIdentity | None = None,
+    display_name: str | None = None,
+    files: Sequence[ModelFileEntry] | None = None,
+    compatible_runtime_backends: Sequence[str] | None = None,
+    model_format: str | None = None,
+    source_metadata: Mapping[str, JsonValue] | None = None,
+    description: str | None = None,
+    required_capabilities: Sequence[str] | None = None,
+    required_device_kind: str | None = None,
+    required_platform: str | None = None,
+) -> str:
+    """Compute the SHA-256 of the canonical manifest payload."""
+    if manifest is not None and any(
+        value is not None
+        for value in (
+            schema_version,
+            identity,
+            display_name,
+            files,
+            compatible_runtime_backends,
+            model_format,
+            source_metadata,
+            description,
+            required_capabilities,
+            required_device_kind,
+            required_platform,
+        )
+    ):
+        raise AppError("model.manifest_digest_invalid", {"reason": "mixed_arguments"})
+    if manifest is not None:
+        payload = model_manifest_digest_payload(manifest)
+    else:
+        if (
+            schema_version is None
+            or identity is None
+            or display_name is None
+            or files is None
+            or compatible_runtime_backends is None
+            or model_format is None
+            or source_metadata is None
+            or description is None
+            or required_capabilities is None
+        ):
+            raise AppError("model.manifest_digest_invalid", {"reason": "missing_fields"})
+        payload = model_manifest_digest_payload(
+            schema_version=schema_version,
+            identity=identity,
+            display_name=display_name,
+            files=files,
+            compatible_runtime_backends=compatible_runtime_backends,
+            model_format=model_format,
+            source_metadata=source_metadata,
+            description=description,
+            required_capabilities=required_capabilities,
+            required_device_kind=required_device_kind,
+            required_platform=required_platform,
+        )
+    try:
+        canonical_json = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise AppError("model.manifest_digest_invalid", {"reason": "json"}) from exc
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class ModelInstallation:
     """A managed or external local model directory projection."""
@@ -208,6 +375,7 @@ class ModelInstallation:
     state: ModelState = ModelState.STAGED
     managed: bool | None = None
     load_verified: bool = False
+    validation_passed: bool | None = None
 
     def __post_init__(self) -> None:
         if self.manifest.identity != self.identity:
@@ -221,17 +389,29 @@ class ModelInstallation:
         )
         if type(managed) is not bool or type(self.load_verified) is not bool:
             raise AppError("model.installation_invalid", {"field": "ownership"})
+        if self.validation_passed is not None and type(self.validation_passed) is not bool:
+            raise AppError("model.installation_invalid", {"field": "validation_passed"})
         if managed and self.state is ModelState.EXTERNAL_UNMANAGED:
             raise AppError("model.installation_invalid", {"field": "managed"})
         if not managed and self.state is not ModelState.EXTERNAL_UNMANAGED:
             raise AppError("model.installation_invalid", {"field": "state"})
         verified = self.state is ModelState.LOAD_VERIFIED or self.load_verified
+        validation_passed = (
+            self.state in {ModelState.INSTALLED, ModelState.LOAD_VERIFIED}
+            if self.validation_passed is None
+            else self.validation_passed
+        )
         object.__setattr__(self, "managed", managed)
         object.__setattr__(self, "load_verified", verified)
+        object.__setattr__(self, "validation_passed", validation_passed)
 
     @property
     def is_load_verified(self) -> bool:
         return self.load_verified
+
+    @property
+    def is_validated(self) -> bool:
+        return self.validation_passed is True
 
     @property
     def can_delete_files(self) -> bool:
@@ -325,6 +505,13 @@ def _require_text(value: object, field: str, code: str) -> None:
         raise AppError(code, {"field": field})
 
 
+def _required_string(value: Mapping[object, object], field: str) -> str:
+    item = value.get(field)
+    if not isinstance(item, str):
+        raise AppError("model.identity_invalid", {"field": field})
+    return item
+
+
 def _require_repository_id(value: object) -> None:
     _require_text(value, "repository_id", "model.identity_invalid")
     assert isinstance(value, str)
@@ -411,5 +598,7 @@ __all__ = [
     "ModelStatus",
     "ModelValidationCheck",
     "ModelValidationReport",
+    "compute_model_manifest_sha256",
+    "model_manifest_digest_payload",
     "required_files_for_format",
 ]

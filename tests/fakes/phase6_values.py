@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 from captioner.core.domain.asr_backend import BackendCapability
@@ -11,7 +12,9 @@ from captioner.core.domain.model import (
     ModelInstallation,
     ModelManifest,
     ModelState,
+    compute_model_manifest_sha256,
 )
+from captioner.core.domain.result import JsonValue
 from captioner.core.domain.runtime import (
     RuntimeFileEntry,
     RuntimeIdentity,
@@ -34,9 +37,12 @@ def runtime_manifest(
     model_format: str = "faster-whisper-ct2",
     platform: str = "macos",
     architecture: str = "arm64",
-    runtime_id: str = "faster-whisper-cpu-macos-arm64",
+    runtime_id: str | None = None,
     version: str = "1.0.0",
+    minimum_os_version: str = "14.0",
+    additional_capabilities: tuple[str, ...] = (),
 ) -> RuntimeManifest:
+    effective_runtime_id = runtime_id or f"{backend_id}-{device_kind}-{platform}-{architecture}"
     capability = BackendCapability(
         backend_id=backend_id,
         device_kind=device_kind,
@@ -44,14 +50,15 @@ def runtime_manifest(
         word_timestamps=True,
         language_detection=True,
         translation_task=True,
+        additional_capabilities=additional_capabilities,
     )
     return RuntimeManifest(
         schema_version=1,
-        runtime_identity=RuntimeIdentity(runtime_id, version),
+        runtime_identity=RuntimeIdentity(effective_runtime_id, version),
         worker_protocol_version="1.0",
         backend_id=backend_id,
         backend_version="1.0.0",
-        target=RuntimeTarget(platform, architecture, device_kind, "14.0"),
+        target=RuntimeTarget(platform, architecture, device_kind, minimum_os_version),
         capabilities=capability,
         supported_model_formats=(model_format,),
         archive_sha256="a" * 64,
@@ -61,11 +68,29 @@ def runtime_manifest(
 
 def runtime_installation(
     *,
+    backend_id: str = "faster-whisper",
+    device_kind: str = "cpu",
+    model_format: str = "faster-whisper-ct2",
+    platform: str = "macos",
+    architecture: str = "arm64",
+    runtime_id: str | None = None,
+    version: str = "1.0.0",
     state: RuntimeState = RuntimeState.AVAILABLE,
     doctor_passed: bool | None = None,
-    **kwargs: str,
+    minimum_os_version: str = "14.0",
+    additional_capabilities: tuple[str, ...] = (),
 ) -> RuntimeInstallation:
-    manifest = runtime_manifest(**kwargs)
+    manifest = runtime_manifest(
+        backend_id=backend_id,
+        device_kind=device_kind,
+        model_format=model_format,
+        platform=platform,
+        architecture=architecture,
+        runtime_id=runtime_id,
+        version=version,
+        minimum_os_version=minimum_os_version,
+        additional_capabilities=additional_capabilities,
+    )
     return RuntimeInstallation(
         identity=manifest.runtime_identity,
         manifest=manifest,
@@ -83,8 +108,15 @@ def model_manifest(
     repository_id: str = "org/model",
     revision: str = "revision-a",
     display_name: str = "large-v3",
+    source_metadata: Mapping[str, JsonValue] | None = None,
+    description: str = "",
+    required_capabilities: tuple[str, ...] = (),
+    required_device_kind: str | None = None,
+    required_platform: str | None = None,
+    files: tuple[ModelFileEntry, ...] | None = None,
+    compatible_runtime_backends: tuple[str, ...] | None = None,
 ) -> ModelManifest:
-    files = (
+    default_files = (
         (
             ModelFileEntry("config.json", 1, "b" * 64),
             ModelFileEntry("model.bin", 1, "c" * 64),
@@ -95,32 +127,90 @@ def model_manifest(
             ModelFileEntry("model.safetensors", 1, "c" * 64),
         )
     )
+    effective_files = default_files if files is None else files
+    effective_backends = (
+        (backend_id,) if compatible_runtime_backends is None else compatible_runtime_backends
+    )
+    normalized_metadata = {} if source_metadata is None else dict(source_metadata)
+    identity_without_digest = ModelIdentity(
+        backend_id=backend_id,
+        source_id=source_id,
+        repository_id=repository_id,
+        revision=revision,
+        model_format=model_format,
+        manifest_sha256="0" * 64,
+    )
+    manifest_sha256 = compute_model_manifest_sha256(
+        schema_version=1,
+        identity=identity_without_digest,
+        display_name=display_name,
+        files=effective_files,
+        compatible_runtime_backends=effective_backends,
+        model_format=model_format,
+        source_metadata=normalized_metadata,
+        description=description,
+        required_capabilities=required_capabilities,
+        required_device_kind=required_device_kind,
+        required_platform=required_platform,
+    )
     identity = ModelIdentity(
         backend_id=backend_id,
         source_id=source_id,
         repository_id=repository_id,
         revision=revision,
         model_format=model_format,
-        manifest_sha256="d" * 64,
+        manifest_sha256=manifest_sha256,
     )
     return ModelManifest(
         schema_version=1,
         identity=identity,
         display_name=display_name,
-        files=files,
-        compatible_runtime_backends=(backend_id,),
+        files=effective_files,
+        compatible_runtime_backends=effective_backends,
         model_format=model_format,
+        source_metadata=normalized_metadata,
+        description=description,
+        required_capabilities=required_capabilities,
+        required_device_kind=required_device_kind,
+        required_platform=required_platform,
     )
 
 
 def model_installation(
     *,
+    backend_id: str = "faster-whisper",
+    model_format: str = "faster-whisper-ct2",
+    source_id: str = "huggingface",
+    repository_id: str = "org/model",
+    revision: str = "revision-a",
+    display_name: str = "large-v3",
     state: ModelState = ModelState.INSTALLED,
     managed: bool | None = None,
     load_verified: bool = False,
-    **kwargs: str,
+    source_metadata: Mapping[str, JsonValue] | None = None,
+    description: str = "",
+    required_capabilities: tuple[str, ...] = (),
+    required_device_kind: str | None = None,
+    required_platform: str | None = None,
+    validation_passed: bool | None = None,
+    files: tuple[ModelFileEntry, ...] | None = None,
+    compatible_runtime_backends: tuple[str, ...] | None = None,
 ) -> ModelInstallation:
-    manifest = model_manifest(**kwargs)
+    manifest = model_manifest(
+        backend_id=backend_id,
+        model_format=model_format,
+        source_id=source_id,
+        repository_id=repository_id,
+        revision=revision,
+        display_name=display_name,
+        source_metadata=source_metadata,
+        description=description,
+        required_capabilities=required_capabilities,
+        required_device_kind=required_device_kind,
+        required_platform=required_platform,
+        files=files,
+        compatible_runtime_backends=compatible_runtime_backends,
+    )
     return ModelInstallation(
         identity=manifest.identity,
         manifest=manifest,
@@ -129,6 +219,7 @@ def model_installation(
         state=state,
         managed=managed,
         load_verified=load_verified,
+        validation_passed=validation_passed,
     )
 
 
