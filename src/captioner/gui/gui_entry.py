@@ -126,13 +126,16 @@ def main(
             _run_smoke_invariants(window)
 
             def _finish() -> None:
-                window.close()
-
-            def _quit() -> None:
-                app.quit()
+                # Close synchronously before quitting so the Application
+                # runner's worker thread has completed its shutdown. A fixed
+                # second timer can terminate the QApplication while that
+                # close path is still waiting under CI load.
+                if window.close():
+                    app.quit()
+                    return
+                QTimer.singleShot(25, _finish)
 
             QTimer.singleShot(100, _finish)
-            QTimer.singleShot(250, _quit)
         return int(app.exec())
     except AppError as exc:
         print(exc.to_dict(), file=sys.stderr)
