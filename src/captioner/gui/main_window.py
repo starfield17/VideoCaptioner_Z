@@ -22,8 +22,8 @@ from captioner.core.application.batch_commands import LocalExecutionSnapshot
 from captioner.core.application.recovery import RecoveryItem
 from captioner.gui.composition import GuiControllers
 from captioner.gui.pages.create_page import CreatePage
+from captioner.gui.pages.diagnostics_page import DiagnosticsPage
 from captioner.gui.pages.history_page import HistoryPage
-from captioner.gui.pages.placeholder_page import PlaceholderPage
 from captioner.gui.pages.queue_page import QueuePage
 from captioner.gui.pages.settings_page import SettingsPage
 from captioner.gui.widgets.recovery_dialog import RecoveryDialog
@@ -95,14 +95,7 @@ class MainWindow(QMainWindow):
         queue_page = QueuePage(service, controllers.queue, controllers.operations)
         history_page = HistoryPage(service, controllers.queue, controllers.operations)
         settings_page = SettingsPage(service, controllers.settings)
-        diagnostics_page = PlaceholderPage(
-            service.translate("gui.nav.diagnostics"),
-            service.translate(
-                "gui.placeholder.message",
-                {"page": service.translate("gui.nav.diagnostics")},
-            ),
-            "diagnosticsPage",
-        )
+        diagnostics_page = DiagnosticsPage(service, controllers.diagnostics)
 
         self._page_stack = QStackedWidget()
         self._page_stack.setObjectName("mainPageStack")
@@ -116,9 +109,7 @@ class MainWindow(QMainWindow):
         self._queue_button.clicked.connect(lambda: self._page_stack.setCurrentWidget(queue_page))
         history_button.clicked.connect(lambda: self._page_stack.setCurrentWidget(history_page))
         settings_button.clicked.connect(lambda: self._page_stack.setCurrentWidget(settings_page))
-        diagnostics_button.clicked.connect(
-            lambda: self._page_stack.setCurrentWidget(diagnostics_page)
-        )
+        diagnostics_button.clicked.connect(self._show_diagnostics)
 
         self._notification = QLabel("")
         self._notification.setObjectName("globalNotificationLabel")
@@ -148,6 +139,10 @@ class MainWindow(QMainWindow):
 
         self._create_page = create_page
         self._queue_page = queue_page
+        self._history_page = history_page
+        self._settings_page = settings_page
+        self._diagnostics_page = diagnostics_page
+        self._diagnostics_button = diagnostics_button
 
     def start(self) -> None:
         if self._started:
@@ -160,14 +155,21 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         operations = self._controllers.operations
         if operations.has_local_work:
-            choice = QMessageBox.question(
-                self,
-                self._service.translate("gui.close.active.title"),
-                self._service.translate("gui.close.active.message"),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+            box = QMessageBox(self)
+            box.setObjectName("closeActiveWorkDialog")
+            box.setWindowTitle(self._service.translate("gui.close.active.title"))
+            box.setText(self._service.translate("gui.close.active.message"))
+            cancel_close = box.addButton(
+                self._service.translate("gui.close.cancel_and_close"),
+                QMessageBox.ButtonRole.AcceptRole,
             )
-            if choice != QMessageBox.StandardButton.Yes:
+            keep_open = box.addButton(
+                self._service.translate("gui.close.keep_open"),
+                QMessageBox.ButtonRole.RejectRole,
+            )
+            box.setDefaultButton(keep_open)
+            box.exec()
+            if box.clickedButton() is not cancel_close:
                 event.ignore()
                 return
             self._close_when_idle = True
@@ -187,6 +189,11 @@ class MainWindow(QMainWindow):
             auto_hide=False,
         )
         event.ignore()
+
+    def _show_diagnostics(self) -> None:
+        self._page_stack.setCurrentWidget(self._diagnostics_page)
+        self._diagnostics_button.setChecked(True)
+        self._diagnostics_page.on_shown()
 
     def _on_batch_submitted(self, _ack: object) -> None:
         self._page_stack.setCurrentWidget(self._queue_page)

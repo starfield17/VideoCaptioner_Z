@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QPushButton, QStackedWidget
 from captioner.gui.batch_controller import BatchController
 from captioner.gui.composition import GuiControllers
 from captioner.gui.create_controller import CreateController
+from captioner.gui.diagnostics_controller import DiagnosticsController
 from captioner.gui.gui_entry import main
 from captioner.gui.job_operations_controller import JobOperationsController
 from captioner.gui.main_window import MainWindow
@@ -56,6 +57,10 @@ class FakeRunner(QObject):
     job_detail_failure = Signal(object)
     recovery_ready = Signal(object)
     recovery_failure = Signal(object)
+    diagnostics_ready = Signal(object)
+    diagnostics_failure = Signal(object)
+    diagnostic_export_ready = Signal(object)
+    diagnostic_export_failure = Signal(object)
     execution_completion = Signal(object)
     local_execution_state_changed = Signal(object)
 
@@ -64,6 +69,7 @@ class FakeRunner(QObject):
         self.start_calls = 0
         self.stop_calls = 0
         self.load_calls = 0
+        self.diagnostics_load_calls = 0
         self._running = False
 
     @property
@@ -85,6 +91,12 @@ class FakeRunner(QObject):
         return None
 
     def request_recovery_scan(self, request: object) -> None:
+        return None
+
+    def request_diagnostics_load(self, request: object) -> None:
+        self.diagnostics_load_calls += 1
+
+    def request_diagnostics_export(self, request: object) -> None:
         return None
 
     def request_job_detail(self, request: object) -> None:
@@ -119,12 +131,14 @@ def _window(locale: str = "en") -> tuple[MainWindow, GuiControllers, FakeRunner]
     settings = SettingsController(runner)  # type: ignore[arg-type]
     operations = JobOperationsController(runner)  # type: ignore[arg-type]
     recovery = RecoveryController(runner)  # type: ignore[arg-type]
+    diagnostics = DiagnosticsController(runner)  # type: ignore[arg-type]
     controllers = GuiControllers(
         queue=queue,
         create=create,
         settings=settings,
         operations=operations,
         recovery=recovery,
+        diagnostics=diagnostics,
     )
     window = MainWindow(service, controllers)
     return window, controllers, runner
@@ -337,9 +351,32 @@ def test_close_without_local_work() -> None:
     assert controllers.queue is not None
 
 
+def _patch_close_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    accept_cancel_and_close: bool,
+) -> None:
+    """Drive the localized custom close dialog without a blocking modal exec."""
+
+    from PySide6.QtWidgets import QMessageBox
+
+    def _fake_exec(self: QMessageBox) -> int:
+        role = (
+            QMessageBox.ButtonRole.AcceptRole
+            if accept_cancel_and_close
+            else QMessageBox.ButtonRole.RejectRole
+        )
+        for button in self.buttons():
+            if self.buttonRole(button) == role:
+                button.click()
+                return int(self.result())
+        return int(QMessageBox.DialogCode.Rejected)
+
+    monkeypatch.setattr(QMessageBox, "exec", _fake_exec)
+
+
 def test_close_with_local_work_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
     from PySide6.QtGui import QCloseEvent
-    from PySide6.QtWidgets import QMessageBox
 
     from captioner.core.application.batch_commands import LocalExecutionSnapshot
 
@@ -347,11 +384,7 @@ def test_close_with_local_work_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
     window.start()
     # Pretend local work is active
     controllers.operations._execution = LocalExecutionSnapshot("batch-a", ())  # type: ignore[attr-defined]
-
-    def _yes(*_a: object, **_k: object) -> QMessageBox.StandardButton:
-        return QMessageBox.StandardButton.Yes
-
-    monkeypatch.setattr(QMessageBox, "question", _yes)
+    _patch_close_dialog(monkeypatch, accept_cancel_and_close=True)
     event = QCloseEvent()
     window.closeEvent(event)
     assert not event.isAccepted()
@@ -367,17 +400,12 @@ def test_close_with_local_work_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_close_with_local_work_keep_open(monkeypatch: pytest.MonkeyPatch) -> None:
     from PySide6.QtGui import QCloseEvent
-    from PySide6.QtWidgets import QMessageBox
 
     from captioner.core.application.batch_commands import LocalExecutionSnapshot
 
     window, controllers, _runner = _window("en")
     controllers.operations._execution = LocalExecutionSnapshot("batch-a", ())  # type: ignore[attr-defined]
-
-    def _no(*_a: object, **_k: object) -> QMessageBox.StandardButton:
-        return QMessageBox.StandardButton.No
-
-    monkeypatch.setattr(QMessageBox, "question", _no)
+    _patch_close_dialog(monkeypatch, accept_cancel_and_close=False)
     event = QCloseEvent()
     window.closeEvent(event)
     assert not event.isAccepted()
@@ -387,7 +415,6 @@ def test_close_with_local_work_keep_open(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_close_cancel_failure_clears_close_when_idle(monkeypatch: pytest.MonkeyPatch) -> None:
     from PySide6.QtGui import QCloseEvent
-    from PySide6.QtWidgets import QMessageBox
 
     from captioner.core.application.batch_commands import LocalExecutionSnapshot
     from captioner.gui.application_runner import RunnerFailure
@@ -395,11 +422,7 @@ def test_close_cancel_failure_clears_close_when_idle(monkeypatch: pytest.MonkeyP
     window, controllers, _runner = _window("en")
     window.start()
     controllers.operations._execution = LocalExecutionSnapshot("batch-a", ())  # type: ignore[attr-defined]
-
-    def _yes(*_a: object, **_k: object) -> QMessageBox.StandardButton:
-        return QMessageBox.StandardButton.Yes
-
-    monkeypatch.setattr(QMessageBox, "question", _yes)
+    _patch_close_dialog(monkeypatch, accept_cancel_and_close=True)
     event = QCloseEvent()
     window.closeEvent(event)
     assert not event.isAccepted()

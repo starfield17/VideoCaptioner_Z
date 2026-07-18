@@ -19,6 +19,10 @@ from captioner.core.application.configuration import (
     GlobalSettings,
     ProviderSettingsUpdate,
 )
+from captioner.core.application.diagnostics import (
+    DiagnosticExportRequest,
+    DiagnosticsRequest,
+)
 from captioner.core.application.input_selection import InputSelectionRequest
 from captioner.core.application.job_detail import JobDetailRequest
 from captioner.core.application.recovery import RecoveryRequest
@@ -67,6 +71,10 @@ class _ApplicationRunnerWorker(QObject):
     job_detail_failure = Signal(object)
     recovery_ready = Signal(object)
     recovery_failure = Signal(object)
+    diagnostics_ready = Signal(object)
+    diagnostics_failure = Signal(object)
+    diagnostic_export_ready = Signal(object)
+    diagnostic_export_failure = Signal(object)
     execution_completion = Signal(object)
     local_execution_state_changed = Signal(object)
     shutdown_finished = Signal()
@@ -352,6 +360,34 @@ class _ApplicationRunnerWorker(QObject):
         except Exception as exc:
             self.recovery_failure.emit(_failure_from_exception(exc))
 
+    @Slot(object)
+    def load_diagnostics(self, request: object) -> None:
+        boundary = self._boundary
+        if boundary is None or not isinstance(request, DiagnosticsRequest):
+            self.diagnostics_failure.emit(
+                RunnerFailure(code=_UNEXPECTED_FAILURE_CODE, retryable=False)
+            )
+            return
+        try:
+            snapshot = boundary.load_diagnostics(request)
+            self.diagnostics_ready.emit(snapshot)
+        except Exception as exc:
+            self.diagnostics_failure.emit(_failure_from_exception(exc))
+
+    @Slot(object)
+    def export_diagnostics(self, request: object) -> None:
+        boundary = self._boundary
+        if boundary is None or not isinstance(request, DiagnosticExportRequest):
+            self.diagnostic_export_failure.emit(
+                RunnerFailure(code=_UNEXPECTED_FAILURE_CODE, retryable=False)
+            )
+            return
+        try:
+            result = boundary.export_diagnostics(request)
+            self.diagnostic_export_ready.emit(result)
+        except Exception as exc:
+            self.diagnostic_export_failure.emit(_failure_from_exception(exc))
+
     @Slot()
     def poll_execution(self) -> None:
         boundary = self._boundary
@@ -449,6 +485,10 @@ class ApplicationRunnerBridge(QObject):
     job_detail_failure = Signal(object)
     recovery_ready = Signal(object)
     recovery_failure = Signal(object)
+    diagnostics_ready = Signal(object)
+    diagnostics_failure = Signal(object)
+    diagnostic_export_ready = Signal(object)
+    diagnostic_export_failure = Signal(object)
     execution_completion = Signal(object)
     local_execution_state_changed = Signal(object)
 
@@ -466,6 +506,8 @@ class ApplicationRunnerBridge(QObject):
     _cancel_local_work_requested = Signal(object)
     _load_job_detail_requested = Signal(object)
     _scan_recovery_requested = Signal(object)
+    _load_diagnostics_requested = Signal(object)
+    _export_diagnostics_requested = Signal(object)
     _shutdown_requested = Signal()
 
     def __init__(
@@ -515,6 +557,10 @@ class ApplicationRunnerBridge(QObject):
         worker.job_detail_failure.connect(self.job_detail_failure)
         worker.recovery_ready.connect(self.recovery_ready)
         worker.recovery_failure.connect(self.recovery_failure)
+        worker.diagnostics_ready.connect(self.diagnostics_ready)
+        worker.diagnostics_failure.connect(self.diagnostics_failure)
+        worker.diagnostic_export_ready.connect(self.diagnostic_export_ready)
+        worker.diagnostic_export_failure.connect(self.diagnostic_export_failure)
         worker.execution_completion.connect(self.execution_completion)
         worker.local_execution_state_changed.connect(self.local_execution_state_changed)
 
@@ -533,6 +579,8 @@ class ApplicationRunnerBridge(QObject):
         self._cancel_local_work_requested.connect(worker.cancel_local_work, queued)
         self._load_job_detail_requested.connect(worker.load_job_detail, queued)
         self._scan_recovery_requested.connect(worker.scan_recovery, queued)
+        self._load_diagnostics_requested.connect(worker.load_diagnostics, queued)
+        self._export_diagnostics_requested.connect(worker.export_diagnostics, queued)
         self._shutdown_requested.connect(worker.shutdown, queued)
 
         self._thread = thread
@@ -612,6 +660,16 @@ class ApplicationRunnerBridge(QObject):
         if not self._running:
             return
         self._scan_recovery_requested.emit(request)
+
+    def request_diagnostics_load(self, request: DiagnosticsRequest) -> None:
+        if not self._running:
+            return
+        self._load_diagnostics_requested.emit(request)
+
+    def request_diagnostics_export(self, request: DiagnosticExportRequest) -> None:
+        if not self._running:
+            return
+        self._export_diagnostics_requested.emit(request)
 
     def stop(self, timeout_ms: int = 5000) -> bool:
         if timeout_ms < 0:

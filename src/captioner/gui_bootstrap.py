@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from captioner.adapters.diagnostics.local_diagnostics import LocalDiagnosticsAdapter
 from captioner.adapters.llm.http_provider_probe import HTTPProviderProbe
 from captioner.adapters.persistence.filesystem_batch_catalog import FilesystemBatchCatalog
 from captioner.adapters.persistence.filesystem_input_discovery import (
@@ -33,6 +34,13 @@ from captioner.core.application.configuration import (
     GlobalSettings,
     ProviderConnectionResult,
     ProviderSettingsUpdate,
+)
+from captioner.core.application.diagnostics import (
+    DiagnosticExportRequest,
+    DiagnosticExportResult,
+    DiagnosticsRequest,
+    DiagnosticsService,
+    DiagnosticsSnapshot,
 )
 from captioner.core.application.execution_coordinator import SerialExecutionCoordinator
 from captioner.core.application.input_selection import InputPreview, InputSelectionRequest
@@ -70,6 +78,7 @@ class GuiApplicationService:
     commands: BatchCommandService
     job_detail: JobDetailService
     recovery: RecoveryService
+    diagnostics: DiagnosticsService
     coordinator: SerialExecutionCoordinator
     gateway: LocalBatchGateway
 
@@ -130,6 +139,15 @@ class GuiApplicationService:
     def scan_recovery(self, request: RecoveryRequest) -> RecoverySnapshot:
         return self.recovery.scan(request)
 
+    def load_diagnostics(self, request: DiagnosticsRequest) -> DiagnosticsSnapshot:
+        return self.diagnostics.load(request)
+
+    def export_diagnostics(
+        self,
+        request: DiagnosticExportRequest,
+    ) -> DiagnosticExportResult:
+        return self.diagnostics.export(request)
+
     def poll_execution(self) -> ExecutionPoll:
         state = self.coordinator.snapshot()
         completions = self.coordinator.drain_completions()
@@ -166,6 +184,15 @@ def build_gui_application_boundary(
     )
     job_detail = JobDetailService(gateway=gateway, coordinator=coordinator)
     recovery = RecoveryService(gateway=gateway, coordinator=coordinator)
+    local_diagnostics = LocalDiagnosticsAdapter()
+    diagnostics = DiagnosticsService(
+        queue=queue,
+        configuration=configuration,
+        recovery=recovery,
+        environment=local_diagnostics,
+        writer=local_diagnostics,
+        now_utc=_now_utc,
+    )
     return GuiApplicationService(
         queue=queue,
         input_discovery=FilesystemInputDiscovery(),
@@ -173,6 +200,7 @@ def build_gui_application_boundary(
         commands=commands,
         job_detail=job_detail,
         recovery=recovery,
+        diagnostics=diagnostics,
         coordinator=coordinator,
         gateway=gateway,
     )

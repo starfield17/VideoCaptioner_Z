@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
 )
 
 from captioner.core.application.job_detail import JobAction, JobDetailSnapshot
+from captioner.core.domain.job import JobState
+from captioner.core.domain.stage import StageName
 from captioner.gui.application_runner import RunnerFailure
 from captioner.gui.job_operations_controller import JobOperationsController
 from captioner.i18n.service import I18nService
@@ -34,6 +36,25 @@ _EVENT_KEYS = {
     "job.succeeded": "gui.activity.event.job_succeeded",
     "job.failed": "gui.activity.event.job_failed",
     "job.cancelled": "gui.activity.event.job_cancelled",
+}
+_JOB_STATE_KEYS: dict[JobState, str] = {
+    JobState.PENDING: "gui.queue.state.pending",
+    JobState.RUNNING: "gui.queue.state.running",
+    JobState.INTERRUPTED: "gui.queue.state.interrupted",
+    JobState.FAILED: "gui.queue.state.failed",
+    JobState.CANCELLED: "gui.queue.state.cancelled",
+    JobState.SUCCEEDED: "gui.queue.state.succeeded",
+}
+_STAGE_KEYS: dict[StageName, str] = {
+    StageName.INSPECT: "gui.queue.stage.inspect",
+    StageName.NORMALIZE: "gui.queue.stage.normalize",
+    StageName.TRANSCRIBE: "gui.queue.stage.transcribe",
+    StageName.CORRECT_SOURCE: "gui.queue.stage.correct_source",
+    StageName.SEGMENT: "gui.queue.stage.segment",
+    StageName.TRANSLATE: "gui.queue.stage.translate",
+    StageName.REVIEW: "gui.queue.stage.review",
+    StageName.EXPORT: "gui.queue.stage.export",
+    StageName.PUBLISH: "gui.queue.stage.publish",
 }
 
 
@@ -155,28 +176,36 @@ class JobDetailPanel(QWidget):
         self._failure.setVisible(True)
 
     def _on_cancel_job(self) -> None:
-        if (
-            QMessageBox.question(
-                self,
-                self._service.translate("gui.job.confirm.cancel_job.title"),
-                self._service.translate("gui.job.confirm.cancel_job.message"),
-            )
-            != QMessageBox.StandardButton.Yes
+        if not self._confirm(
+            "gui.job.confirm.cancel_job.title",
+            "gui.job.confirm.cancel_job.message",
         ):
             return
         self._operations.cancel_job()
 
     def _on_cancel_batch(self) -> None:
-        if (
-            QMessageBox.question(
-                self,
-                self._service.translate("gui.job.confirm.cancel_batch.title"),
-                self._service.translate("gui.job.confirm.cancel_batch.message"),
-            )
-            != QMessageBox.StandardButton.Yes
+        if not self._confirm(
+            "gui.job.confirm.cancel_batch.title",
+            "gui.job.confirm.cancel_batch.message",
         ):
             return
         self._operations.cancel_batch()
+
+    def _confirm(self, title_key: str, message_key: str) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle(self._service.translate(title_key))
+        box.setText(self._service.translate(message_key))
+        yes = box.addButton(
+            self._service.translate("gui.value.yes"),
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        no = box.addButton(
+            self._service.translate("gui.value.no"),
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        box.setDefaultButton(no)
+        box.exec()
+        return box.clickedButton() is yes
 
     def _render(self, detail: JobDetailSnapshot | None) -> None:
         if detail is None:
@@ -209,13 +238,17 @@ class JobDetailPanel(QWidget):
             )
         )
         self._output.setToolTip(detail.output_dir)
+        state_label = self._service.translate(_JOB_STATE_KEYS[detail.state])
         self._state.setText(
             self._service.translate(
                 "gui.job.detail.state",
-                {"state": detail.state.value},
+                {"state": state_label},
             )
         )
-        stage_text = "—" if detail.active_stage is None else detail.active_stage.value
+        if detail.active_stage is None:
+            stage_text = "—"
+        else:
+            stage_text = self._service.translate(_STAGE_KEYS[detail.active_stage])
         self._stage.setText(self._service.translate("gui.job.detail.stage", {"stage": stage_text}))
         self._attempt.setText(
             self._service.translate(
@@ -234,10 +267,11 @@ class JobDetailPanel(QWidget):
         self._resume.setEnabled(not busy and JobAction.RESUME_BATCH in actions)
         self._retry.setEnabled(not busy and JobAction.RETRY_JOB in actions)
         if detail.retry_stage is not None:
+            retry_stage = self._service.translate(_STAGE_KEYS[detail.retry_stage])
             self._retry.setText(
                 self._service.translate(
                     "gui.job.action.retry_stage",
-                    {"stage": detail.retry_stage.value},
+                    {"stage": retry_stage},
                 )
             )
         else:
@@ -248,12 +282,18 @@ class JobDetailPanel(QWidget):
         self._activity_list.clear()
         # Newest first for usability.
         for entry in reversed(detail.activity):
-            event_key = _EVENT_KEYS.get(entry.event_type, "gui.activity.event.batch_created")
-            label = (
-                f"{entry.timestamp_utc} · {self._service.translate(event_key)} · seq={entry.seq}"
-            )
+            event_key = _EVENT_KEYS.get(entry.event_type, "gui.activity.event.unknown")
+            if entry.event_type not in _EVENT_KEYS:
+                event_label = self._service.translate(
+                    "gui.activity.event.unknown",
+                    {"code": entry.event_type},
+                )
+            else:
+                event_label = self._service.translate(event_key)
+            label = f"{entry.timestamp_utc} · {event_label} · seq={entry.seq}"
             if entry.stage_name is not None:
-                label += f" · {entry.stage_name.value}"
+                stage_label = self._service.translate(_STAGE_KEYS[entry.stage_name])
+                label += f" · {stage_label}"
             if entry.attempt is not None:
                 label += f" · attempt={entry.attempt}"
             if entry.error_code is not None:

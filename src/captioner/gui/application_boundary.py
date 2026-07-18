@@ -22,6 +22,12 @@ from captioner.core.application.configuration import (
     ProviderConnectionResult,
     ProviderSettingsUpdate,
 )
+from captioner.core.application.diagnostics import (
+    DiagnosticExportRequest,
+    DiagnosticExportResult,
+    DiagnosticsRequest,
+    DiagnosticsSnapshot,
+)
 from captioner.core.application.input_selection import InputPreview, InputSelectionRequest
 from captioner.core.application.job_detail import JobDetailRequest, JobDetailSnapshot
 from captioner.core.application.queue_projection import QueueSnapshot
@@ -75,6 +81,13 @@ class GuiApplicationBoundary(Protocol):
     def load_job_detail(self, request: JobDetailRequest) -> JobDetailSnapshot: ...
 
     def scan_recovery(self, request: RecoveryRequest) -> RecoverySnapshot: ...
+
+    def load_diagnostics(self, request: DiagnosticsRequest) -> DiagnosticsSnapshot: ...
+
+    def export_diagnostics(
+        self,
+        request: DiagnosticExportRequest,
+    ) -> DiagnosticExportResult: ...
 
     def poll_execution(self) -> ExecutionPoll: ...
 

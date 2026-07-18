@@ -23,6 +23,56 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _smoke_assert(condition: bool, message: str) -> None:
+    if not condition:
+        raise AppError("gui.smoke_failed", {"reason": message})
+
+
+def _run_smoke_invariants(window: object) -> None:
+    from PySide6.QtWidgets import QWidget
+
+    from captioner.gui.main_window import MainWindow
+    from captioner.gui.pages.diagnostics_page import DiagnosticsPage
+    from captioner.gui.pages.placeholder_page import PlaceholderPage
+
+    if not isinstance(window, MainWindow):
+        raise AppError("gui.smoke_failed", {"reason": "main_window_type"})
+    main = window
+    stack = main.findChild(QWidget, "mainPageStack")
+    _smoke_assert(stack is not None, "page_stack_missing")
+    # Required navigation buttons.
+    for name in (
+        "navCreateButton",
+        "navQueueButton",
+        "navHistoryButton",
+        "navSettingsButton",
+        "navDiagnosticsButton",
+    ):
+        button = main.findChild(QWidget, name)
+        _smoke_assert(button is not None, f"missing_{name}")
+
+    diagnostics = main.findChild(DiagnosticsPage, "diagnosticsPage")
+    if diagnostics is None:
+        raise AppError("gui.smoke_failed", {"reason": "diagnostics_page_missing"})
+    placeholder = main.findChild(PlaceholderPage, "diagnosticsPage")
+    _smoke_assert(placeholder is None, "diagnostics_still_placeholder")
+
+    for name in (
+        "diagnosticsTitle",
+        "diagnosticsRefreshButton",
+        "diagnosticsExportButton",
+        "diagnosticsInstallRuntimeButton",
+        "diagnosticsManageModelsButton",
+        "diagnosticsPrivacyLabel",
+    ):
+        control = diagnostics.findChild(QWidget, name)
+        _smoke_assert(control is not None, f"missing_{name}")
+
+    for name in ("createPage", "queuePage", "historyPage", "settingsPage", "diagnosticsPage"):
+        page = main.findChild(QWidget, name)
+        _smoke_assert(page is not None, f"missing_{name}")
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -64,9 +114,26 @@ def main(
         window.show()
         window.start()
         if namespace.smoke_test:
-            QTimer.singleShot(100, window.close)
-            QTimer.singleShot(200, app.quit)
+            _run_smoke_invariants(window)
+
+            def _finish() -> None:
+                window.close()
+
+            def _quit() -> None:
+                app.quit()
+
+            QTimer.singleShot(100, _finish)
+            QTimer.singleShot(250, _quit)
         return int(app.exec())
     except AppError as exc:
         print(exc.to_dict(), file=sys.stderr)
         return 2
+    except Exception as exc:
+        # Smoke mode must not swallow unexpected failures as success.
+        print(
+            {"code": "gui.smoke_failed", "params": {"reason": type(exc).__name__}}, file=sys.stderr
+        )
+        return 2
+
+
+__all__ = ["build_parser", "main"]

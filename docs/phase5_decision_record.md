@@ -61,14 +61,28 @@
 - No detached process or tray mode in initial Phase 5.
 - Active local work is cancelled before GUI shutdown; no tray/background continuation.
 
+## Functional desktop pages
+
+- Create, Queue, History, Settings, and Diagnostics are functional.
+- No sidebar page remains a placeholder after PR5.5.
+- Diagnostics loads aggregate runtime, queue, configuration, and recovery
+  summaries without Batch writer leases, Journal repair, network, or heavy SDKs.
+- Diagnostic ZIP export is atomic, bounded, and whitelist-only:
+  `manifest.json`, `application.json`, `configuration.json`, `queue.json`,
+  `recovery.json`, `capabilities.json`.
+- Diagnostic bundles exclude credentials, media paths, source/subtitle text,
+  prompts, provider bodies, Journal payloads, raw logs, and raw config files.
+
 ## Scope exclusions (retained)
 
-- Diagnostics export
 - Runtime/model installation
 - OS keychain
 - Dynamic language switching
 - Native notifications
 - Tray/background mode
+- Automatic GitHub Release publication
+- Windows installer
+- macOS signing/notarization
 
 ## Configuration
 

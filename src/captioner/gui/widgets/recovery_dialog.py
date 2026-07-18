@@ -18,7 +18,18 @@ from PySide6.QtWidgets import (
 )
 
 from captioner.core.application.recovery import RecoveryItem
+from captioner.core.domain.batch import BatchState
 from captioner.i18n.service import I18nService
+
+_BATCH_STATE_KEYS: dict[BatchState, str] = {
+    BatchState.PENDING: "gui.recovery.state.pending",
+    BatchState.RUNNING: "gui.recovery.state.running",
+    BatchState.PARTIAL: "gui.recovery.state.partial",
+    BatchState.INTERRUPTED: "gui.recovery.state.interrupted",
+    BatchState.FAILED: "gui.recovery.state.failed",
+    BatchState.CANCELLED: "gui.recovery.state.failed",
+    BatchState.SUCCEEDED: "gui.recovery.state.pending",
+}
 
 
 class RecoveryDialog(QDialog):
@@ -97,7 +108,7 @@ class RecoveryDialog(QDialog):
             reason = self._service.translate("gui.recovery.pending")
             if item.pause_requested:
                 reason = self._service.translate("gui.recovery.paused")
-            elif item.state.value == "interrupted":
+            elif item.state is BatchState.INTERRUPTED:
                 reason = self._service.translate("gui.recovery.interrupted")
             if item.blocked_code:
                 reason = self._service.translate("gui.recovery.blocked")
@@ -111,9 +122,14 @@ class RecoveryDialog(QDialog):
                         "names": ", ".join(basenames),
                     },
                 )
+            state_key = _BATCH_STATE_KEYS.get(item.state, "gui.recovery.state.pending")
+            if item.blocked_code is not None:
+                state_key = "gui.recovery.state.blocked"
+            elif item.pause_requested:
+                state_key = "gui.recovery.state.paused"
             values = (
                 item.batch_id,
-                item.state.value,
+                self._service.translate(state_key),
                 str(item.job_count),
                 reason,
                 missing_text,

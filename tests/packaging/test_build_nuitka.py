@@ -64,7 +64,30 @@ def test_build_command_contains_plugin_package_and_resources(tmp_path: Path) -> 
     assert "--nofollow-import-to=faster_whisper" in command
     assert "--nofollow-import-to=ctranslate2" in command
     assert "--nofollow-import-to=torch" in command
+    assert "--nofollow-import-to=transformers" in command
     assert "--version" not in joined
+
+
+def test_packaged_gui_smoke_command_shapes() -> None:
+    """Document the packaged bilingual GUI smoke invocations used by Release Full Gate."""
+    en = ["captioner", "--gui", "--lang", "en", "--smoke-test"]
+    zh = ["captioner", "--gui", "--lang", "zh-CN", "--smoke-test"]
+    assert en[1:4] == ["--gui", "--lang", "en"]
+    assert zh[1:4] == ["--gui", "--lang", "zh-CN"]
+    assert en[-1] == "--smoke-test"
+    assert zh[-1] == "--smoke-test"
+
+
+def test_diagnostics_modules_are_package_discoverable() -> None:
+    import captioner.adapters.diagnostics.local_diagnostics as local_diagnostics
+    import captioner.core.application.diagnostics as diagnostics
+    import captioner.gui.diagnostics_controller as diagnostics_controller
+    import captioner.gui.pages.diagnostics_page as diagnostics_page
+
+    assert diagnostics.DIAGNOSTICS_SCHEMA_VERSION == 1
+    assert local_diagnostics.LocalDiagnosticsAdapter is not None
+    assert diagnostics_controller.DiagnosticsController is not None
+    assert diagnostics_page.DiagnosticsPage is not None
 
 
 def test_windows_python_313_command_uses_msvc_and_numeric_metadata(tmp_path: Path) -> None:

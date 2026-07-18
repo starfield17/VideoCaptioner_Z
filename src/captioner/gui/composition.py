@@ -8,6 +8,7 @@ from captioner.gui.application_boundary import GuiApplicationBoundary
 from captioner.gui.application_runner import ApplicationRunnerBridge
 from captioner.gui.batch_controller import BatchController
 from captioner.gui.create_controller import CreateController
+from captioner.gui.diagnostics_controller import DiagnosticsController
 from captioner.gui.job_operations_controller import JobOperationsController
 from captioner.gui.queue_table_model import QueueTableModel
 from captioner.gui.recovery_controller import RecoveryController
@@ -24,6 +25,7 @@ class GuiControllers:
     settings: SettingsController
     operations: JobOperationsController
     recovery: RecoveryController
+    diagnostics: DiagnosticsController
 
 
 def build_gui_controllers(
@@ -53,6 +55,7 @@ def build_gui_controllers(
     settings = SettingsController(runner, startup_issue=startup_issue)
     operations = JobOperationsController(runner)
     recovery = RecoveryController(runner)
+    diagnostics = DiagnosticsController(runner)
 
     settings.configuration_changed.connect(create.set_configuration)
 
@@ -73,6 +76,7 @@ def build_gui_controllers(
         settings=settings,
         operations=operations,
         recovery=recovery,
+        diagnostics=diagnostics,
     )
 
 

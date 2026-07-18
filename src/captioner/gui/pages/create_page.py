@@ -548,12 +548,17 @@ class CreatePage(QWidget):
 
     def _on_draft(self, draft: object) -> None:
         if isinstance(draft, BatchDraft):
+            profile_key = {
+                PipelineProfile.DETERMINISTIC: "gui.queue.profile.deterministic",
+                PipelineProfile.FAST: "gui.queue.profile.fast",
+                PipelineProfile.QUALITY: "gui.queue.profile.quality",
+            }[draft.pipeline_profile]
             self._draft_status.setText(
                 self._service.translate(
                     "gui.create.draft.ready",
                     {
                         "count": str(len(draft.input_paths)),
-                        "profile": draft.pipeline_profile.value,
+                        "profile": self._service.translate(profile_key),
                         "output": draft.output_root,
                     },
                 )
