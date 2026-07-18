@@ -25,6 +25,17 @@ uv run python scripts/build_nuitka.py --clean --target cli --version 0.0.0
 uv run python scripts/build_nuitka.py --clean --target desktop --version 0.0.0
 ```
 
+Without `uv`, install the locked runtime dependencies with pip (Python 3.13):
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -e .
+python main.py --cli --help
+```
+
+`requirements.txt` is exported from `uv.lock` and does not include dev tools or the
+optional Faster Whisper ASR extra. Prefer `uv sync --frozen` for development and CI.
+
 Phase 5 desktop workflow pages: Create, Queue, History, Settings, and
 Diagnostics. English and Simplified Chinese catalogs are required. Diagnostics
 exports a redacted aggregate ZIP (no credentials, media paths, source text, or

@@ -63,6 +63,7 @@ include = [
     "main.py",
     "pyproject.toml",
     "uv.lock",
+    "requirements.txt",
 ]
 
 [tool.ruff]
