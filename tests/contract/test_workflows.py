@@ -110,16 +110,26 @@ def test_release_full_gate_yaml_and_scope() -> None:
     _assert_archive_smoke_order(windows, "Windows")
     _assert_archive_smoke_order(macos, "macOS")
 
+    assert jobs["package-ubuntu"]["name"] == "ubuntu-24.04-cli-package"
+    assert jobs["package-windows"]["name"] == "windows-2022-cli-package"
+    assert jobs["package-macos"]["name"] == "macos-15-cli-package"
+    assert text.count("--target cli") == 3
+    assert "--gui" not in text
+    assert "Captioner.app" not in text
+
     ubuntu_pre = _run(_step(ubuntu, "Pre-archive Ubuntu compiled smoke"))
     ubuntu_archive = _run(_step(ubuntu, "Archive Ubuntu distribution"))
     ubuntu_extract = _run(_step(ubuntu, "Extract Ubuntu archive"))
     ubuntu_post = _run(_step(ubuntu, "Post-extraction Ubuntu compiled smoke"))
     ubuntu_upload = _step(ubuntu, "Upload Ubuntu archive")
     assert "$GITHUB_WORKSPACE/dist/captioner/captioner" in ubuntu_pre
-    assert "tar -C dist -czf dist/captioner-linux.tar.gz captioner" in ubuntu_archive
-    assert "tar -xzf dist/captioner-linux.tar.gz" in ubuntu_extract
+    assert "tar -C dist -czf dist/captioner-cli-linux.tar.gz captioner" in ubuntu_archive
+    assert "tar -xzf dist/captioner-cli-linux.tar.gz" in ubuntu_extract
     assert 'test -x "$EXTRACTED"' in ubuntu_post
-    assert ubuntu_upload["with"]["path"] == "dist/captioner-linux.tar.gz"
+    assert "--cli" not in ubuntu_pre
+    assert "--cli" not in ubuntu_post
+    assert ubuntu_upload["with"]["path"] == "dist/captioner-cli-linux.tar.gz"
+    assert ubuntu_upload["with"]["name"] == "captioner-cli-ubuntu-${{ github.ref_name }}"
     assert ubuntu_upload["with"]["path"] != "dist/captioner"
 
     windows_pre = _run(_step(windows, "Pre-archive Windows compiled smoke"))
@@ -129,7 +139,7 @@ def test_release_full_gate_yaml_and_scope() -> None:
     windows_upload = _step(windows, "Upload Windows archive")
     assert "dist\\captioner\\captioner.exe" in windows_pre
     assert "Compress-Archive" in windows_archive
-    assert "dist\\captioner-windows.zip" in windows_archive
+    assert "dist\\captioner-cli-windows.zip" in windows_archive
     assert "Expand-Archive" in windows_extract
     assert "Test-Path $Extracted" in windows_post
     assert 'Join-Path $env:CAPTIONER_EXTRACT_ROOT "captioner"' in windows_post
@@ -140,24 +150,29 @@ def test_release_full_gate_yaml_and_scope() -> None:
     assert 'Join-Path $ExtractedRoot "resources\\tokenizers\\cl100k_base.tiktoken"' in windows_post
     assert 'Join-Path $ExtractedRoot "resources\\tokenizers\\o200k_base.tiktoken"' in windows_post
     assert 'Join-Path $env:CAPTIONER_EXTRACT_ROOT "THIRD_PARTY_NOTICES.md"' not in windows_post
-    assert windows_upload["with"]["path"] == "dist/captioner-windows.zip"
+    assert "--cli" not in windows_pre
+    assert "--cli" not in windows_post
+    assert windows_upload["with"]["path"] == "dist/captioner-cli-windows.zip"
+    assert windows_upload["with"]["name"] == "captioner-cli-windows-${{ github.ref_name }}"
 
     macos_pre = _run(_step(macos, "Pre-archive macOS compiled smoke"))
     macos_archive = _run(_step(macos, "Archive macOS distribution"))
     macos_extract = _run(_step(macos, "Extract macOS archive"))
     macos_post = _run(_step(macos, "Post-extraction macOS compiled smoke"))
     macos_upload = _step(macos, "Upload macOS archive")
-    macos_executable = "$GITHUB_WORKSPACE/dist/Captioner.app/Contents/MacOS/captioner"
+    macos_executable = "$GITHUB_WORKSPACE/dist/captioner/captioner"
     assert macos_executable in macos_pre
-    assert "ditto -c -k --sequesterRsrc --keepParent" in macos_archive
-    assert "dist/Captioner-macos.zip" in macos_archive
-    assert "ditto -x -k dist/Captioner-macos.zip" in macos_extract
+    assert "ditto -c -k --keepParent" in macos_archive
+    assert "dist/captioner" in macos_archive
+    assert "dist/captioner-cli-macos.zip" in macos_archive
+    assert "ditto -x -k dist/captioner-cli-macos.zip" in macos_extract
     assert 'test -x "$EXTRACTED"' in macos_post
-    assert macos_upload["with"]["path"] == "dist/Captioner-macos.zip"
+    assert "$CAPTIONER_EXTRACT_ROOT/captioner/captioner" in macos_post
+    assert "--cli" not in macos_pre
+    assert "--cli" not in macos_post
+    assert macos_upload["with"]["path"] == "dist/captioner-cli-macos.zip"
+    assert macos_upload["with"]["name"] == "captioner-cli-macos-${{ github.ref_name }}"
 
-    macos_text = "\n".join(_run(step) for step in _job_steps(macos))
-    assert "./dist/captioner/captioner" not in macos_text
-    assert "path: dist/captioner\n" not in text
     for package_job in (ubuntu, windows, macos):
         upload = next(
             step

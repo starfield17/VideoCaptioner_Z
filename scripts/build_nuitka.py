@@ -11,6 +11,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from captioner.core.domain.errors import AppError
 from captioner.infrastructure.app_paths import validate_resource_root
@@ -21,6 +22,7 @@ VERSION_PATTERN = re.compile(
     r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
+BuildTarget = Literal["cli", "desktop"]
 
 
 class BuildError(RuntimeError):
@@ -29,6 +31,10 @@ class BuildError(RuntimeError):
     @classmethod
     def unsupported_platform(cls, value: str) -> BuildError:
         return cls(f"unsupported build platform: {value}")
+
+    @classmethod
+    def unsupported_target(cls, value: str) -> BuildError:
+        return cls(f"unsupported build target: {value}")
 
     @classmethod
     def uncontrolled_path(cls, path: Path) -> BuildError:
@@ -58,10 +64,23 @@ class BuildError(RuntimeError):
     def staging_copy_failed(cls, source: Path, target: Path, detail: str) -> BuildError:
         return cls(f"failed to stage {source} -> {target}: {detail}")
 
+    @classmethod
+    def resource_source_invalid(cls, path: Path) -> BuildError:
+        return cls(f"resource source tree is invalid: {path}")
+
+    @classmethod
+    def resource_destination_exists(cls, path: Path) -> BuildError:
+        return cls(f"resource destination already exists: {path}")
+
+    @classmethod
+    def resource_copy_failed(cls, source: Path, destination: Path, detail: str) -> BuildError:
+        return cls(f"failed to stage resources {source} -> {destination}: {detail}")
+
 
 @dataclass(frozen=True, slots=True)
 class BuildLayout:
     platform_name: str
+    target: BuildTarget
     dist_root: Path
     work_root: Path
     final_root: Path
@@ -113,13 +132,18 @@ def normalize_platform(value: str | None = None) -> str:
 
 
 def layout_for_platform(
-    platform_name: str | None = None, *, dist_root: Path = DIST_ROOT
+    platform_name: str | None = None,
+    *,
+    target: BuildTarget = "desktop",
+    dist_root: Path = DIST_ROOT,
 ) -> BuildLayout:
-    """Return the standardized output and executable paths."""
+    """Return the standardized output and executable paths for a build target."""
+    if target not in {"cli", "desktop"}:
+        raise BuildError.unsupported_target(str(target))
     normalized = normalize_platform(platform_name)
     root = dist_root.expanduser().resolve()
-    work_root = root / ".nuitka-build"
-    if normalized == "macos":
+    work_root = root / ".nuitka-build" / target
+    if target == "desktop" and normalized == "macos":
         final_root = root / "Captioner.app"
         executable = final_root / "Contents" / "MacOS" / "captioner"
         resource_root = final_root / "Contents" / "Resources" / "resources"
@@ -134,6 +158,7 @@ def layout_for_platform(
         notice_path = final_root / "THIRD_PARTY_NOTICES.md"
     return BuildLayout(
         platform_name=normalized,
+        target=target,
         dist_root=root,
         work_root=work_root,
         final_root=final_root,
@@ -142,6 +167,13 @@ def layout_for_platform(
         readme_path=readme_path,
         notice_path=notice_path,
     )
+
+
+def artifact_suffix(layout: BuildLayout) -> str:
+    """Return the Nuitka artifact suffix expected for the layout."""
+    if layout.target == "desktop" and layout.platform_name == "macos":
+        return ".app"
+    return ".dist"
 
 
 def safe_remove_owned(path: Path, owned_paths: tuple[Path, ...]) -> None:
@@ -176,16 +208,12 @@ def build_command(
     """Build the platform-specific Nuitka command without executing it."""
     display_version = validate_version(version)
     python = str(sys.executable if python_executable is None else python_executable)
-    resources = project_root / "resources"
     command = [
         python,
         "-m",
         "nuitka",
         "--standalone",
         "--static-libpython=no",
-        "--enable-plugin=pyside6",
-        "--include-package=captioner",
-        f"--include-data-dir={resources}=resources",
         "--assume-yes-for-downloads",
         "--nofollow-import-to=tests",
         "--nofollow-import-to=faster_whisper",
@@ -195,6 +223,21 @@ def build_command(
         f"--output-dir={layout.work_root}",
         "--output-filename=captioner",
     ]
+    if layout.target == "cli":
+        command.extend(
+            (
+                "--nofollow-import-to=captioner.gui",
+                "--nofollow-import-to=captioner.gui.*",
+                "--nofollow-import-to=PySide6",
+                "--nofollow-import-to=PySide6.*",
+            )
+        )
+        entry = project_root / "scripts" / "nuitka_cli_entry.py"
+    else:
+        command.extend(("--enable-plugin=pyside6", "--include-package=captioner"))
+        entry = project_root / "main.py"
+        if layout.platform_name == "macos":
+            command.extend(("--macos-create-app-bundle", "--macos-app-name=Captioner"))
     if layout.platform_name == "windows":
         numeric_version = windows_numeric_version(display_version)
         command.extend(windows_compiler_options(architecture))
@@ -206,9 +249,7 @@ def build_command(
         )
     else:
         command.append(f"--product-version={display_version}")
-    if layout.platform_name == "macos":
-        command.extend(("--macos-create-app-bundle", "--macos-app-name=Captioner"))
-    command.append(str(project_root / "main.py"))
+    command.append(str(entry))
     return command
 
 
@@ -244,6 +285,44 @@ def _destination_within_final_root(layout: BuildLayout, destination: Path) -> Pa
     return candidate
 
 
+def _assert_resource_tree_safe(source: Path) -> None:
+    """Reject symlinks and non-file/non-directory entries in the resource tree."""
+    if source.is_symlink() or not source.is_dir():
+        raise BuildError.resource_source_invalid(source)
+    for path in sorted(source.rglob("*")):
+        if path.is_symlink():
+            raise BuildError.resource_source_invalid(path)
+        if not path.is_file() and not path.is_dir():
+            raise BuildError.resource_source_invalid(path)
+
+
+def stage_resource_tree(
+    layout: BuildLayout,
+    *,
+    project_root: Path = PROJECT_ROOT,
+) -> None:
+    """Copy the project resource tree into the staged final layout."""
+    source = project_root / "resources"
+    try:
+        validate_resource_root(source)
+    except AppError as exc:
+        raise BuildError.resource_source_invalid(source) from exc
+    _assert_resource_tree_safe(source)
+    destination = _destination_within_final_root(layout, layout.resource_root)
+    if destination.exists() or destination.is_symlink():
+        raise BuildError.resource_destination_exists(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copytree(source, destination)
+    except OSError as exc:
+        raise BuildError.resource_copy_failed(source, destination, str(exc)) from exc
+    try:
+        validate_resource_root(destination)
+    except AppError as exc:
+        raise BuildError.resource_source_invalid(destination) from exc
+    _assert_resource_tree_safe(destination)
+
+
 def stage_release_documents(
     layout: BuildLayout,
     *,
@@ -274,13 +353,14 @@ def stage_artifact(
 
     Prefer a same-filesystem move over a full tree copy so standalone builds do
     not pay a second multi-hundred-megabyte directory walk. Cross-device failures
-    fall back to ``shutil.move``'s copy-and-remove path. Release documentation is
-    staged explicitly after the move so platform layout does not depend on Nuitka
-    data-file placement.
+    fall back to ``shutil.move``'s copy-and-remove path. Application resources
+    and release documentation are staged explicitly after the move so platform
+    layout does not depend on Nuitka data-file placement.
     """
     safe_remove_owned(layout.final_root, (layout.work_root, layout.final_root))
     layout.final_root.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(artifact), str(layout.final_root))
+    stage_resource_tree(layout, project_root=project_root)
     stage_release_documents(layout, project_root=project_root)
     verify_layout(layout)
 
@@ -301,18 +381,23 @@ def verify_layout(layout: BuildLayout) -> None:
         raise BuildError.missing_files(str(exc)) from exc
 
 
-def build(version: str, *, clean: bool = False, platform_name: str | None = None) -> BuildLayout:
+def build(
+    version: str,
+    *,
+    clean: bool = False,
+    platform_name: str | None = None,
+    target: BuildTarget = "desktop",
+) -> BuildLayout:
     """Compile, stage, and verify the local platform artifact."""
     validate_version(version)
-    layout = layout_for_platform(platform_name)
+    layout = layout_for_platform(platform_name, target=target)
     if clean:
         clean_owned_paths(layout)
     layout.work_root.mkdir(parents=True, exist_ok=True)
     command = build_command(version, layout)
     print("==> " + " ".join(command), flush=True)
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
-    suffix = ".app" if layout.platform_name == "macos" else ".dist"
-    artifact = find_unique_artifact(layout.work_root, suffix)
+    artifact = find_unique_artifact(layout.work_root, artifact_suffix(layout))
     stage_artifact(layout, artifact)
     print(f"Nuitka output: {layout.final_root}")
     return layout
@@ -324,10 +409,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--clean", action="store_true", help="Clean owned staging/output paths first"
     )
+    parser.add_argument(
+        "--target",
+        choices=("cli", "desktop"),
+        default="desktop",
+        help="Build target: cli or desktop (default: desktop)",
+    )
     parser.add_argument("--version", default="0.0.0", help="Package version")
     namespace = parser.parse_args(argv)
     try:
-        build(namespace.version, clean=namespace.clean)
+        build(namespace.version, clean=namespace.clean, target=namespace.target)
     except (BuildError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Nuitka build failed: {exc}", file=sys.stderr)
         return 1
