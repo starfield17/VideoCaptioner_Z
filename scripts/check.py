@@ -38,6 +38,9 @@ def build_steps(mode: str) -> list[tuple[str, list[str]]]:
         "tests/contract",
         "tests/packaging",
         "tests/recovery",
+        "tests/runtime",
+        "tests/runtime_worker",
+        "tests/integration/runtime",
         "-q",
     ]
     if mode == "fast":
