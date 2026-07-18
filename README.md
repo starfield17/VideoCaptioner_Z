@@ -11,7 +11,7 @@ content-addressed artifacts support resume and retry.
 ## Local commands
 
 The supported local interpreter for this checkout is the `Lab` environment at
-`/home/hazel/miniconda3/envs/Lab/bin/python` (Python 3.13).
+`/Users/ray/miniconda3/envs/Lab/bin/python` (Python 3.13).
 
 ```bash
 uv sync --frozen
@@ -22,6 +22,48 @@ uv run python main.py --cli doctor --json
 QT_QPA_PLATFORM=offscreen uv run captioner-gui --lang en --smoke-test
 QT_QPA_PLATFORM=offscreen uv run captioner-gui --lang zh-CN --smoke-test
 ```
+
+## Storage locations
+
+Captioner keeps writable data in the operating system's user application
+directories. The source checkout and packaged application's bundled
+`resources/` tree remain read-only.
+
+On macOS the default roots are:
+
+```text
+~/Library/Application Support/Captioner/config
+~/Library/Application Support/Captioner/data
+~/Library/Caches/Captioner
+~/Library/Logs/Captioner
+```
+
+On Linux they are:
+
+```text
+~/.config/Captioner
+~/.local/share/Captioner
+~/.cache/Captioner
+~/.local/state/Captioner/log
+```
+
+On Windows, configuration uses the user's Roaming AppData area and application
+data, cache, temporary files, and logs use the user's Local AppData area, all
+under `Captioner`.
+
+Models are stored under `<data_dir>/models`, runtimes under
+`<data_dir>/runtimes`, and workspaces under `<data_dir>/workspaces`. Downloads
+and staging use `<data_dir>/downloads` and `<data_dir>/staging` respectively.
+Run the read-only Doctor command to see the exact paths selected on the current
+machine:
+
+```bash
+python main.py --cli doctor --json
+```
+
+Named Faster Whisper models downloaded after this change use
+`<data_dir>/models/faster-whisper`. Existing Hugging Face or Faster Whisper
+caches are not moved or migrated automatically.
 
 ### Recommended Nuitka build (`uv`)
 

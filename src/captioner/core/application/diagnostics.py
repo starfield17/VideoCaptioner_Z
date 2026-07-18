@@ -1,10 +1,14 @@
-"""Aggregate diagnostics DTOs and Application service (no paths/IDs/secrets)."""
+"""Aggregate diagnostics DTOs and Application service.
+
+Storage locations are an explicitly local UI projection. They are never copied
+into the redacted diagnostic bundle by the writer adapter.
+"""
 
 from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from captioner.core.domain.errors import AppError
@@ -69,6 +73,45 @@ class RuntimeAvailability:
         ):
             if not value.strip():
                 raise AppError("diagnostics.snapshot_invalid", {"field": field_name})
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticsStorageLocations:
+    """Application-owned writable locations for local Diagnostics presentation."""
+
+    config_dir: str
+    data_dir: str
+    models_dir: str
+    runtimes_dir: str
+    workspaces_dir: str
+    cache_dir: str
+    log_dir: str
+    downloads_dir: str
+    artifacts_dir: str
+    staging_dir: str
+
+    def __post_init__(self) -> None:
+        values = (
+            ("config_dir", self.config_dir),
+            ("data_dir", self.data_dir),
+            ("models_dir", self.models_dir),
+            ("runtimes_dir", self.runtimes_dir),
+            ("workspaces_dir", self.workspaces_dir),
+            ("cache_dir", self.cache_dir),
+            ("log_dir", self.log_dir),
+            ("downloads_dir", self.downloads_dir),
+            ("artifacts_dir", self.artifacts_dir),
+            ("staging_dir", self.staging_dir),
+        )
+        if any(value.strip() for _name, value in values) and any(
+            not value.strip() for _name, value in values
+        ):
+            raise AppError("diagnostics.snapshot_invalid", {"field": "storage"})
+
+    @classmethod
+    def empty(cls) -> DiagnosticsStorageLocations:
+        """Return a compatibility projection for legacy test/application ports."""
+        return cls("", "", "", "", "", "", "", "", "", "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +192,10 @@ class DiagnosticsSnapshot:
     queue: DiagnosticsQueueSummary
     configuration: DiagnosticsConfigurationSummary
     recovery: DiagnosticsRecoverySummary
+    storage: DiagnosticsStorageLocations = field(
+        default_factory=DiagnosticsStorageLocations.empty,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.schema_version != DIAGNOSTICS_SCHEMA_VERSION:
@@ -303,6 +350,13 @@ class DiagnosticsService:
             provider_configured=configuration_summary.provider_configured,
             credential_source=configuration_summary.credential_source,
         )
+        collector = getattr(self.environment, "collect_storage_locations", None)
+        storage = DiagnosticsStorageLocations.empty()
+        if callable(collector):
+            candidate = collector()
+            if not isinstance(candidate, DiagnosticsStorageLocations):
+                raise AppError("diagnostics.snapshot_invalid", {"field": "storage"})
+            storage = candidate
         return DiagnosticsSnapshot(
             schema_version=DIAGNOSTICS_SCHEMA_VERSION,
             request_id=request.request_id,
@@ -311,6 +365,7 @@ class DiagnosticsService:
             queue=queue_summary,
             configuration=configuration_summary,
             recovery=recovery_summary,
+            storage=storage,
         )
 
     def export(
@@ -339,5 +394,6 @@ __all__ = [
     "DiagnosticsRequest",
     "DiagnosticsService",
     "DiagnosticsSnapshot",
+    "DiagnosticsStorageLocations",
     "RuntimeAvailability",
 ]

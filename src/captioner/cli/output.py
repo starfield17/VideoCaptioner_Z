@@ -18,6 +18,13 @@ DOCTOR_LABEL_KEYS = {
     "cache_dir": "cli.doctor.cache_dir",
     "log_dir": "cli.doctor.log_dir",
     "temp_dir": "cli.doctor.temp_dir",
+    "batches_dir": "cli.doctor.batches_dir",
+    "artifacts_dir": "cli.doctor.artifacts_dir",
+    "models_dir": "cli.doctor.models_dir",
+    "runtimes_dir": "cli.doctor.runtimes_dir",
+    "workspaces_dir": "cli.doctor.workspaces_dir",
+    "downloads_dir": "cli.doctor.downloads_dir",
+    "staging_dir": "cli.doctor.staging_dir",
     "locale": "cli.doctor.locale",
     "catalog_valid": "cli.doctor.catalog_valid",
 }

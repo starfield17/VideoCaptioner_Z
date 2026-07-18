@@ -38,6 +38,21 @@ def test_source_override_and_writable_layout_are_separate(tmp_path: Path) -> Non
     assert paths.batches_dir.is_dir()
     assert (paths.artifacts_dir / ".incoming").is_dir()
     assert (paths.artifacts_dir / "sha256").is_dir()
+    assert paths.models_dir == paths.data_dir / "models"
+    assert paths.runtimes_dir == paths.data_dir / "runtimes"
+    assert paths.workspaces_dir == paths.data_dir / "workspaces"
+    assert paths.downloads_dir == paths.data_dir / "downloads"
+    assert paths.staging_dir == paths.data_dir / "staging"
+    assert all(
+        directory.is_dir()
+        for directory in (
+            paths.models_dir,
+            paths.runtimes_dir,
+            paths.workspaces_dir,
+            paths.downloads_dir,
+            paths.staging_dir,
+        )
+    )
     assert all(resources not in directory.parents for directory in paths.writable_directories)
 
 
@@ -123,3 +138,10 @@ def test_default_platformdirs_paths_are_not_bundle_relative() -> None:
     paths = resolve_app_paths()
     assert paths.config_dir != paths.resource_root
     assert paths.data_dir != paths.resource_root
+
+
+def test_platformdirs_macos_paths_keep_config_and_data_namespaces_separate() -> None:
+    paths = resolve_app_paths(platform_name="darwin")
+    assert paths.config_dir.name == "config"
+    assert paths.data_dir.name == "data"
+    assert paths.config_dir.parent == paths.data_dir.parent

@@ -20,9 +20,11 @@ from captioner.core.application.diagnostics import (
     DiagnosticExportRequest,
     DiagnosticExportResult,
     DiagnosticsSnapshot,
+    DiagnosticsStorageLocations,
     RuntimeAvailability,
 )
 from captioner.core.domain.errors import AppError
+from captioner.infrastructure.app_paths import AppPaths, resolve_app_paths
 
 _MAX_MEMBER_BYTES = 512 * 1024
 _MAX_TOTAL_UNCOMPRESSED_BYTES = 2 * 1024 * 1024
@@ -82,6 +84,9 @@ def _fsync_directory(path: Path) -> None:
 class LocalDiagnosticsAdapter:
     """Implements environment probes and whitelist-only ZIP export."""
 
+    def __init__(self, *, paths: AppPaths | None = None) -> None:
+        self._paths = paths
+
     def collect_runtime_availability(
         self,
         *,
@@ -102,6 +107,22 @@ class LocalDiagnosticsAdapter:
             asr_runtime_available=asr_spec is not None,
             provider_configured=provider_configured,
             credential_source=credential_source,
+        )
+
+    def collect_storage_locations(self) -> DiagnosticsStorageLocations:
+        """Project resolved writable locations without creating or exporting them."""
+        paths = self._paths if self._paths is not None else resolve_app_paths()
+        return DiagnosticsStorageLocations(
+            config_dir=str(paths.config_dir),
+            data_dir=str(paths.data_dir),
+            models_dir=str(paths.models_dir),
+            runtimes_dir=str(paths.runtimes_dir),
+            workspaces_dir=str(paths.workspaces_dir),
+            cache_dir=str(paths.cache_dir),
+            log_dir=str(paths.log_dir),
+            downloads_dir=str(paths.downloads_dir),
+            artifacts_dir=str(paths.artifacts_dir),
+            staging_dir=str(paths.staging_dir),
         )
 
     def write_bundle(

@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
 from captioner.core.application.diagnostics import (
     DiagnosticExportResult,
     DiagnosticsSnapshot,
+    DiagnosticsStorageLocations,
 )
 from captioner.gui.application_runner import RunnerFailure
 from captioner.gui.diagnostics_controller import DiagnosticsController
@@ -39,6 +41,7 @@ class DiagnosticsPage(QWidget):
         self._service = service
         self._controller = controller
         self._visited = False
+        self._storage_paths: dict[str, str] = {}
 
         root = QVBoxLayout(self)
         title = QLabel(service.translate("gui.diagnostics.title"))
@@ -104,6 +107,77 @@ class DiagnosticsPage(QWidget):
             self._credential_source,
         )
         root.addWidget(cap_group)
+
+        storage_group = QGroupBox(service.translate("gui.diagnostics.storage"))
+        storage_group.setObjectName("diagnosticsStorageGroup")
+        storage_form = QFormLayout(storage_group)
+        self._storage_labels: dict[str, QLabel] = {}
+        self._storage_buttons: dict[str, QPushButton] = {}
+        for key, label_key, label_name, button_name in (
+            (
+                "config_dir",
+                "gui.diagnostics.storage.configuration",
+                "diagnosticsConfigPathLabel",
+                "diagnosticsOpenConfigFolderButton",
+            ),
+            (
+                "data_dir",
+                "gui.diagnostics.storage.application_data",
+                "diagnosticsDataPathLabel",
+                "diagnosticsOpenDataFolderButton",
+            ),
+            (
+                "models_dir",
+                "gui.diagnostics.storage.models",
+                "diagnosticsModelsPathLabel",
+                "diagnosticsOpenModelsFolderButton",
+            ),
+            (
+                "runtimes_dir",
+                "gui.diagnostics.storage.runtimes",
+                "diagnosticsRuntimesPathLabel",
+                "diagnosticsOpenRuntimesFolderButton",
+            ),
+            (
+                "workspaces_dir",
+                "gui.diagnostics.storage.workspaces",
+                "diagnosticsWorkspacesPathLabel",
+                "diagnosticsOpenWorkspacesFolderButton",
+            ),
+            (
+                "cache_dir",
+                "gui.diagnostics.storage.cache",
+                "diagnosticsCachePathLabel",
+                "diagnosticsOpenCacheFolderButton",
+            ),
+            (
+                "log_dir",
+                "gui.diagnostics.storage.logs",
+                "diagnosticsLogsPathLabel",
+                "diagnosticsOpenLogsFolderButton",
+            ),
+        ):
+            path_label = QLabel("")
+            path_label.setObjectName(label_name)
+            path_label.setWordWrap(True)
+            path_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+            path_label.setToolTip("")
+            open_button = QPushButton(service.translate("gui.diagnostics.open_folder"))
+            open_button.setObjectName(button_name)
+            open_button.setEnabled(False)
+            open_button.clicked.connect(
+                lambda _checked=False, storage_key=key: self._on_open_storage(storage_key)
+            )
+            row = QHBoxLayout()
+            row.addWidget(path_label, stretch=1)
+            row.addWidget(open_button)
+            storage_form.addRow(service.translate(label_key), row)
+            self._storage_labels[key] = path_label
+            self._storage_buttons[key] = open_button
+        root.addWidget(storage_group)
 
         queue_group = QGroupBox(service.translate("gui.diagnostics.queue"))
         queue_group.setObjectName("diagnosticsQueueGroup")
@@ -260,6 +334,15 @@ class DiagnosticsPage(QWidget):
         )
         self._credential_source.setText(self._credential_label(runtime.credential_source))
 
+        storage = snapshot.storage
+        self._storage_paths = self._storage_values(storage)
+        unavailable = self._service.translate("gui.value.unavailable")
+        for key, label in self._storage_labels.items():
+            path = self._storage_paths[key]
+            label.setText(path or unavailable)
+            label.setToolTip(path)
+            self._storage_buttons[key].setEnabled(bool(path))
+
         queue = snapshot.queue
         self._queue_summary.setText(
             self._service.translate(
@@ -366,6 +449,36 @@ class DiagnosticsPage(QWidget):
             "missing": "gui.value.missing",
         }.get(source, "gui.value.missing")
         return self._service.translate(key)
+
+    def _on_open_storage(self, key: str) -> None:
+        path_text = self._storage_paths.get(key, "")
+        if not path_text:
+            return
+        path = Path(path_text)
+        if not path.is_dir():
+            self._show_storage_error("gui.diagnostics.storage_missing", path_text)
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            self._show_storage_error("gui.diagnostics.storage_open_failed", path_text)
+
+    def _show_storage_error(self, message_key: str, path: str) -> None:
+        box = QMessageBox(self)
+        box.setObjectName("diagnosticsStorageErrorDialog")
+        box.setWindowTitle(self._service.translate("gui.diagnostics.storage_error_title"))
+        box.setText(self._service.translate(message_key, {"path": path}))
+        box.exec()
+
+    @staticmethod
+    def _storage_values(storage: DiagnosticsStorageLocations) -> dict[str, str]:
+        return {
+            "config_dir": storage.config_dir,
+            "data_dir": storage.data_dir,
+            "models_dir": storage.models_dir,
+            "runtimes_dir": storage.runtimes_dir,
+            "workspaces_dir": storage.workspaces_dir,
+            "cache_dir": storage.cache_dir,
+            "log_dir": storage.log_dir,
+        }
 
 
 __all__ = ["DiagnosticsPage"]

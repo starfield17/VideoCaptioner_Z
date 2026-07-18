@@ -7,7 +7,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
+from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton
 
 from captioner.core.application.configuration import (
     ConfigurationIssue,
@@ -185,4 +185,53 @@ def test_chinese_labels() -> None:
     save = page.findChild(QPushButton, "settingsSaveGlobalButton")
     assert save is not None
     assert "保存" in save.text()
+    helper = page.findChild(QLabel, "settingsTokenizerHelperLabel")
+    assert helper is not None
+    assert "完整请求长度" in helper.text()
+    page.close()
+
+
+def test_tokenizer_display_is_localized_but_user_data_is_stable() -> None:
+    page, _controller, _runner = _page("en")
+    combo = page.findChild(QComboBox, "settingsTokenizerCombo")
+    helper = page.findChild(QLabel, "settingsTokenizerHelperLabel")
+    assert combo is not None and helper is not None
+    assert [combo.itemData(index) for index in range(combo.count())] == [
+        "auto",
+        "cl100k_base",
+        "o200k_base",
+    ]
+    assert combo.itemText(0) == "Auto — known models only"
+    assert combo.itemText(0) != combo.itemData(0)
+    assert "complete LLM request" in helper.text()
+    page.close()
+
+
+def test_provider_model_list_refresh_preserves_manual_model_and_unknown_auto_is_actionable() -> (
+    None
+):
+    page, _controller, _runner = _page("en")
+    model = page.findChild(QLineEdit, "settingsModelEdit")
+    assert model is not None
+    model.setText("manual-model")
+    page._on_provider_test(  # pyright: ignore[reportPrivateUsage]  # test signal rendering directly
+        ProviderConnectionResult(
+            ok=True,
+            code="llm.connection_ok",
+            model_listing_supported=True,
+            available_models=("a-model", "b-model"),
+            configured_model_found=False,
+            resolved_tokenizer="cl100k_base",
+            tokenizer_valid=True,
+        )
+    )
+    assert model.text() == "manual-model"
+    result = page.findChild(QLabel, "settingsProviderResultLabel")
+    assert result is not None
+    assert "Current model: not found in list" in result.text()
+
+    page._on_provider_test(  # pyright: ignore[reportPrivateUsage]  # test signal rendering directly
+        ProviderConnectionResult(ok=False, code="llm.tokenizer_unknown")
+    )
+    assert "Choose cl100k_base or o200k_base manually" in result.text()
     page.close()

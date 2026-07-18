@@ -8,6 +8,7 @@ from captioner.core.application.diagnostics import (
     DiagnosticExportRequest,
     DiagnosticExportResult,
     DiagnosticsSnapshot,
+    DiagnosticsStorageLocations,
     RuntimeAvailability,
 )
 
@@ -19,6 +20,8 @@ class DiagnosticsEnvironmentPort(Protocol):
         provider_configured: bool,
         credential_source: Literal["config", "environment", "missing"],
     ) -> RuntimeAvailability: ...
+
+    def collect_storage_locations(self) -> DiagnosticsStorageLocations: ...
 
 
 class DiagnosticBundleWriterPort(Protocol):

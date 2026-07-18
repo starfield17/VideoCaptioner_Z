@@ -21,11 +21,24 @@ temperature = 0.1
 tokenizer = "cl100k_base"
 ```
 
+## Request token estimator
+
 Supported tokenizer IDs are `cl100k_base` and `o200k_base`. The value may also
 be `auto`, which maps only explicitly recognized model IDs; unknown models fail
-closed with `llm.tokenizer_unknown`. Production budgeting uses tiktoken through
-`ModelTokenCounter`. Character-length counters are test doubles only and must
-not be reported as token budgets.
+closed with `llm.tokenizer_unknown` and require a manual tokenizer choice.
+
+The tokenizer estimates the complete serialized LLM request for token budgeting:
+system Prompt, user envelope, dynamic context, and response schema are all
+included. It is used to split subtitle batches before a provider context limit
+is exceeded. It does not perform ASR, subtitle segmentation, or translation.
+Choosing the wrong tokenizer can underestimate a request and cause a provider
+rejection, or overestimate it and split work more aggressively than necessary.
+
+Production budgeting uses tiktoken through `ModelTokenCounter`. The
+`cl100k_base` and `o200k_base` tokenizer resources are bundled with the
+application and verified locally; an encoding file is never downloaded at
+runtime. Character-length counters are test doubles only and must not be
+reported as token budgets.
 
 The API key is intentionally plaintext in the OS-specific config directory.
 POSIX creation attempts mode `0600`. The application never generates a real

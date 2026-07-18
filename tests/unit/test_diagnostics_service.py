@@ -20,6 +20,7 @@ from captioner.core.application.diagnostics import (
     DiagnosticsRequest,
     DiagnosticsService,
     DiagnosticsSnapshot,
+    DiagnosticsStorageLocations,
     RuntimeAvailability,
 )
 from captioner.core.application.queue_projection import (
@@ -85,6 +86,9 @@ class FakeEnvironment:
             provider_configured=provider_configured,
             credential_source=credential_source,
         )
+
+    def collect_storage_locations(self) -> DiagnosticsStorageLocations:
+        return DiagnosticsStorageLocations.empty()
 
 
 class FakeWriter:

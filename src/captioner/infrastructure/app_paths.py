@@ -63,6 +63,26 @@ class AppPaths:
         return self.data_dir / "artifacts"
 
     @property
+    def models_dir(self) -> Path:
+        return self.data_dir / "models"
+
+    @property
+    def runtimes_dir(self) -> Path:
+        return self.data_dir / "runtimes"
+
+    @property
+    def workspaces_dir(self) -> Path:
+        return self.data_dir / "workspaces"
+
+    @property
+    def downloads_dir(self) -> Path:
+        return self.data_dir / "downloads"
+
+    @property
+    def staging_dir(self) -> Path:
+        return self.data_dir / "staging"
+
+    @property
     def tokenizer_resource_dir(self) -> Path:
         return self.resource_root / "tokenizers"
 
@@ -72,7 +92,22 @@ class AppPaths:
 
     @property
     def writable_directories(self) -> tuple[Path, ...]:
-        return (self.config_dir, self.data_dir, self.cache_dir, self.log_dir, self.temp_dir)
+        return (
+            self.config_dir,
+            self.data_dir,
+            self.cache_dir,
+            self.log_dir,
+            self.temp_dir,
+            self.batches_dir,
+            self.artifacts_dir,
+            self.artifacts_dir / ".incoming",
+            self.artifacts_dir / "sha256",
+            self.models_dir,
+            self.runtimes_dir,
+            self.workspaces_dir,
+            self.downloads_dir,
+            self.staging_dir,
+        )
 
 
 def resolve_app_paths(
@@ -130,9 +165,6 @@ def ensure_runtime_layout(paths: AppPaths) -> None:
     """Create only writable directories; bundled resources remain untouched."""
     for directory in paths.writable_directories:
         directory.mkdir(parents=True, exist_ok=True)
-    paths.batches_dir.mkdir(parents=True, exist_ok=True)
-    (paths.artifacts_dir / ".incoming").mkdir(parents=True, exist_ok=True)
-    (paths.artifacts_dir / "sha256").mkdir(parents=True, exist_ok=True)
 
 
 def resolve_safe_child(root: Path, identifier: str, *, field: str) -> Path:
@@ -254,12 +286,22 @@ def _resolve_writable_dirs(
             "temp_dir": root / "temp",
         }
     if home_dir is None:
+        config_root = Path(user_config_dir(app_name, appauthor=False))
+        data_root = Path(user_data_dir(app_name, appauthor=False))
+        if platform_name == "darwin":
+            # platformdirs intentionally maps both macOS roots to the same
+            # Application Support directory. Keep the application's config
+            # and durable data namespaces explicit, matching the injected-home
+            # seam and avoiding one mixed-purpose writable root.
+            config_root /= "config"
+            data_root /= "data"
+        cache_root = Path(user_cache_dir(app_name, appauthor=False))
         return {
-            "config_dir": Path(user_config_dir(app_name, appauthor=False)),
-            "data_dir": Path(user_data_dir(app_name, appauthor=False)),
-            "cache_dir": Path(user_cache_dir(app_name, appauthor=False)),
+            "config_dir": config_root,
+            "data_dir": data_root,
+            "cache_dir": cache_root,
             "log_dir": Path(user_log_dir(app_name, appauthor=False)),
-            "temp_dir": Path(user_cache_dir(app_name, appauthor=False)) / "tmp",
+            "temp_dir": cache_root / "tmp",
         }
 
     home = home_dir.expanduser().resolve()

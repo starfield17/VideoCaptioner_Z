@@ -111,6 +111,7 @@ def build_run_service(
             device=device,
             compute_type=compute_type,
             language=language,
+            model_cache_dir=application_paths.models_dir / "faster-whisper",
         )
     )
     return RunSingleService(
@@ -408,7 +409,13 @@ def build_durable_service(
     durable = ContentAddressedArtifactStore(
         application_paths.artifacts_dir, initialize=initialize_runtime
     )
-    engine_config = FasterWhisperConfig(model_ref, device, compute_type, language)
+    engine_config = FasterWhisperConfig(
+        model_ref,
+        device,
+        compute_type,
+        language,
+        model_cache_dir=application_paths.models_dir / "faster-whisper",
+    )
     engine = FasterWhisperEngine(engine_config)
     policy = SegmentationPolicyConfig.from_mapping(
         segmentation or SegmentationPolicyConfig().to_mapping()

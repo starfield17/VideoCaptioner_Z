@@ -64,6 +64,15 @@ def _run_smoke_invariants(window: object) -> None:
         "diagnosticsInstallRuntimeButton",
         "diagnosticsManageModelsButton",
         "diagnosticsPrivacyLabel",
+        "diagnosticsStorageGroup",
+        "diagnosticsConfigPathLabel",
+        "diagnosticsDataPathLabel",
+        "diagnosticsModelsPathLabel",
+        "diagnosticsRuntimesPathLabel",
+        "diagnosticsWorkspacesPathLabel",
+        "diagnosticsCachePathLabel",
+        "diagnosticsLogsPathLabel",
+        "diagnosticsOpenConfigFolderButton",
     ):
         control = diagnostics.findChild(QWidget, name)
         _smoke_assert(control is not None, f"missing_{name}")

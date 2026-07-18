@@ -330,6 +330,8 @@ class TomlConfigurationStore:
             base_url=base_url,
             api_key=api_key,
             timeout_sec=float(update.request_timeout_sec),
+            model=update.model,
+            tokenizer=update.tokenizer,
         )
 
     def _load_settings_or_defaults(

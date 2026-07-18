@@ -293,6 +293,11 @@ class ConfigurationSnapshot:
 class ProviderConnectionResult:
     ok: bool
     code: str
+    model_listing_supported: bool = False
+    available_models: tuple[str, ...] = ()
+    configured_model_found: bool | None = None
+    resolved_tokenizer: str | None = None
+    tokenizer_valid: bool = False
 
 
 @dataclass(slots=True)

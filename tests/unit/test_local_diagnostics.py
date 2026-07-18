@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,9 +20,11 @@ from captioner.core.application.diagnostics import (
     DiagnosticsQueueSummary,
     DiagnosticsRecoverySummary,
     DiagnosticsSnapshot,
+    DiagnosticsStorageLocations,
     RuntimeAvailability,
 )
 from captioner.core.domain.errors import AppError
+from captioner.infrastructure.app_paths import resolve_app_paths
 
 SENTINELS = (
     b"sk-diagnostic-secret-123",
@@ -101,6 +104,47 @@ def test_runtime_probe_is_lightweight() -> None:
     assert isinstance(runtime.ffprobe_available, bool)
     assert isinstance(runtime.asr_runtime_available, bool)
     assert isinstance(runtime.packaged, bool)
+
+
+def test_storage_projection_uses_injected_app_paths(tmp_path: Path) -> None:
+    paths = resolve_app_paths(
+        base_dir=tmp_path / "runtime",
+        resource_root_override=Path("resources").resolve(),
+    )
+    storage = LocalDiagnosticsAdapter(paths=paths).collect_storage_locations()
+    assert storage.config_dir == str(paths.config_dir)
+    assert storage.data_dir == str(paths.data_dir)
+    assert storage.models_dir == str(paths.models_dir)
+    assert storage.runtimes_dir == str(paths.runtimes_dir)
+    assert storage.workspaces_dir == str(paths.workspaces_dir)
+    assert storage.cache_dir == str(paths.cache_dir)
+    assert storage.log_dir == str(paths.log_dir)
+
+
+def test_storage_paths_are_not_exported_in_diagnostic_bundle(tmp_path: Path) -> None:
+    adapter = LocalDiagnosticsAdapter()
+    destination = tmp_path / "safe-storage.zip"
+    result = adapter.write_bundle(
+        DiagnosticExportRequest(request_id="req-storage", destination=str(destination)),
+        snapshot=replace(
+            _snapshot(),
+            storage=DiagnosticsStorageLocations(
+                config_dir=str(tmp_path / "config-secret"),
+                data_dir=str(tmp_path / "data-secret"),
+                models_dir=str(tmp_path / "models-secret"),
+                runtimes_dir=str(tmp_path / "runtimes-secret"),
+                workspaces_dir=str(tmp_path / "workspaces-secret"),
+                cache_dir=str(tmp_path / "cache-secret"),
+                log_dir=str(tmp_path / "log-secret"),
+                downloads_dir=str(tmp_path / "downloads-secret"),
+                artifacts_dir=str(tmp_path / "artifacts-secret"),
+                staging_dir=str(tmp_path / "staging-secret"),
+            ),
+        ),
+    )
+    assert result.size_bytes > 0
+    raw = destination.read_bytes()
+    assert str(tmp_path).encode("utf-8") not in raw
 
 
 def test_bundle_members_canonical_and_hashed(tmp_path: Path) -> None:

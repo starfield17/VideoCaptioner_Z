@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from captioner.core.application.diagnostics import (
@@ -14,6 +17,7 @@ from captioner.core.application.diagnostics import (
     DiagnosticsQueueSummary,
     DiagnosticsRecoverySummary,
     DiagnosticsSnapshot,
+    DiagnosticsStorageLocations,
     RuntimeAvailability,
 )
 from captioner.gui.diagnostics_controller import DiagnosticsController
@@ -80,6 +84,18 @@ def _snapshot() -> DiagnosticsSnapshot:
             paused_batches=1,
             issue_codes=(),
         ),
+        storage=DiagnosticsStorageLocations(
+            config_dir="/tmp/captioner/config",
+            data_dir="/tmp/captioner/data",
+            models_dir="/tmp/captioner/data/models",
+            runtimes_dir="/tmp/captioner/data/runtimes",
+            workspaces_dir="/tmp/captioner/data/workspaces",
+            cache_dir="/tmp/captioner/cache",
+            log_dir="/tmp/captioner/log",
+            downloads_dir="/tmp/captioner/data/downloads",
+            artifacts_dir="/tmp/captioner/data/artifacts",
+            staging_dir="/tmp/captioner/data/staging",
+        ),
     )
 
 
@@ -110,6 +126,15 @@ def test_required_object_names_and_future_controls() -> None:
         "diagnosticsAsrRuntimeLabel",
         "diagnosticsProviderLabel",
         "diagnosticsCredentialSourceLabel",
+        "diagnosticsStorageGroup",
+        "diagnosticsConfigPathLabel",
+        "diagnosticsDataPathLabel",
+        "diagnosticsModelsPathLabel",
+        "diagnosticsRuntimesPathLabel",
+        "diagnosticsWorkspacesPathLabel",
+        "diagnosticsCachePathLabel",
+        "diagnosticsLogsPathLabel",
+        "diagnosticsOpenConfigFolderButton",
         "diagnosticsQueueGroup",
         "diagnosticsQueueSummaryLabel",
         "diagnosticsQueueIssuesLabel",
@@ -158,3 +183,28 @@ def test_snapshot_render_english_and_chinese() -> None:
         queue = page.findChild(QLabel, "diagnosticsQueueSummaryLabel")
         assert queue is not None
         assert "2" in queue.text()
+        config_path = page.findChild(QLabel, "diagnosticsConfigPathLabel")
+        assert config_path is not None
+        assert config_path.text() == "/tmp/captioner/config"
+        assert config_path.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+
+
+def test_open_folder_uses_snapshot_path_as_local_file_url(tmp_path: Path) -> None:
+    page = _page("en")
+    target = tmp_path / "config"
+    target.mkdir()
+    storage = replace(_snapshot().storage, config_dir=str(target))
+    page._on_snapshot(  # pyright: ignore[reportPrivateUsage]  # render injected snapshot
+        replace(_snapshot(), storage=storage)
+    )
+    with patch(
+        "captioner.gui.pages.diagnostics_page.QDesktopServices.openUrl",
+        return_value=True,
+    ) as open_url:
+        page._on_open_storage(  # pyright: ignore[reportPrivateUsage]  # invoke button slot
+            "config_dir"
+        )
+    url = open_url.call_args.args[0]
+    assert url.isLocalFile()
+    assert Path(url.toLocalFile()) == target
+    page.close()

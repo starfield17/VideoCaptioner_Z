@@ -1,9 +1,19 @@
 """Thin source-tree and Nuitka entry point for Captioner."""
 
+import sys
+from pathlib import Path
 from typing import cast
 
-from captioner.entrypoint import main
-from captioner.infrastructure.app_paths import (
+PROJECT_ROOT = Path(__file__).resolve().parent
+SOURCE_ROOT = PROJECT_ROOT / "src"
+
+if SOURCE_ROOT.is_dir():
+    source_root_text = str(SOURCE_ROOT)
+    if source_root_text not in sys.path:
+        sys.path.insert(0, source_root_text)
+
+from captioner.entrypoint import main  # noqa: E402  # source bootstrap must run first
+from captioner.infrastructure.app_paths import (  # noqa: E402  # source bootstrap must run first
     CompiledRuntime,
     compiled_runtime_from_descriptor,
 )

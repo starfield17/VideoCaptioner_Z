@@ -49,6 +49,13 @@ def run(options: DoctorOptions, *, service: I18nService | None = None) -> dict[s
         "cache_dir": str(paths.cache_dir),
         "log_dir": str(paths.log_dir),
         "temp_dir": str(paths.temp_dir),
+        "batches_dir": str(paths.batches_dir),
+        "artifacts_dir": str(paths.artifacts_dir),
+        "models_dir": str(paths.models_dir),
+        "runtimes_dir": str(paths.runtimes_dir),
+        "workspaces_dir": str(paths.workspaces_dir),
+        "downloads_dir": str(paths.downloads_dir),
+        "staging_dir": str(paths.staging_dir),
         "locale": message_service.locale,
         "catalog_valid": catalog_valid,
     }

@@ -167,9 +167,12 @@ model = "m"
             base_url="https://example.com/v1",
             model="m",
             api_key=None,
+            tokenizer="o200k_base",
         )
     )
     assert probe.api_key == "config-key"
+    assert probe.model == "m"
+    assert probe.tokenizer == "o200k_base"
 
 
 def test_environment_fallbacks(tmp_path: Path) -> None:

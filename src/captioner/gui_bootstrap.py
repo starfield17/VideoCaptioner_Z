@@ -184,7 +184,7 @@ def build_gui_application_boundary(
     )
     job_detail = JobDetailService(gateway=gateway, coordinator=coordinator)
     recovery = RecoveryService(gateway=gateway, coordinator=coordinator)
-    local_diagnostics = LocalDiagnosticsAdapter()
+    local_diagnostics = LocalDiagnosticsAdapter(paths=application_paths)
     diagnostics = DiagnosticsService(
         queue=queue,
         configuration=configuration,

@@ -35,6 +35,13 @@ def test_doctor_json_and_locale(capsys: pytest.CaptureFixture[str]) -> None:
         "cache_dir",
         "log_dir",
         "temp_dir",
+        "batches_dir",
+        "artifacts_dir",
+        "models_dir",
+        "runtimes_dir",
+        "workspaces_dir",
+        "downloads_dir",
+        "staging_dir",
         "locale",
         "catalog_valid",
     }

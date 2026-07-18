@@ -17,11 +17,15 @@ def _settings(
     base_url: str = "https://api.example.com/v1",
     api_key: str = "probe-secret",
     timeout_sec: float = 5.0,
+    model: str = "gpt-4o-mini",
+    tokenizer: str = "cl100k_base",
 ) -> ProviderRuntimeProbeSettings:
     return ProviderRuntimeProbeSettings(
         base_url=base_url,
         api_key=api_key,
         timeout_sec=timeout_sec,
+        model=model,
+        tokenizer=tokenizer,
     )
 
 
@@ -46,16 +50,21 @@ def test_success_sends_auth_and_models_path() -> None:
     ) as client_cls:
         probe = HTTPProviderProbe()
         result = probe.test(_settings())
-    assert result.ok is True
-    assert result.code == "llm.connection_ok"
-    kwargs = client_cls.call_args.kwargs
-    assert kwargs["follow_redirects"] is False
-    call = client.get.call_args
-    assert call.args[0] == "https://api.example.com/v1/models"
-    assert call.kwargs["headers"]["Authorization"] == "Bearer probe-secret"
-    assert call.kwargs["headers"]["Accept"] == "application/json"
-    client.close.assert_called_once()
-    assert "probe-secret" not in repr(result)
+        assert result.ok is True
+        assert result.code == "llm.connection_ok"
+        assert result.model_listing_supported is True
+        assert result.available_models == ()
+        assert result.configured_model_found is False
+        assert result.resolved_tokenizer == "cl100k_base"
+        assert result.tokenizer_valid is True
+        kwargs = client_cls.call_args.kwargs
+        assert kwargs["follow_redirects"] is False
+        call = client.get.call_args
+        assert call.args[0] == "https://api.example.com/v1/models"
+        assert call.kwargs["headers"]["Authorization"] == "Bearer probe-secret"
+        assert call.kwargs["headers"]["Accept"] == "application/json"
+        client.close.assert_called_once()
+        assert "probe-secret" not in repr(result)
 
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -125,3 +134,69 @@ def test_transport_failure() -> None:
 def test_settings_repr_redacted() -> None:
     settings = _settings()
     assert "probe-secret" not in repr(settings)
+
+
+def test_models_success_returns_sorted_deduplicated_ids_and_keeps_manual_model() -> None:
+    client = _client_with_response(
+        200,
+        b'{"data":[{"id":"z-model"},{"id":"a-model"},{"id":"z-model"}]}',
+    )
+    with patch(
+        "captioner.adapters.llm.http_provider_probe.httpx.Client",
+        return_value=client,
+    ):
+        result = HTTPProviderProbe().test(_settings(model="manual-model"))
+    assert result.ok is True
+    assert result.available_models == ("a-model", "z-model")
+    assert result.configured_model_found is False
+
+
+def test_models_endpoint_unsupported_does_not_fail_valid_provider() -> None:
+    client = _client_with_response(404, b'{"error":"not supported"}')
+    with patch(
+        "captioner.adapters.llm.http_provider_probe.httpx.Client",
+        return_value=client,
+    ):
+        result = HTTPProviderProbe().test(_settings(model="manual-model"))
+    assert result.ok is True
+    assert result.model_listing_supported is False
+    assert result.configured_model_found is None
+    assert result.tokenizer_valid is True
+
+
+def test_explicit_unsupported_models_response_does_not_fail_valid_provider() -> None:
+    client = _client_with_response(400, b'{"error":"endpoint unsupported"}')
+    with patch(
+        "captioner.adapters.llm.http_provider_probe.httpx.Client",
+        return_value=client,
+    ):
+        result = HTTPProviderProbe().test(_settings(model="manual-model"))
+    assert result.ok is True
+    assert result.model_listing_supported is False
+
+
+def test_auto_tokenizer_unknown_model_returns_actionable_structured_code() -> None:
+    client = _client_with_response(404)
+    with patch(
+        "captioner.adapters.llm.http_provider_probe.httpx.Client",
+        return_value=client,
+    ):
+        result = HTTPProviderProbe().test(
+            _settings(model="provider-specific-model", tokenizer="auto")
+        )
+    assert result.ok is False
+    assert result.code == "llm.tokenizer_unknown"
+    assert result.tokenizer_valid is False
+    assert result.resolved_tokenizer is None
+
+
+def test_auto_tokenizer_resolves_known_model() -> None:
+    client = _client_with_response(404)
+    with patch(
+        "captioner.adapters.llm.http_provider_probe.httpx.Client",
+        return_value=client,
+    ):
+        result = HTTPProviderProbe().test(_settings(model="gpt-4o-mini", tokenizer="auto"))
+    assert result.ok is True
+    assert result.resolved_tokenizer == "o200k_base"
+    assert result.tokenizer_valid is True

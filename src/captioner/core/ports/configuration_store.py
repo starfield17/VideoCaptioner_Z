@@ -18,6 +18,8 @@ class ProviderRuntimeProbeSettings:
     base_url: str
     api_key: str = field(repr=False)
     timeout_sec: float
+    model: str = ""
+    tokenizer: str = "cl100k_base"
 
     def __repr__(self) -> str:
         return "ProviderRuntimeProbeSettings(<redacted>)"

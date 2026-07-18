@@ -162,8 +162,14 @@ class SettingsPage(QWidget):
         self._base_url.setObjectName("settingsBaseUrlEdit")
         form.addRow(self._service.translate("gui.settings.base_url"), self._base_url)
 
-        self._model = QLineEdit()
-        self._model.setObjectName("settingsModelEdit")
+        self._model = QComboBox()
+        self._model.setObjectName("settingsModelCombo")
+        self._model.setEditable(True)
+        model_edit = self._model.lineEdit()
+        if model_edit is not None:
+            # Keep the Phase 5 object name for automation while the public
+            # control gains model-list discovery and free-form editing.
+            model_edit.setObjectName("settingsModelEdit")
         form.addRow(self._service.translate("gui.settings.model"), self._model)
 
         self._api_key = QLineEdit()
@@ -217,9 +223,20 @@ class SettingsPage(QWidget):
 
         self._tokenizer = QComboBox()
         self._tokenizer.setObjectName("settingsTokenizerCombo")
-        for value in ("cl100k_base", "o200k_base", "auto"):
-            self._tokenizer.addItem(value, value)
+        for value, label_key in (
+            ("auto", "gui.settings.tokenizer.auto"),
+            ("cl100k_base", "gui.settings.tokenizer.cl100k_base"),
+            ("o200k_base", "gui.settings.tokenizer.o200k_base"),
+        ):
+            self._tokenizer.addItem(self._service.translate(label_key), value)
+        default_tokenizer_index = self._tokenizer.findData("cl100k_base")
+        if default_tokenizer_index >= 0:
+            self._tokenizer.setCurrentIndex(default_tokenizer_index)
         form.addRow(self._service.translate("gui.settings.tokenizer"), self._tokenizer)
+        tokenizer_helper = QLabel(self._service.translate("gui.settings.tokenizer_description"))
+        tokenizer_helper.setObjectName("settingsTokenizerHelperLabel")
+        tokenizer_helper.setWordWrap(True)
+        form.addRow("", tokenizer_helper)
 
         buttons = QHBoxLayout()
         save_provider = QPushButton(self._service.translate("gui.settings.provider_save"))
@@ -264,7 +281,7 @@ class SettingsPage(QWidget):
         return ProviderSettingsUpdate(
             profile_name=self._profile_edit.text().strip() or "default",
             base_url=self._base_url.text().strip(),
-            model=self._model.text().strip(),
+            model=self._model.currentText().strip(),
             api_key=api_key,
             max_concurrency=int(self._max_concurrency.value()),
             request_timeout_sec=float(self._timeout.value()),
@@ -307,7 +324,7 @@ class SettingsPage(QWidget):
         provider = snapshot.provider
         self._profile_edit.setText(provider.profile_name)
         self._base_url.setText(provider.base_url)
-        self._model.setText(provider.model)
+        self._model.setEditText(provider.model)
         self._api_key.clear()
         source_key = {
             "config": "gui.settings.credential.config",
@@ -362,17 +379,61 @@ class SettingsPage(QWidget):
     def _on_provider_test(self, result: object) -> None:
         if not isinstance(result, ProviderConnectionResult):
             return
-        if result.ok:
-            self._provider_result.setText(self._service.translate("gui.settings.provider_test_ok"))
+        if result.available_models:
+            current_model = self._model.currentText()
+            self._model.blockSignals(True)
+            self._model.clear()
+            for model_id in result.available_models:
+                self._model.addItem(model_id, model_id)
+            self._model.setEditText(current_model)
+            self._model.blockSignals(False)
+
+        if not result.ok:
+            if result.code == "llm.tokenizer_unknown":
+                self._provider_result.setText(
+                    self._service.translate("gui.settings.provider_test_tokenizer_unknown")
+                )
+            else:
+                self._provider_result.setText(
+                    self._service.translate(
+                        "gui.settings.provider_test_failed",
+                        {"code": result.code},
+                    )
+                )
             self._provider_failure.clear()
             self._provider_failure.setVisible(False)
             return
+
+        model_listing_key = (
+            "gui.settings.provider_test_models_available"
+            if result.model_listing_supported
+            else "gui.settings.provider_test_models_unsupported"
+        )
+        model_key = (
+            "gui.settings.provider_test_model_found"
+            if result.configured_model_found is True
+            else "gui.settings.provider_test_model_not_found"
+            if result.configured_model_found is False
+            else "gui.settings.provider_test_model_unchecked"
+        )
+        tokenizer = result.resolved_tokenizer or self._service.translate(
+            "gui.settings.provider_test_tokenizer_unknown_label"
+        )
         self._provider_result.setText(
-            self._service.translate(
-                "gui.settings.provider_test_failed",
-                {"code": result.code},
+            "\n".join(
+                (
+                    self._service.translate("gui.settings.provider_test_connection_ok"),
+                    self._service.translate(model_listing_key),
+                    self._service.translate(model_key),
+                    self._service.translate(
+                        "gui.settings.provider_test_tokenizer",
+                        {"tokenizer": tokenizer},
+                    ),
+                )
             )
         )
+        self._provider_failure.clear()
+        self._provider_failure.setVisible(False)
 
     def _on_restart_required(self, required: bool) -> None:
         self._restart_label.setVisible(required)

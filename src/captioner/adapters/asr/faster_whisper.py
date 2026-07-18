@@ -427,7 +427,10 @@ def default_model_factory(config: FasterWhisperConfig) -> WhisperModelProtocol:
         "device": config.device,
         "compute_type": config.compute_type,
     }
-    if config.model_cache_dir is not None:
+    # Named model refs are downloaded into the application-owned model store.
+    # An absolute ref is already a user-selected local directory and must be
+    # passed through unchanged without redirecting its loading semantics.
+    if config.model_cache_dir is not None and not Path(config.model_ref).is_absolute():
         options["download_root"] = str(config.model_cache_dir)
     try:
         model = constructor(config.model_ref, **options)

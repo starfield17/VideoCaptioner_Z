@@ -294,12 +294,11 @@ def test_absolute_model_reference_is_passed_to_sdk(
 ) -> None:
     model_dir = tmp_path / "model"
     _write_model_identity_files(model_dir)
-    received: list[str] = []
+    received: list[tuple[str, dict[str, object]]] = []
 
     class SDKModel:
         def __init__(self, model_ref: str, **options: object) -> None:
-            del options
-            received.append(model_ref)
+            received.append((model_ref, options))
 
     class SDKModule:
         WhisperModel = SDKModel
@@ -308,6 +307,46 @@ def test_absolute_model_reference_is_passed_to_sdk(
         return SDKModule
 
     monkeypatch.setattr(faster_whisper_module.importlib, "import_module", import_sdk)
-    config = FasterWhisperConfig(model_ref=str(model_dir))
+    config = FasterWhisperConfig(
+        model_ref=str(model_dir),
+        model_cache_dir=tmp_path / "models" / "faster-whisper",
+    )
     default_model_factory(config)
-    assert received == [str(model_dir.resolve())]
+    assert received == [
+        (
+            str(model_dir.resolve()),
+            {"device": "auto", "compute_type": "default"},
+        )
+    ]
+
+
+def test_named_model_uses_injected_download_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    received: list[dict[str, object]] = []
+
+    class SDKModel:
+        def __init__(self, model_ref: str, **options: object) -> None:
+            assert model_ref == "tiny"
+            received.append(options)
+
+    class SDKModule:
+        WhisperModel = SDKModel
+
+    def import_sdk(_name: str) -> object:
+        return SDKModule
+
+    monkeypatch.setattr(
+        faster_whisper_module.importlib,
+        "import_module",
+        import_sdk,
+    )
+    download_root = tmp_path / "models" / "faster-whisper"
+    default_model_factory(FasterWhisperConfig(model_ref="tiny", model_cache_dir=download_root))
+    assert received == [
+        {
+            "device": "auto",
+            "compute_type": "default",
+            "download_root": str(download_root),
+        }
+    ]
