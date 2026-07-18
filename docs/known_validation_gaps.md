@@ -1,16 +1,17 @@
 # Known Validation Gaps
 
 **Status:** Non-blocking technical debt
-**Last reviewed:** 2026-07-17
-**Relevant implementation:** `src/captioner/core/policies/quantity_scanner.py`
-**Introduced or confirmed during:** Phase 4 protected-fact validation review
+**Last reviewed:** 2026-07-18
+**Relevant implementation:** `src/captioner/core/policies/quantity_scanner.py`, release packaging
+**Introduced or confirmed during:** Phase 4 protected-fact validation review; Phase 5 release packaging policy
 **Phase impact:** Does not block Phase 5 development
 
 ---
 
 ## 1. Purpose
 
-This document records known edge cases in protected numeric-fact validation that are intentionally deferred.
+This document records known edge cases in protected numeric-fact validation and
+release-validation debt that are intentionally deferred.
 
 The protected-fact scanner currently provides strong deterministic handling for:
 
@@ -31,7 +32,14 @@ The scanner is intentionally implemented without quantity regular expressions an
 
 However, protected-fact parsing is an open-ended text interpretation problem. Attempting to eliminate every possible ambiguous expression before continuing product development would create diminishing returns and prevent progress on more important functionality.
 
-The issues below are therefore classified as known, non-blocking validation limitations rather than Phase 5 blockers.
+Release packaging also has temporary policy limits: cross-platform CI currently
+validates CLI-only standalone builds. Packaged desktop GUI, optional GUI
+dependency profiles, non-Linux compiler caches, additional native architectures,
+signing/installers, and transactional final staging remain deferred.
+
+The issues below are therefore classified as known, non-blocking validation
+limitations rather than Phase 5 blockers. Packaging items are release-validation
+debt, not Pipeline or durable-state correctness failures.
 
 ---
 
@@ -439,18 +447,150 @@ semantic classification of every malformed or adversarial natural-language
 quantity expression.
 ```
 
-The two items in this document are tracked technical debt and are not Phase 5 entry blockers.
+The scanner items in this document are tracked technical debt and are not Phase 5 entry blockers.
 
-Cross-platform Release Full Gate execution remains a separate deferred verification item and is not part of these scanner limitations.
+Cross-platform Release Full Gate currently validates CLI packaging only; packaged desktop GUI and related release gaps are tracked as PKG-* below and are not scanner limitations.
+
+---
+
+# PKG-001 — Packaged Desktop GUI Is Not Cross-platform CI Validated
+
+## Status
+
+```text
+Open
+Priority: P1.5
+Area: Desktop distribution
+```
+
+## Summary
+
+Release Full Gate currently builds and smokes CLI-only distributions on Ubuntu,
+Windows, and macOS.
+
+English and Simplified Chinese source GUI tests remain in the repository and
+continue to run on Ubuntu full checks. Packaged desktop GUI smoke is local-only.
+
+Windows/macOS packaged GUI success must not be claimed from CLI-only CI.
+
+## Exit criteria
+
+Native Windows and macOS desktop builds, bilingual packaged smoke, external
+working-directory launch, clean shutdown, and artifact inspection.
+
+---
+
+# PKG-002 — GUI Dependency Is Not Yet an Optional Extra
+
+## Status
+
+```text
+Open
+Priority: P1.5
+Area: Dependency packaging
+```
+
+## Summary
+
+PySide6 remains in core project dependencies. CLI-only CI still installs it.
+
+## Future correction
+
+Split core and GUI dependency profiles without breaking the desktop application
+or frozen lock reproducibility.
+
+---
+
+# PKG-003 — Windows/macOS Compiler Cache Is Missing
+
+## Status
+
+```text
+Open
+Priority: P1.5
+Area: CI performance
+```
+
+## Summary
+
+Linux restores Nuitka/ccache. Windows and macOS package Jobs start with cold
+compiler caches.
+
+## Future correction
+
+Add platform-safe cache keys and size bounds. Cache failure must never affect
+artifact correctness.
+
+---
+
+# PKG-004 — Native Architecture Coverage Is Partial
+
+## Status
+
+```text
+Open
+Priority: P2
+Area: Release matrix
+```
+
+## Summary
+
+macOS hosted build validates ARM64 only. Windows hosted build validates x64 only.
+Intel macOS and Windows ARM64 remain unverified.
+
+---
+
+# PKG-005 — Desktop Platform Polish Is Deferred
+
+## Status
+
+```text
+Open
+Priority: P2
+Area: Desktop distribution
+```
+
+## Summary
+
+No macOS icon, signing, or notarization. No Windows installer or signing.
+Portable artifacts only.
+
+---
+
+# PKG-006 — Final Distribution Staging Is Not Transactional
+
+## Status
+
+```text
+Open
+Priority: P2
+Area: Build wrapper
+```
+
+## Summary
+
+A post-move staging failure can leave an incomplete `dist` output. Current CI is
+ephemeral and fails closed.
+
+## Future correction
+
+Stage into a sibling temporary final directory, verify, then atomically rename
+where supported.
 
 ---
 
 # 5. Summary Table
 
-| ID     | Issue                                           | Priority | User impact                            | Phase 5 blocker |
-| ------ | ----------------------------------------------- | -------: | -------------------------------------- | --------------- |
-| KV-001 | Space-separated known marker may be ignored     |       P2 | Low; unusual conflicting marker output | No              |
-| KV-002 | Empty slash components have incomplete identity |       P3 | Very low; malformed slash expressions  | No              |
+| ID      | Issue                                           | Priority | User impact                            | Phase 5 blocker |
+| ------- | ----------------------------------------------- | -------: | -------------------------------------- | --------------- |
+| KV-001  | Space-separated known marker may be ignored     |       P2 | Low; unusual conflicting marker output | No              |
+| KV-002  | Empty slash components have incomplete identity |       P3 | Very low; malformed slash expressions  | No              |
+| PKG-001 | Packaged desktop GUI not cross-platform CI      |     P1.5 | No CI claim for packaged desktop GUI   | No              |
+| PKG-002 | GUI dependency not optional extra               |     P1.5 | CLI CI still installs PySide6          | No              |
+| PKG-003 | Windows/macOS compiler cache missing            |     P1.5 | Slower non-Linux package builds        | No              |
+| PKG-004 | Native architecture coverage partial            |       P2 | Intel macOS / Win ARM64 unverified     | No              |
+| PKG-005 | Desktop platform polish deferred                |       P2 | Portable artifacts only                | No              |
+| PKG-006 | Final distribution staging not transactional    |       P2 | Incomplete dist on mid-stage failure   | No              |
 
 ---
 
@@ -460,5 +600,7 @@ Cross-platform Release Full Gate execution remains a separate deferred verificat
 Phase 4 implementation: accepted with documented limitations
 Phase 5 development: approved to begin
 Known scanner gaps: deferred
+Release Full Gate: CLI-only packaging smoke
+Packaged desktop GUI: local-only until revised
 Stable-release reevaluation: required
 ```

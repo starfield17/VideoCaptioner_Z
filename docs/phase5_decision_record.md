@@ -140,3 +140,11 @@
   lines or branches executed.
 - Pixel-exact screenshot tests remain limited.
 - New unrelated defects are recorded unless they block correctness, safety, or the active PR.
+
+## Temporary release-validation policy
+
+- Cross-platform CI compiles and smokes the CLI target only.
+- Desktop GUI implementation remains accepted.
+- Packaged desktop GUI smoke is local-only until the packaging cost and native
+  platform validation strategy are revised.
+- Do not claim Windows/macOS packaged desktop GUI success from CLI-only CI.
