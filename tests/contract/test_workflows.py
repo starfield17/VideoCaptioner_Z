@@ -129,7 +129,7 @@ def test_release_full_gate_yaml_and_scope() -> None:
     assert "--cli" not in ubuntu_pre
     assert "--cli" not in ubuntu_post
     assert ubuntu_upload["with"]["path"] == "dist/captioner-cli-linux.tar.gz"
-    assert ubuntu_upload["with"]["name"] == "captioner-cli-ubuntu-${{ github.ref_name }}"
+    assert ubuntu_upload["with"]["name"] == "captioner-cli-ubuntu-${{ github.run_id }}"
     assert ubuntu_upload["with"]["path"] != "dist/captioner"
 
     windows_pre = _run(_step(windows, "Pre-archive Windows compiled smoke"))
@@ -153,7 +153,7 @@ def test_release_full_gate_yaml_and_scope() -> None:
     assert "--cli" not in windows_pre
     assert "--cli" not in windows_post
     assert windows_upload["with"]["path"] == "dist/captioner-cli-windows.zip"
-    assert windows_upload["with"]["name"] == "captioner-cli-windows-${{ github.ref_name }}"
+    assert windows_upload["with"]["name"] == "captioner-cli-windows-${{ github.run_id }}"
 
     macos_pre = _run(_step(macos, "Pre-archive macOS compiled smoke"))
     macos_archive = _run(_step(macos, "Archive macOS distribution"))
@@ -171,7 +171,7 @@ def test_release_full_gate_yaml_and_scope() -> None:
     assert "--cli" not in macos_pre
     assert "--cli" not in macos_post
     assert macos_upload["with"]["path"] == "dist/captioner-cli-macos.zip"
-    assert macos_upload["with"]["name"] == "captioner-cli-macos-${{ github.ref_name }}"
+    assert macos_upload["with"]["name"] == "captioner-cli-macos-${{ github.run_id }}"
 
     for package_job in (ubuntu, windows, macos):
         upload = next(
