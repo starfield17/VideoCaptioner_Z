@@ -535,6 +535,14 @@ class ApplicationRunnerBridge(QObject):
         worker.moveToThread(thread)
 
         thread.started.connect(worker.initialize)
+        # The worker must schedule its own deferred deletion while its event
+        # loop is still alive. Calling deleteLater() from the main thread
+        # after wait() leaves the deferred-delete event stranded and can make
+        # PySide6 abort during interpreter shutdown.
+        worker.shutdown_finished.connect(
+            worker.deleteLater,
+            Qt.ConnectionType.DirectConnection,
+        )
         worker.snapshot_ready.connect(self.snapshot_ready)
         worker.failure.connect(self.failure)
         worker.input_preview_ready.connect(self.input_preview_ready)
@@ -697,9 +705,6 @@ class ApplicationRunnerBridge(QObject):
             self._stopping = False
             return False
 
-        worker = self._worker
-        if worker is not None:
-            worker.deleteLater()
         thread.deleteLater()
         self._worker = None
         self._thread = None
