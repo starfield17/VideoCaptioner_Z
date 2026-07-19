@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from tests.fakes.in_memory_runtime_repository import InMemoryRuntimeRepository
-from tests.fakes.phase6_values import runtime_manifest
+from tests.fakes.phase6_values import runtime_installation, runtime_manifest
 
 from captioner.adapters.runtime.filesystem_runtime_repository import FilesystemRuntimeRepository
 from captioner.adapters.runtime.runtime_archive import (
@@ -23,6 +25,7 @@ from captioner.core.domain.runtime import (
     DoctorPhase,
     DoctorReport,
     RuntimeIdentity,
+    RuntimeInstallation,
     RuntimeState,
 )
 from captioner.core.domain.runtime_package import RuntimePackageDescriptor
@@ -168,6 +171,30 @@ def test_install_is_verified_and_repeat_install_is_idempotent(tmp_path: Path) ->
     assert source.archive.is_file()
 
 
+def test_existing_install_refreshes_state_and_emits_completed_after_activation(
+    tmp_path: Path,
+) -> None:
+    manager, _source, repository = _manager(tmp_path)
+    manager.install("local", activate=False)
+    phases: list[str] = []
+
+    refreshed = manager.install(
+        "local",
+        activate=True,
+        progress=lambda event: phases.append(event.phase),
+    )
+
+    assert refreshed.state is RuntimeState.AVAILABLE
+    assert refreshed.is_available
+    pointer = repository.get_active_pointer(
+        refreshed.manifest.backend_id, refreshed.manifest.target
+    )
+    assert pointer is not None
+    assert pointer.current == refreshed.identity
+    assert phases[-1] == "completed"
+    assert "cleaning_staging" not in phases
+
+
 def test_recover_cleans_orphaned_transactions_and_partial_archives(tmp_path: Path) -> None:
     manager, _source, _repository = _manager(tmp_path)
     paths = _Paths(tmp_path / "app")
@@ -198,6 +225,89 @@ def test_activation_failure_keeps_no_new_active_pointer(tmp_path: Path) -> None:
         )
         is None
     )
+
+
+def test_activation_failure_preserves_current_and_previous_pointer(tmp_path: Path) -> None:
+    manager, _source, repository = _manager(tmp_path, activation_ok=False)
+    first = runtime_installation(version="1.0.0", state=RuntimeState.AVAILABLE)
+    second = runtime_installation(version="2.0.0", state=RuntimeState.AVAILABLE)
+    candidate = runtime_installation(version="3.0.0", state=RuntimeState.AVAILABLE)
+    for installation in (first, second, candidate):
+        repository.register_installation(installation)
+    repository.set_active_runtime(first.identity, first.manifest.backend_id, first.manifest.target)
+    repository.set_active_runtime(
+        second.identity, second.manifest.backend_id, second.manifest.target
+    )
+
+    with pytest.raises(AppError, match=r"runtime\.test_doctor_failed"):
+        manager.activate(candidate.identity)
+
+    pointer = repository.get_active_pointer(second.manifest.backend_id, second.manifest.target)
+    assert pointer is not None
+    assert pointer.current == second.identity
+    assert pointer.previous == first.identity
+    assert pointer.pending_activation is None
+    failed = repository.get_by_identity(candidate.identity)
+    assert failed is not None
+    assert failed.state is RuntimeState.FAILED
+    assert not failed.is_available
+
+
+class _LockAwareRepository(InMemoryRuntimeRepository):
+    def __init__(self, initial_installations: tuple[RuntimeInstallation, ...]) -> None:
+        super().__init__(initial_installations)
+        self.lock_active = False
+
+    @contextmanager
+    def manager_lock(self) -> Generator[None]:
+        if self.lock_active:
+            raise AppError("runtime.manager_busy")
+        self.lock_active = True
+        try:
+            yield
+        finally:
+            self.lock_active = False
+
+
+class _LockCheckingDoctor:
+    def __init__(self, repository: _LockAwareRepository, remove: Callable[[], None]) -> None:
+        self._repository = repository
+        self._remove = remove
+
+    def static_doctor(self, runtime: RuntimeInstallation) -> DoctorReport:
+        del runtime
+        assert self._repository.lock_active
+        with pytest.raises(AppError, match=r"runtime\.manager_busy"):
+            self._remove()
+        return _report(True)
+
+    def activation_doctor(self, runtime: RuntimeInstallation, workspace: Path) -> DoctorReport:
+        del runtime, workspace
+        assert self._repository.lock_active
+        return _report(True)
+
+
+def test_doctor_holds_manager_lock_for_entire_static_check(tmp_path: Path) -> None:
+    runtime = runtime_installation(version="1.0.0", state=RuntimeState.FAILED)
+    repository = _LockAwareRepository((runtime,))
+    source, _identity = _package(tmp_path)
+    paths = _Paths(tmp_path / "app")
+    manager: RuntimeManager
+    doctor = _LockCheckingDoctor(repository, lambda: manager.remove(runtime.identity))
+    manager = RuntimeManager(
+        paths=paths,
+        repository=repository,
+        archive=_Archive(),
+        package_source=source,
+        doctor=doctor,
+        host_facts=HostFacts("macos", "arm64", "14.0", True),
+    )
+
+    report = manager.doctor(runtime.identity, activation=True)
+
+    assert report.ok
+    assert not repository.lock_active
+    manager.remove(runtime.identity)
 
 
 def test_activate_current_runtime_is_idempotent_and_preserves_pointer(tmp_path: Path) -> None:

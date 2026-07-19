@@ -16,6 +16,7 @@ from captioner.adapters.runtime.subprocess_worker_client import (
     SubprocessWorkerClient,
 )
 from captioner.core.domain.errors import AppError
+from captioner.core.domain.runtime import RuntimeState
 from captioner.core.domain.worker_protocol import (
     HandshakeRequest,
     TranscribeRequest,
@@ -302,6 +303,41 @@ async def _test_active_worker_blocks_runtime_removal_until_shutdown(tmp_path: Pa
 
     await client.shutdown()
     repository.remove_managed_files(runtime.identity)
+
+
+def test_active_external_worker_blocks_record_removal_until_shutdown(tmp_path: Path) -> None:
+    asyncio.run(_test_active_external_worker_blocks_record_removal_until_shutdown(tmp_path))
+
+
+async def _test_active_external_worker_blocks_record_removal_until_shutdown(
+    tmp_path: Path,
+) -> None:
+    repository = FilesystemRuntimeRepository(tmp_path / "runtimes")
+    runtime = replace(
+        _runtime(tmp_path),
+        state=RuntimeState.EXTERNAL_UNMANAGED,
+        managed=False,
+        doctor_passed=True,
+    )
+    marker = runtime.install_path / "external-model.bin"
+    marker.write_bytes(b"external")
+    repository.register_installation(runtime)
+    client = SubprocessWorkerClient(
+        log_dir=tmp_path / "logs",
+        process_factory=cast(ProcessFactory, _factory("stderr")),
+        message_timeout_sec=2.0,
+        termination_grace_sec=0.2,
+        runtime_use_lock=repository.use_lock,
+    )
+    await client.start(runtime, tmp_path / "session", HandshakeRequest())
+
+    with pytest.raises(AppError, match=r"runtime\.in_use"):
+        repository.remove_installation_record(runtime.identity)
+
+    await client.shutdown()
+    repository.remove_installation_record(runtime.identity)
+    assert marker.read_bytes() == b"external"
+    assert runtime.install_path.is_dir()
 
 
 def test_shutdown_acknowledgement_still_escalates_for_hanging_process(tmp_path: Path) -> None:

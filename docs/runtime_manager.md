@@ -41,16 +41,21 @@ does not use the system Python, shell activation, or an implicit `PATH` Python.
 
 The active slot is `(backend_id, platform, architecture, device)`. Minimum OS
 version is checked during compatibility validation but is not part of the
-slot key. Activation first writes the candidate as `pending_activation`, runs
-Activation Doctor while holding the version use lock, and then commits the
-candidate as `current` with the old current as `previous`. A failed Doctor
-restores the old pointer and marks the candidate failed without deleting it.
+slot key. Activation first writes the candidate as `pending_activation` while
+leaving `current` and `previous` unchanged, then runs Activation Doctor while
+holding the version use lock. Only after Doctor succeeds does it atomically
+commit the candidate as `current` with the old current as `previous`. A failed
+Doctor or startup recovery clears only `pending_activation`, preserves the old
+pointer, and marks a managed candidate failed without deleting it.
 
-`recover()` performs that restoration for an interrupted pending activation.
-Rollback validates and activates `previous` through the same Doctor path. A
+`recover()` clears the pending marker for an interrupted activation while
+preserving the current and previous identities. Rollback validates and
+activates `previous` through the same Doctor path. A
 current, previous, pending, or in-use Runtime is protected from removal.
 External Developer Mode records have `managed=false`: removing the record
-does not touch the external Runtime directory.
+does not touch the external Runtime directory and still requires the Runtime
+version use lock. External registration filenames are SHA-256 digests of the
+canonical Runtime identity, so distinct identities cannot collide.
 
 The manager reports only operation phases such as `downloading`,
 `verifying_archive`, `activating`, and `running_doctor`. It does not fabricate

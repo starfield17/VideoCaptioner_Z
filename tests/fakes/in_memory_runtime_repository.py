@@ -132,8 +132,8 @@ class InMemoryRuntimeRepository:
         pointer = ActiveRuntimePointer(
             installation.manifest.backend_id,
             installation.manifest.target,
-            current=identity,
-            previous=None if old is None else old.current,
+            current=None if old is None else old.current,
+            previous=None if old is None else old.previous,
             pending_activation=identity,
         )
         self._pointers[key] = pointer
@@ -150,8 +150,8 @@ class InMemoryRuntimeRepository:
         self._pointers[key] = ActiveRuntimePointer(
             pointer.backend_id,
             pointer.target,
-            current=pointer.current,
-            previous=pointer.previous,
+            current=identity,
+            previous=pointer.current,
         )
         self._active[key] = identity
 
@@ -163,14 +163,20 @@ class InMemoryRuntimeRepository:
         pointer = self._pointers.get(key)
         if pointer is None or pointer.pending_activation != identity:
             return
-        if pointer.previous is None:
+        if pointer.current is None and pointer.previous is None:
             self._pointers.pop(key, None)
             self._active.pop(key, None)
         else:
             self._pointers[key] = ActiveRuntimePointer(
-                pointer.backend_id, pointer.target, current=pointer.previous
+                pointer.backend_id,
+                pointer.target,
+                current=pointer.current,
+                previous=pointer.previous,
             )
-            self._active[key] = pointer.previous
+            if pointer.current is None:
+                self._active.pop(key, None)
+            else:
+                self._active[key] = pointer.current
 
     def remove_installation_record(self, identity: RuntimeIdentity) -> None:
         if identity in self._in_use:

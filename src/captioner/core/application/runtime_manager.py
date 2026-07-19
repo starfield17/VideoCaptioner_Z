@@ -124,7 +124,11 @@ class RuntimeManager:
                         raise AppError("runtime.identity_manifest_conflict")
                     if activate:
                         self._activate(existing.identity, progress)
-                    return existing
+                    refreshed = self._repository.get_by_identity(existing.identity)
+                    if refreshed is None:
+                        raise AppError("runtime.registration_missing")
+                    self._emit(progress, "completed")
+                    return refreshed
                 if final_root.exists():
                     raise AppError("runtime.version_directory_conflict")
                 installation = RuntimeInstallation(
@@ -165,7 +169,6 @@ class RuntimeManager:
             finally:
                 _remove_tree(staging_root)
                 archive_part.unlink(missing_ok=True)
-                self._emit(progress, "cleaning_staging")
 
     def activate(
         self, identity: RuntimeIdentity, *, progress: ProgressCallback | None = None
@@ -197,15 +200,16 @@ class RuntimeManager:
             return result
 
     def doctor(self, identity: RuntimeIdentity, *, activation: bool = False):
-        runtime = self._repository.get_by_identity(identity)
-        if runtime is None:
-            raise AppError("runtime.not_registered")
-        report = self._doctor.static_doctor(runtime)
-        if activation and report.ok:
-            report = self._doctor.activation_doctor(
-                runtime, self._activation_workspace(runtime.identity, "doctor")
-            )
-        return report
+        with self._repository.manager_lock():
+            runtime = self._repository.get_by_identity(identity)
+            if runtime is None:
+                raise AppError("runtime.not_registered")
+            report = self._doctor.static_doctor(runtime)
+            if activation and report.ok:
+                report = self._doctor.activation_doctor(
+                    runtime, self._activation_workspace(runtime.identity, "doctor")
+                )
+            return report
 
     def register_external(
         self,

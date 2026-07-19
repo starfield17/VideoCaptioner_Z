@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -60,7 +61,9 @@ class FilesystemRuntimeRepository:
         installation = self.get_by_identity(identity)
         if installation is None:
             raise AppError("runtime.not_registered")
-        lock = FileLock(str(installation.install_path / ".use.lock"), timeout=0)
+        lock_path = self._use_lock_path(installation)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(str(lock_path), timeout=0)
         try:
             lock.acquire()
         except Timeout as exc:
@@ -167,8 +170,8 @@ class FilesystemRuntimeRepository:
         pointer = ActiveRuntimePointer(
             installation.manifest.backend_id,
             installation.manifest.target,
-            current=identity,
-            previous=None if old is None else old.current,
+            current=None if old is None else old.current,
+            previous=None if old is None else old.previous,
             pending_activation=identity,
         )
         self._write_active_pointer(pointer)
@@ -187,8 +190,8 @@ class FilesystemRuntimeRepository:
             ActiveRuntimePointer(
                 pointer.backend_id,
                 pointer.target,
-                current=pointer.current,
-                previous=pointer.previous,
+                current=identity,
+                previous=pointer.current,
                 pending_activation=None,
             )
         )
@@ -202,7 +205,7 @@ class FilesystemRuntimeRepository:
         )
         if pointer is None or pointer.pending_activation != identity:
             return
-        if pointer.previous is None:
+        if pointer.current is None and pointer.previous is None:
             slots = self._read_active_slots()
             slots.pop(_slot_key(pointer.backend_id, pointer.target), None)
             self._write_active_slots(slots)
@@ -211,8 +214,8 @@ class FilesystemRuntimeRepository:
             ActiveRuntimePointer(
                 pointer.backend_id,
                 pointer.target,
-                current=pointer.previous,
-                previous=None,
+                current=pointer.current,
+                previous=pointer.previous,
                 pending_activation=None,
             )
         )
@@ -237,7 +240,8 @@ class FilesystemRuntimeRepository:
             raise AppError("runtime.active_or_previous")
         record = self._record_path(installation)
         try:
-            record.unlink()
+            with self.use_lock(identity):
+                record.unlink()
         except OSError as exc:
             raise AppError("runtime.record_remove_failed") from exc
 
@@ -257,7 +261,7 @@ class FilesystemRuntimeRepository:
         }:
             raise AppError("runtime.active_or_previous")
         record = self._record_path(installation)
-        lock_path = installation.install_path / ".use.lock"
+        lock_path = self._use_lock_path(installation)
         try:
             with self.use_lock(identity):
                 for child in installation.install_path.iterdir():
@@ -309,14 +313,14 @@ class FilesystemRuntimeRepository:
     def _restore_pointer_without_candidate(self, pointer: ActiveRuntimePointer) -> None:
         slots = self._read_active_slots()
         key = _slot_key(pointer.backend_id, pointer.target)
-        if pointer.previous is None:
+        if pointer.current is None and pointer.previous is None:
             slots.pop(key, None)
         else:
             slots[key] = ActiveRuntimePointer(
                 pointer.backend_id,
                 pointer.target,
-                current=pointer.previous,
-                previous=None,
+                current=pointer.current,
+                previous=pointer.previous,
                 pending_activation=None,
             )
         self._write_active_slots(slots)
@@ -395,10 +399,12 @@ class FilesystemRuntimeRepository:
     def _record_path(self, installation: RuntimeInstallation) -> Path:
         if installation.managed:
             return installation.install_path / "installation.json"
-        safe = f"{installation.identity.runtime_id}-{installation.identity.version}".replace(
-            ".", "_"
-        )
-        return self.external_root / f"{safe}.json"
+        return self.external_root / f"{_identity_digest(installation.identity)}.json"
+
+    def _use_lock_path(self, installation: RuntimeInstallation) -> Path:
+        if installation.managed:
+            return installation.install_path / ".use.lock"
+        return self.root / ".use" / f"{_identity_digest(installation.identity)}.lock"
 
     def _read_installation(self, record: Path) -> RuntimeInstallation:
         try:
@@ -550,6 +556,16 @@ def _installation_to_dict(installation: RuntimeInstallation) -> dict[str, object
 
 def _slot_key(backend_id: str, target: RuntimeTarget) -> str:
     return f"{backend_id}|{target.platform}|{target.architecture}|{target.device_kind}"
+
+
+def _identity_digest(identity: RuntimeIdentity) -> str:
+    canonical = json.dumps(
+        identity.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _parse_slot_key(value: str) -> tuple[str, RuntimeTarget]:
