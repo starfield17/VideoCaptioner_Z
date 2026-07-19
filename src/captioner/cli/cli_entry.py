@@ -10,8 +10,10 @@ from typing import cast
 
 from captioner import __version__
 from captioner.adapters.subtitles.corpus import run_project_subtitle_corpus
+from captioner.bootstrap import create_asr_job_snapshot
 from captioner.cli.commands import batch as batch_command
 from captioner.cli.commands import doctor
+from captioner.cli.commands import model as model_command
 from captioner.cli.commands import runtime as runtime_command
 from captioner.cli.outcomes import exit_code_for_error
 from captioner.cli.output import doctor_labels, render
@@ -68,8 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Transcribe one media file")
     run_parser.add_argument("input", nargs="+", type=Path, help="Input audio or video files")
     run_parser.add_argument("--output", type=Path, required=True, help="Output directory")
-    run_parser.add_argument("--model", dest="model_ref", default="tiny")
-    run_parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    run_parser.add_argument(
+        "--model",
+        dest="model_ref",
+        required=True,
+        help="Selector for an installed model",
+    )
+    run_parser.add_argument("--device", choices=("auto", "cpu", "cuda", "metal"), default="auto")
     run_parser.add_argument("--compute-type", default="default")
     run_parser.add_argument(
         "--language",
@@ -100,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--json", action="store_true")
         if command == "resume":
             command_parser.add_argument("--model")
-            command_parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
+            command_parser.add_argument("--device", choices=("auto", "cpu", "cuda", "metal"))
             command_parser.add_argument("--compute-type")
             command_parser.add_argument(
                 "--language",
@@ -162,6 +169,63 @@ def build_parser() -> argparse.ArgumentParser:
     runtime_external.add_argument("--root", type=Path, required=True)
     runtime_external.add_argument("--developer-mode", action="store_true")
     runtime_external.add_argument("--json", action="store_true")
+
+    model_parser = subparsers.add_parser("model", help="Manage local ASR models")
+    model_subparsers = model_parser.add_subparsers(dest="model_command", required=True)
+    model_list = model_subparsers.add_parser("list", help="List installed models")
+    model_list.add_argument("--json", action="store_true")
+    model_search = model_subparsers.add_parser("search-hf", help="Search Hugging Face models")
+    model_search.add_argument("query")
+    model_search.add_argument("--backend", required=True)
+    model_search.add_argument("--limit", type=int, default=20)
+    model_search.add_argument("--json", action="store_true")
+    for source_command, source_name in (
+        ("install-hf", "Install a Hugging Face model"),
+        ("install-modelscope", "Install a ModelScope model"),
+    ):
+        source_parser = model_subparsers.add_parser(source_command, help=source_name)
+        source_parser.add_argument("repository_id")
+        source_parser.add_argument("--revision", required=source_command == "install-modelscope")
+        source_parser.add_argument("--backend", required=True)
+        source_parser.add_argument("--format", dest="model_format", required=True)
+        source_parser.add_argument("--display-name")
+        source_parser.add_argument("--verify-load", action="store_true")
+        source_parser.add_argument("--runtime-id")
+        source_parser.add_argument("--runtime-version")
+        source_parser.add_argument(
+            "--device", choices=("auto", "cpu", "cuda", "metal"), default="auto"
+        )
+        source_parser.add_argument("--json", action="store_true")
+    for import_command, import_help in (
+        ("import", "Import a managed local model"),
+        ("register-external", "Register an unmanaged local model"),
+    ):
+        import_parser = model_subparsers.add_parser(import_command, help=import_help)
+        import_parser.add_argument("directory", type=Path)
+        import_parser.add_argument("--backend")
+        import_parser.add_argument("--format", dest="model_format")
+        import_parser.add_argument("--display-name")
+        import_parser.add_argument("--verify-load", action="store_true")
+        import_parser.add_argument("--runtime-id")
+        import_parser.add_argument("--runtime-version")
+        import_parser.add_argument(
+            "--device", choices=("auto", "cpu", "cuda", "metal"), default="auto"
+        )
+        if import_command == "register-external":
+            import_parser.add_argument("--developer-mode", action="store_true")
+        import_parser.add_argument("--json", action="store_true")
+    model_validate = model_subparsers.add_parser("validate", help="Validate an installed model")
+    model_validate.add_argument("selector")
+    model_validate.add_argument("--json", action="store_true")
+    model_verify = model_subparsers.add_parser("verify-load", help="Verify a model load")
+    model_verify.add_argument("selector")
+    model_verify.add_argument("--runtime-id")
+    model_verify.add_argument("--runtime-version")
+    model_verify.add_argument("--device", choices=("auto", "cpu", "cuda", "metal"), default="auto")
+    model_verify.add_argument("--json", action="store_true")
+    model_remove = model_subparsers.add_parser("remove", help="Remove an installed model")
+    model_remove.add_argument("selector")
+    model_remove.add_argument("--json", action="store_true")
     return parser
 
 
@@ -186,6 +250,7 @@ def main(
             "cancel",
             "subtitle-corpus",
             "runtime",
+            "model",
         ):
             parser.error(f"unknown command: {namespace.command}")
         paths = resolve_app_paths(compiled_runtime=compiled_runtime)
@@ -210,10 +275,17 @@ def main(
             payload = doctor.run(options, service=service)
             labels = None if as_json else doctor_labels(service)
         elif namespace.command == "run":
+            selected_model_ref = namespace.model_ref
+            asr_snapshot = create_asr_job_snapshot(
+                model_selector=selected_model_ref,
+                requested_device=namespace.device,
+                compute_type=namespace.compute_type,
+                paths=paths,
+            )
             run_options = batch_command.BatchRunOptions(
                 inputs=tuple(namespace.input),
                 output_dir=namespace.output,
-                model_ref=namespace.model_ref,
+                model_ref=selected_model_ref,
                 device=namespace.device,
                 compute_type=namespace.compute_type,
                 language=namespace.language,
@@ -223,6 +295,7 @@ def main(
                 pipeline_profile=PipelineProfile(namespace.profile),
                 target_language=namespace.target_language,
                 llm_provider_profile=namespace.llm_provider_profile,
+                asr_snapshot=asr_snapshot,
             )
             projection = batch_command.run(run_options, paths=paths)
             payload = cast(
@@ -274,6 +347,10 @@ def main(
         elif namespace.command == "runtime":
             ensure_runtime_layout(paths)
             payload = runtime_command.execute(namespace, paths=paths)
+            labels = None
+        elif namespace.command == "model":
+            ensure_runtime_layout(paths)
+            payload = model_command.execute(namespace, paths=paths)
             labels = None
         else:
             marker = batch_command.cancel(namespace.batch_id, namespace.job, paths=paths)
