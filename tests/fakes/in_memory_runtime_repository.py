@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.runtime import (
+    ActiveRuntimePointer,
     RuntimeIdentity,
     RuntimeInstallation,
     RuntimeState,
@@ -26,6 +28,10 @@ def _empty_in_use() -> set[RuntimeIdentity]:
     return set()
 
 
+def _empty_pointers() -> dict[tuple[str, tuple[str, str, str]], ActiveRuntimePointer]:
+    return {}
+
+
 @dataclass(slots=True)
 class InMemoryRuntimeRepository:
     initial_installations: Iterable[RuntimeInstallation] = ()
@@ -36,6 +42,9 @@ class InMemoryRuntimeRepository:
         default_factory=_empty_active, init=False
     )
     _in_use: set[RuntimeIdentity] = field(default_factory=_empty_in_use, init=False)
+    _pointers: dict[tuple[str, tuple[str, str, str]], ActiveRuntimePointer] = field(
+        default_factory=_empty_pointers, init=False
+    )
 
     def __post_init__(self) -> None:
         for installation in self.initial_installations:
@@ -55,6 +64,15 @@ class InMemoryRuntimeRepository:
 
     def register_installation(self, installation: RuntimeInstallation) -> None:
         self.register(installation)
+
+    def update_installation(self, installation: RuntimeInstallation) -> None:
+        if installation.identity not in self._installations:
+            raise AppError("runtime.not_registered")
+        self._installations[installation.identity] = installation
+
+    @contextmanager
+    def manager_lock(self) -> Generator[None]:
+        yield
 
     def register(self, installation: RuntimeInstallation) -> None:
         if installation.identity in self._installations:
@@ -79,19 +97,126 @@ class InMemoryRuntimeRepository:
             raise AppError("runtime.active_pointer_invalid")
         if installation.manifest.target != target:
             raise AppError("runtime.active_pointer_invalid")
+        existing = self._pointers.get((backend_id, target.key))
+        if (
+            existing is not None
+            and existing.current == identity
+            and existing.pending_activation is None
+        ):
+            return
         self._active[(backend_id, target.key)] = identity
+        self._pointers[(backend_id, target.key)] = ActiveRuntimePointer(
+            backend_id,
+            target,
+            current=identity,
+            previous=None if existing is None else existing.current,
+        )
 
     def clear_active_runtime(self, backend_id: str, target: RuntimeTarget) -> None:
         self._active.pop((backend_id, target.key), None)
+        self._pointers.pop((backend_id, target.key), None)
+
+    def get_active_pointer(
+        self, backend_id: str, target: RuntimeTarget
+    ) -> ActiveRuntimePointer | None:
+        return self._pointers.get((backend_id, target.key))
+
+    def prepare_activation(self, identity: RuntimeIdentity) -> ActiveRuntimePointer:
+        installation = self._installations.get(identity)
+        if installation is None:
+            raise AppError("runtime.not_registered")
+        key = (installation.manifest.backend_id, installation.manifest.target.key)
+        old = self._pointers.get(key)
+        if old is not None and old.current == identity and old.pending_activation is None:
+            return old
+        pointer = ActiveRuntimePointer(
+            installation.manifest.backend_id,
+            installation.manifest.target,
+            current=None if old is None else old.current,
+            previous=None if old is None else old.previous,
+            pending_activation=identity,
+        )
+        self._pointers[key] = pointer
+        return pointer
+
+    def complete_activation(self, identity: RuntimeIdentity) -> None:
+        installation = self._installations.get(identity)
+        if installation is None:
+            raise AppError("runtime.not_registered")
+        key = (installation.manifest.backend_id, installation.manifest.target.key)
+        pointer = self._pointers.get(key)
+        if pointer is None or pointer.pending_activation != identity:
+            raise AppError("runtime.active_pointer_invalid")
+        self._pointers[key] = ActiveRuntimePointer(
+            pointer.backend_id,
+            pointer.target,
+            current=identity,
+            previous=pointer.current,
+        )
+        self._active[key] = identity
+
+    def restore_pending_activation(self, identity: RuntimeIdentity) -> None:
+        installation = self._installations.get(identity)
+        if installation is None:
+            raise AppError("runtime.not_registered")
+        key = (installation.manifest.backend_id, installation.manifest.target.key)
+        pointer = self._pointers.get(key)
+        if pointer is None or pointer.pending_activation != identity:
+            return
+        if pointer.current is None and pointer.previous is None:
+            self._pointers.pop(key, None)
+            self._active.pop(key, None)
+        else:
+            self._pointers[key] = ActiveRuntimePointer(
+                pointer.backend_id,
+                pointer.target,
+                current=pointer.current,
+                previous=pointer.previous,
+            )
+            if pointer.current is None:
+                self._active.pop(key, None)
+            else:
+                self._active[key] = pointer.current
 
     def remove_installation_record(self, identity: RuntimeIdentity) -> None:
         if identity in self._in_use:
             raise AppError("runtime.busy")
         if identity not in self._installations:
             raise AppError("runtime.not_registered")
-        if identity in self._active.values():
+        if any(
+            identity in {pointer.current, pointer.previous, pointer.pending_activation}
+            for pointer in self._pointers.values()
+        ):
             raise AppError("runtime.active")
         del self._installations[identity]
+
+    def remove_managed_files(self, identity: RuntimeIdentity) -> None:
+        installation = self._installations.get(identity)
+        if installation is None:
+            raise AppError("runtime.not_registered")
+        if not installation.can_delete_files:
+            raise AppError("runtime.external_files_protected")
+        self.remove_installation_record(identity)
+
+    def recover(self) -> tuple[RuntimeIdentity, ...]:
+        recovered: list[RuntimeIdentity] = []
+        for pointer in tuple(self._pointers.values()):
+            if pointer.pending_activation is None:
+                continue
+            candidate = self._installations.get(pointer.pending_activation)
+            if candidate is not None:
+                self._installations[candidate.identity] = replace(
+                    candidate,
+                    state=(
+                        RuntimeState.EXTERNAL_UNMANAGED
+                        if candidate.state is RuntimeState.EXTERNAL_UNMANAGED
+                        else RuntimeState.FAILED
+                    ),
+                    doctor_passed=False,
+                )
+                recovered.append(candidate.identity)
+                self.restore_pending_activation(candidate.identity)
+        return tuple(recovered)
 
     def mark_state(
         self,

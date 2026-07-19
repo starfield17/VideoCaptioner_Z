@@ -22,7 +22,7 @@ from captioner.core.domain.result import (
 from captioner.core.domain.runtime import RuntimeIdentity
 
 WORKER_PROTOCOL_NAME = "captioner.worker"
-WORKER_PROTOCOL_VERSION = "1.0"
+WORKER_PROTOCOL_VERSION = "1.1"
 _VERSION_RE = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SENSITIVE_KEYS = frozenset(
@@ -69,7 +69,7 @@ def _empty_json_mapping() -> dict[str, JsonValue]:
 
 
 class WorkerMessageType(StrEnum):
-    """Messages in the first Worker transport protocol."""
+    """Messages in Worker transport protocol 1.1."""
 
     HANDSHAKE_REQUEST = "handshake.request"
     HANDSHAKE_RESPONSE = "handshake.response"
@@ -82,6 +82,8 @@ class WorkerMessageType(StrEnum):
     OPERATION_ERROR = "operation.error"
     SHUTDOWN_REQUEST = "shutdown.request"
     SHUTDOWN_ACKNOWLEDGED = "shutdown.acknowledged"
+    DOCTOR_REQUEST = "doctor.request"
+    DOCTOR_RESPONSE = "doctor.response"
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +183,83 @@ class ShutdownAcknowledged:
     def from_payload(cls, value: object) -> ShutdownAcknowledged:
         raw = _object(value, "shutdown_acknowledged")
         return cls(_required_bool(raw, "acknowledged"))
+
+
+@dataclass(frozen=True, slots=True)
+class DoctorRequest:
+    """Activation Doctor probe request."""
+
+    nonce: str
+    probe_filename: str
+    workspace: Path | None = None
+
+    def __post_init__(self) -> None:
+        _require_nonempty(self.nonce, "nonce", "worker.doctor_invalid")
+        _validate_relative_posix_path(self.probe_filename, "worker.doctor_invalid")
+        if self.workspace is not None and not self.workspace.is_absolute():
+            raise AppError("worker.doctor_invalid", {"field": "workspace"})
+
+    def to_payload(self) -> dict[str, JsonValue]:
+        payload: dict[str, JsonValue] = {
+            "nonce": self.nonce,
+            "probe_filename": self.probe_filename,
+        }
+        if self.workspace is not None:
+            payload["workspace"] = str(self.workspace)
+        return payload
+
+    @classmethod
+    def from_payload(cls, value: object) -> DoctorRequest:
+        raw = _object(value, "doctor_request")
+        workspace = _optional_str(raw, "workspace")
+        return cls(
+            _required_str(raw, "nonce"),
+            _required_str(raw, "probe_filename"),
+            None if workspace is None else Path(workspace),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DoctorResponse:
+    """Activation Doctor response with a workspace round-trip descriptor."""
+
+    nonce: str
+    backend_import_ok: bool
+    device_kind: str
+    probe_result: ResultDescriptor
+    details: Mapping[str, JsonValue] = field(default_factory=_empty_json_mapping)
+
+    def __post_init__(self) -> None:
+        _require_nonempty(self.nonce, "nonce", "worker.doctor_invalid")
+        if type(self.backend_import_ok) is not bool:
+            raise AppError("worker.doctor_invalid", {"field": "backend_import_ok"})
+        _require_nonempty(self.device_kind, "device_kind", "worker.doctor_invalid")
+        object.__setattr__(
+            self, "details", _freeze_public_mapping(self.details, "worker.doctor_invalid")
+        )
+
+    def to_payload(self) -> dict[str, JsonValue]:
+        return {
+            "nonce": self.nonce,
+            "backend_import_ok": self.backend_import_ok,
+            "device_kind": self.device_kind,
+            "probe_result": self.probe_result.to_payload(),
+            "details": _thaw_public_mapping(self.details),
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> DoctorResponse:
+        raw = _object(value, "doctor_response")
+        details = _required_value(raw, "details")
+        if not isinstance(details, Mapping):
+            raise AppError("worker.doctor_invalid", {"field": "details"})
+        return cls(
+            nonce=_required_str(raw, "nonce"),
+            backend_import_ok=_required_bool(raw, "backend_import_ok"),
+            device_kind=_required_str(raw, "device_kind"),
+            probe_result=ResultDescriptor.from_payload(_required_value(raw, "probe_result")),
+            details=cast(Mapping[str, JsonValue], details),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,7 +539,7 @@ class TranscribeRequest:
         raw = _object(value, "transcribe_request")
         runtime_identity = RuntimeIdentity.from_dict(raw.get("runtime_identity"))
         model_identity = ModelIdentity.from_dict(raw.get("model_identity"))
-        backend_options = raw.get("backend_options", {})
+        backend_options = _required_value(raw, "backend_options")
         if not isinstance(backend_options, Mapping):
             raise AppError("worker.transcribe_request_invalid", {"field": "backend_options"})
         return cls(
@@ -556,7 +635,7 @@ class WorkerError:
     @classmethod
     def from_payload(cls, value: object) -> WorkerError:
         raw = _object(value, "worker_error")
-        details = raw.get("details", {})
+        details = _required_value(raw, "details")
         if not isinstance(details, Mapping):
             raise AppError("worker.error_invalid", {"field": "details"})
         return cls(
@@ -643,6 +722,8 @@ type WorkerProtocolMessage = (
     | WorkerError
     | ShutdownRequest
     | ShutdownAcknowledged
+    | DoctorRequest
+    | DoctorResponse
 )
 
 
@@ -694,6 +775,10 @@ def _decode_typed_payload(
         return ShutdownRequest.from_payload(payload)
     if message_type == WorkerMessageType.SHUTDOWN_ACKNOWLEDGED.value:
         return ShutdownAcknowledged.from_payload(payload)
+    if message_type == WorkerMessageType.DOCTOR_REQUEST.value:
+        return DoctorRequest.from_payload(payload)
+    if message_type == WorkerMessageType.DOCTOR_RESPONSE.value:
+        return DoctorResponse.from_payload(payload)
     raise AppError("worker.message_type_unknown", {"field": "message_type"})
 
 
@@ -890,6 +975,12 @@ def _required_str(value: Mapping[object, object], key: str) -> str:
     return item
 
 
+def _required_value(value: Mapping[object, object], key: str) -> object:
+    if key not in value:
+        raise AppError("worker.message_invalid", {"field": key})
+    return value[key]
+
+
 def _optional_str(value: Mapping[object, object], key: str) -> str | None:
     item = value.get(key)
     if item is not None and not isinstance(item, str):
@@ -964,6 +1055,8 @@ __all__ = [
     "CancelAcknowledged",
     "CancelRequest",
     "CancelResult",
+    "DoctorRequest",
+    "DoctorResponse",
     "HandshakeRequest",
     "JsonlProtocolCodec",
     "OperationCancelled",

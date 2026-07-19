@@ -1,0 +1,10 @@
+python = "3.12.9"
+runtime_id = "faster-whisper-cpu-{platform}-{architecture}"
+backend_id = "faster-whisper"
+backend_version = "1.2.1"
+device_kind = "cpu"
+model_format = "faster-whisper-ct2"
+minimum_os_version = "0.0.0"
+supported_platforms = ["macos", "windows", "linux"]
+supported_architectures = ["arm64", "x86_64"]
+dependencies = ["faster-whisper==1.2.1", "ctranslate2==4.8.1"]

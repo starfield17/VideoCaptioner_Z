@@ -140,7 +140,7 @@ jobs:
       - name: Upload Ubuntu archive
         uses: actions/upload-artifact@v4
         with:
-          name: captioner-cli-ubuntu-${{ github.ref_name }}
+          name: captioner-cli-ubuntu-${{ github.run_id }}
           path: dist/captioner-cli-linux.tar.gz
           if-no-files-found: error
 
@@ -226,7 +226,7 @@ jobs:
       - name: Upload Windows archive
         uses: actions/upload-artifact@v4
         with:
-          name: captioner-cli-windows-${{ github.ref_name }}
+          name: captioner-cli-windows-${{ github.run_id }}
           path: dist/captioner-cli-windows.zip
           if-no-files-found: error
 
@@ -302,6 +302,6 @@ jobs:
       - name: Upload macOS archive
         uses: actions/upload-artifact@v4
         with:
-          name: captioner-cli-macos-${{ github.ref_name }}
+          name: captioner-cli-macos-${{ github.run_id }}
           path: dist/captioner-cli-macos.zip
           if-no-files-found: error

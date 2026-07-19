@@ -159,6 +159,7 @@ def test_required_object_names_and_future_controls() -> None:
     privacy = page.findChild(QLabel, "diagnosticsPrivacyLabel")
     assert privacy is not None
     assert privacy.text()
+    page.close()
 
 
 def test_snapshot_render_english_and_chinese() -> None:
@@ -187,6 +188,7 @@ def test_snapshot_render_english_and_chinese() -> None:
         assert config_path is not None
         assert config_path.text() == "/tmp/captioner/config"
         assert config_path.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+        page.close()
 
 
 def test_open_folder_uses_snapshot_path_as_local_file_url(tmp_path: Path) -> None:

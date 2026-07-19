@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -55,7 +56,7 @@ def runtime_manifest(
     return RuntimeManifest(
         schema_version=1,
         runtime_identity=RuntimeIdentity(effective_runtime_id, version),
-        worker_protocol_version="1.0",
+        worker_protocol_version="1.1",
         backend_id=backend_id,
         backend_version="1.0.0",
         target=RuntimeTarget(platform, architecture, device_kind, minimum_os_version),
@@ -94,7 +95,9 @@ def runtime_installation(
     return RuntimeInstallation(
         identity=manifest.runtime_identity,
         manifest=manifest,
-        install_path=Path("/captioner/runtime") / manifest.runtime_identity.runtime_id,
+        install_path=Path(tempfile.gettempdir())
+        / "captioner-runtime-test"
+        / manifest.runtime_identity.runtime_id,
         state=state,
         doctor_passed=doctor_passed,
     )
@@ -214,7 +217,8 @@ def model_installation(
     return ModelInstallation(
         identity=manifest.identity,
         manifest=manifest,
-        model_directory=Path("/captioner/models")
+        model_directory=Path(tempfile.gettempdir())
+        / "captioner-model-test"
         / manifest.identity.repository_id.replace("/", "-"),
         state=state,
         managed=managed,
@@ -225,7 +229,7 @@ def model_installation(
 
 def worker_handshake() -> WorkerHandshake:
     return WorkerHandshake(
-        protocol_version="1.0",
+        protocol_version="1.1",
         runtime_id="faster-whisper-cpu-macos-arm64",
         runtime_version="1.0.0",
         backend_id="faster-whisper",
@@ -243,9 +247,10 @@ def worker_handshake() -> WorkerHandshake:
 def transcribe_request() -> TranscribeRequest:
     runtime = runtime_installation()
     model = model_installation()
+    work_root = Path(tempfile.gettempdir()) / "captioner-worker-test"
     return TranscribeRequest(
-        normalized_audio_path=Path("/captioner/work/audio.wav"),
-        attempt_workspace=Path("/captioner/work/attempt"),
+        normalized_audio_path=work_root / "audio.wav",
+        attempt_workspace=work_root / "attempt",
         model_directory=model.model_directory,
         backend_id=runtime.manifest.backend_id,
         runtime_identity=runtime.identity,

@@ -1,8 +1,9 @@
 # Phase 6 Runtime / Worker / Model Contracts
 
-Phase 6.0 fixes the contracts used by later Runtime and model work. It does
-not install a Runtime, download a model, start a subprocess, or call a remote
-model registry.
+Phase 6.0 fixed the contracts used by Runtime and model work. Phase 6.1 adds
+the local Runtime manager and real Worker transport described below. It still
+does not download or install models, and it does not implement CUDA12,
+Hugging Face, or ModelScope model management.
 
 ## Ownership and execution flow
 
@@ -47,9 +48,27 @@ minimum OS version is a compatibility constraint, not a second slot key.
 Selectors consume the repository's active pointers and do not guess between
 multiple versions. A duplicate active candidate is an ambiguity error.
 
-Static Doctor and Activation Doctor are separate Port operations. Phase 6.0
-defines their structured reports and deterministic fake only; it does not run
-either real Doctor.
+Static Doctor and Activation Doctor are separate operations. Static Doctor
+validates the installed payload and sidecar/build metadata. Activation Doctor
+starts the Runtime's own Python, performs the v1.1 handshake and Doctor probe,
+checks backend imports/device visibility, verifies a workspace round-trip, and
+shuts the Worker down cleanly.
+
+Runtime packages are `.tar.gz` archives with an external `.runtime.json`
+descriptor. The descriptor carries the archive size and the Manifest whose
+`archive_sha256` is the digest of the archive bytes; the descriptor is never
+inside the archive. Archives contain only regular files and directories under
+the `payload/` tree. The manager validates every path, size, hash, and
+executable bit before moving a staged transaction into
+`<data_dir>/runtimes/<runtime-id>/<version>/`.
+
+Activation uses `current`, `previous`, and `pending_activation` in an atomic
+`active.json`. A failed activation restores the previous pointer and retains
+the candidate for diagnosis. Startup recovery performs the same restoration
+when a pending pointer is found. Managed current, previous, pending, or
+in-use Runtimes cannot be removed. External Developer Mode Runtimes are only
+registered after Manifest and Doctor validation; their files are never
+copied, upgraded, or deleted by Captioner.
 
 ## Model contract
 
@@ -122,18 +141,38 @@ the activation policy checks the Worker Runtime identity, compatible backend
 version, normalized platform/architecture, required capabilities and result
 schemas, model formats, and target device before the Runtime becomes usable.
 
-The scripted Worker fake models one active request, correlated request/job/
-attempt IDs, strictly increasing event sequences, terminal cancellation, and
-the distinction between acknowledged cancellation and a timeout. A timeout
-keeps the request busy until shutdown/termination simulation.
+The real `SubprocessWorkerClient` launches the Runtime-provided interpreter in
+an isolated environment. Core owns the stderr log; stdout is JSONL only. A
+partial line, ordinary stdout text, unknown message, correlation mismatch, or
+non-monotonic sequence is a structured protocol failure. Cooperative cancel
+waits for `cancel.acknowledged` and `operation.cancelled`; a timeout escalates
+from process-group termination to process-group kill. The scripted Worker fake
+models the same lifecycle without starting a production Runtime.
 
 ## Progress and errors
 
 Runtime, model, and ASR progress reports identify the current phase only, such
-as `verifying_archive`, `loading_model`, or `transcribing`. Protocol v1 does
+as `verifying_archive`, `loading_model`, or `transcribing`. Protocol v1.1 does
 not carry percentages, completed-unit counts, ETA, or equivalent precision.
 
 Public Worker errors contain a stable code, localized message code, retryable
 flag, and safe details. Tracebacks belong to stderr/runtime logs in a later
 implementation. Credentials are rejected from protocol objects and never
-enter a message representation.
+enter a message representation. Progress remains phase-only; no percentage,
+byte count, or ETA is transmitted.
+
+## Runtime implementations in Phase 6.1
+
+The Faster Whisper CPU Runtime uses its bundled Python 3.12.9 and exact
+`faster-whisper==1.2.1` / `ctranslate2==4.8.1` dependencies. It accepts only an
+absolute local CTranslate2 model directory and uses CPU `int8` by default.
+The MLX Metal Runtime is native macOS arm64 only, requires macOS 14 or newer,
+and uses `mlx-whisper==0.4.3`. It accepts only a local MLX model directory;
+`config.json` and one of the supported weight filenames are required. Neither
+Worker downloads a model or resolves a remote repository ID.
+
+The ordinary `captioner run --model ...` path remains on the existing
+in-process Faster Whisper adapter in Phase 6.1. `WorkerBackedASREngine` is an
+injection seam and is exercised by Runtime Doctor and isolated tests. PR 6.2
+may construct it after Model Manager preflight; it must not make an uninstalled
+model look available.

@@ -376,6 +376,7 @@ class LocalBatchGateway:
                 ffprobe_bin=draft.ffprobe_bin,
                 output_dir=job_output,
                 overwrite=overwrite,
+                paths=self.paths,
                 pipeline_profile=draft.pipeline_profile,
                 llm=llm_snapshot,
             )

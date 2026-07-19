@@ -70,6 +70,7 @@ from captioner.core.domain.stage import (
 )
 from captioner.core.policies.segmentation_config import SegmentationPolicyConfig
 from captioner.core.policies.simple_segmentation import SimpleSegmentationConfig
+from captioner.core.ports.asr import ASREngine
 from captioner.core.ports.llm_cache import LLMCachePort
 from captioner.core.ports.stage_runner import StageRunner
 from captioner.core.ports.token_counter import TokenCounter
@@ -94,6 +95,7 @@ def build_run_service(
     ffprobe_bin: str = "ffprobe",
     paths: AppPaths | None = None,
     model_id: str | None = None,
+    asr_engine: ASREngine | None = None,
 ) -> RunSingleService:
     """Assemble concrete adapters for one CLI invocation."""
     if model_id is not None:
@@ -105,7 +107,7 @@ def build_run_service(
     process = AsyncioSubprocessRunner()
     inspector = FFprobeMediaInspector(process, executable=ffprobe_bin)
     normalizer = FFmpegAudioNormalizer(process, executable=ffmpeg_bin)
-    engine = FasterWhisperEngine(
+    engine = asr_engine or FasterWhisperEngine(
         FasterWhisperConfig(
             model_ref=model_ref,
             device=device,
@@ -236,6 +238,7 @@ def create_job_config(
     ffprobe_bin: str,
     output_dir: Path,
     overwrite: bool,
+    paths: AppPaths | None = None,
     pipeline_profile: PipelineProfile = PipelineProfile.DETERMINISTIC,
     llm: Mapping[str, object] | None = None,
     target_language: str | None = None,
@@ -249,7 +252,14 @@ def create_job_config(
     prompt_identity: Mapping[str, object] | None = None,
 ) -> JobConfig:
     selected_profile = PipelineProfile(pipeline_profile)
-    model = FasterWhisperConfig(model_ref, device, compute_type, language)
+    application_paths = resolve_app_paths() if paths is None else paths
+    model = FasterWhisperConfig(
+        model_ref,
+        device,
+        compute_type,
+        language,
+        model_cache_dir=application_paths.models_dir / "faster-whisper",
+    )
     snapshot: Mapping[str, object] | None = llm
     if snapshot is None and any(
         item is not None
@@ -399,6 +409,7 @@ def build_durable_service(
     llm_runtime: LLMRuntime | None = None,
     llm_cache: LLMCachePort | None = None,
     token_counter: TokenCounter | None = None,
+    asr_engine: ASREngine | None = None,
 ) -> DurableServiceBundle:
     selected_profile = PipelineProfile(pipeline_profile)
     application_paths = resolve_app_paths() if paths is None else paths
@@ -416,7 +427,7 @@ def build_durable_service(
         language,
         model_cache_dir=application_paths.models_dir / "faster-whisper",
     )
-    engine = FasterWhisperEngine(engine_config)
+    engine = asr_engine or FasterWhisperEngine(engine_config)
     policy = SegmentationPolicyConfig.from_mapping(
         segmentation or SegmentationPolicyConfig().to_mapping()
     )

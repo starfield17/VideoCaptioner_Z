@@ -1,0 +1,375 @@
+from __future__ import annotations
+
+import shutil
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+from tests.fakes.in_memory_runtime_repository import InMemoryRuntimeRepository
+from tests.fakes.phase6_values import runtime_installation, runtime_manifest
+
+from captioner.adapters.runtime.filesystem_runtime_repository import FilesystemRuntimeRepository
+from captioner.adapters.runtime.runtime_archive import (
+    FilesystemRuntimeArchive,
+    build_file_manifest,
+    create_deterministic_archive,
+    sha256_file,
+)
+from captioner.core.application.runtime_manager import RuntimeManager
+from captioner.core.application.runtime_selection import HostFacts
+from captioner.core.domain.errors import AppError
+from captioner.core.domain.runtime import (
+    DoctorCheck,
+    DoctorPhase,
+    DoctorReport,
+    RuntimeIdentity,
+    RuntimeInstallation,
+    RuntimeState,
+)
+from captioner.core.domain.runtime_package import RuntimePackageDescriptor
+from captioner.core.ports.runtime_package_source import RuntimePackageSource
+
+
+@dataclass(frozen=True, slots=True)
+class _Paths:
+    root: Path
+
+    @property
+    def config_dir(self) -> Path:
+        return self.root / "config"
+
+    @property
+    def data_dir(self) -> Path:
+        return self.root / "data"
+
+    @property
+    def runtimes_dir(self) -> Path:
+        return self.data_dir / "runtimes"
+
+    @property
+    def downloads_dir(self) -> Path:
+        return self.root / "downloads"
+
+    @property
+    def staging_dir(self) -> Path:
+        return self.root / "staging"
+
+    @property
+    def temp_dir(self) -> Path:
+        return self.root / "temp"
+
+    @property
+    def log_dir(self) -> Path:
+        return self.root / "log"
+
+
+@dataclass(slots=True)
+class _LocalSource(RuntimePackageSource):
+    archive: Path
+    descriptor: RuntimePackageDescriptor
+
+    def resolve(self, reference: str | Path, destination: Path) -> RuntimePackageDescriptor:
+        del reference
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.archive, destination)
+        return self.descriptor
+
+
+class _Archive(FilesystemRuntimeArchive):
+    pass
+
+
+def _report(ok: bool) -> DoctorReport:
+    check = DoctorCheck(
+        "test",
+        ok,
+        None if ok else "runtime.test_doctor_failed",
+        None if ok else "runtime.test_doctor_failed",
+    )
+    return DoctorReport(
+        ok=ok,
+        phase=DoctorPhase.STATIC.value,
+        checks=(check,),
+        error_code=None if ok else check.error_code,
+        message_code=None if ok else check.message_code,
+    )
+
+
+def _package(tmp_path: Path) -> tuple[_LocalSource, RuntimeIdentity]:
+    root = tmp_path / "package-root"
+    worker = root / "payload" / "worker"
+    worker.parent.mkdir(parents=True)
+    worker.write_bytes(b"worker")
+    manifest = runtime_manifest()
+    manifest = type(manifest)(
+        schema_version=manifest.schema_version,
+        runtime_identity=manifest.runtime_identity,
+        worker_protocol_version=manifest.worker_protocol_version,
+        backend_id=manifest.backend_id,
+        backend_version=manifest.backend_version,
+        target=manifest.target,
+        capabilities=manifest.capabilities,
+        supported_model_formats=manifest.supported_model_formats,
+        archive_sha256=manifest.archive_sha256,
+        files=build_file_manifest(root),
+    )
+    archive = tmp_path / "runtime.tar.gz"
+    create_deterministic_archive(root, archive)
+    manifest = type(manifest)(
+        schema_version=manifest.schema_version,
+        runtime_identity=manifest.runtime_identity,
+        worker_protocol_version=manifest.worker_protocol_version,
+        backend_id=manifest.backend_id,
+        backend_version=manifest.backend_version,
+        target=manifest.target,
+        capabilities=manifest.capabilities,
+        supported_model_formats=manifest.supported_model_formats,
+        archive_sha256=sha256_file(archive),
+        files=manifest.files,
+    )
+    descriptor = RuntimePackageDescriptor(
+        package_schema_version=1,
+        archive_filename=archive.name,
+        archive_size_bytes=archive.stat().st_size,
+        runtime_manifest=manifest,
+    )
+    return _LocalSource(archive, descriptor), manifest.runtime_identity
+
+
+def _manager(
+    tmp_path: Path, *, activation_ok: bool = True
+) -> tuple[RuntimeManager, _LocalSource, InMemoryRuntimeRepository]:
+    source, identity = _package(tmp_path)
+    del identity
+    paths = _Paths(tmp_path / "app")
+    repository = InMemoryRuntimeRepository()
+    from tests.fakes.fake_runtime_doctor import FakeRuntimeDoctor
+
+    doctor = FakeRuntimeDoctor(_report(True), _report(activation_ok))
+    manager = RuntimeManager(
+        paths=paths,
+        repository=repository,
+        archive=_Archive(),
+        package_source=source,
+        doctor=doctor,
+        host_facts=HostFacts("macos", "arm64", "14.0", True),
+    )
+    return manager, source, repository
+
+
+def test_install_is_verified_and_repeat_install_is_idempotent(tmp_path: Path) -> None:
+    manager, source, repository = _manager(tmp_path)
+
+    first = manager.install("local", activate=False)
+    second = manager.install("local", activate=False)
+
+    assert first.identity == second.identity
+    assert first.state is RuntimeState.INSTALLED
+    assert repository.list_installations() == (first,)
+    assert source.archive.is_file()
+
+
+def test_existing_install_refreshes_state_and_emits_completed_after_activation(
+    tmp_path: Path,
+) -> None:
+    manager, _source, repository = _manager(tmp_path)
+    manager.install("local", activate=False)
+    phases: list[str] = []
+
+    refreshed = manager.install(
+        "local",
+        activate=True,
+        progress=lambda event: phases.append(event.phase),
+    )
+
+    assert refreshed.state is RuntimeState.AVAILABLE
+    assert refreshed.is_available
+    pointer = repository.get_active_pointer(
+        refreshed.manifest.backend_id, refreshed.manifest.target
+    )
+    assert pointer is not None
+    assert pointer.current == refreshed.identity
+    assert phases[-1] == "completed"
+    assert "cleaning_staging" not in phases
+
+
+def test_recover_cleans_orphaned_transactions_and_partial_archives(tmp_path: Path) -> None:
+    manager, _source, _repository = _manager(tmp_path)
+    paths = _Paths(tmp_path / "app")
+    orphan = paths.staging_dir / "runtimes" / "interrupted"
+    orphan.mkdir(parents=True)
+    (orphan / "payload").write_bytes(b"partial")
+    partial = paths.downloads_dir / "runtimes" / "interrupted.part"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"partial")
+
+    assert manager.recover() == ()
+    assert not orphan.exists()
+    assert not partial.exists()
+
+
+def test_activation_failure_keeps_no_new_active_pointer(tmp_path: Path) -> None:
+    manager, _source, repository = _manager(tmp_path, activation_ok=False)
+
+    with pytest.raises(AppError, match=r"runtime\.test_doctor_failed"):
+        manager.install("local", activate=True)
+
+    installed = repository.list_installations()
+    assert len(installed) == 1
+    assert installed[0].state is RuntimeState.FAILED
+    assert (
+        repository.get_active_pointer(
+            installed[0].manifest.backend_id, installed[0].manifest.target
+        )
+        is None
+    )
+
+
+def test_activation_failure_preserves_current_and_previous_pointer(tmp_path: Path) -> None:
+    manager, _source, repository = _manager(tmp_path, activation_ok=False)
+    first = runtime_installation(version="1.0.0", state=RuntimeState.AVAILABLE)
+    second = runtime_installation(version="2.0.0", state=RuntimeState.AVAILABLE)
+    candidate = runtime_installation(version="3.0.0", state=RuntimeState.AVAILABLE)
+    for installation in (first, second, candidate):
+        repository.register_installation(installation)
+    repository.set_active_runtime(first.identity, first.manifest.backend_id, first.manifest.target)
+    repository.set_active_runtime(
+        second.identity, second.manifest.backend_id, second.manifest.target
+    )
+
+    with pytest.raises(AppError, match=r"runtime\.test_doctor_failed"):
+        manager.activate(candidate.identity)
+
+    pointer = repository.get_active_pointer(second.manifest.backend_id, second.manifest.target)
+    assert pointer is not None
+    assert pointer.current == second.identity
+    assert pointer.previous == first.identity
+    assert pointer.pending_activation is None
+    failed = repository.get_by_identity(candidate.identity)
+    assert failed is not None
+    assert failed.state is RuntimeState.FAILED
+    assert not failed.is_available
+
+
+class _LockAwareRepository(InMemoryRuntimeRepository):
+    def __init__(self, initial_installations: tuple[RuntimeInstallation, ...]) -> None:
+        super().__init__(initial_installations)
+        self.lock_active = False
+
+    @contextmanager
+    def manager_lock(self) -> Generator[None]:
+        if self.lock_active:
+            raise AppError("runtime.manager_busy")
+        self.lock_active = True
+        try:
+            yield
+        finally:
+            self.lock_active = False
+
+
+class _LockCheckingDoctor:
+    def __init__(self, repository: _LockAwareRepository, remove: Callable[[], None]) -> None:
+        self._repository = repository
+        self._remove = remove
+
+    def static_doctor(self, runtime: RuntimeInstallation) -> DoctorReport:
+        del runtime
+        assert self._repository.lock_active
+        with pytest.raises(AppError, match=r"runtime\.manager_busy"):
+            self._remove()
+        return _report(True)
+
+    def activation_doctor(self, runtime: RuntimeInstallation, workspace: Path) -> DoctorReport:
+        del runtime, workspace
+        assert self._repository.lock_active
+        return _report(True)
+
+
+def test_doctor_holds_manager_lock_for_entire_static_check(tmp_path: Path) -> None:
+    runtime = runtime_installation(version="1.0.0", state=RuntimeState.FAILED)
+    repository = _LockAwareRepository((runtime,))
+    source, _identity = _package(tmp_path)
+    paths = _Paths(tmp_path / "app")
+    manager: RuntimeManager
+    doctor = _LockCheckingDoctor(repository, lambda: manager.remove(runtime.identity))
+    manager = RuntimeManager(
+        paths=paths,
+        repository=repository,
+        archive=_Archive(),
+        package_source=source,
+        doctor=doctor,
+        host_facts=HostFacts("macos", "arm64", "14.0", True),
+    )
+
+    report = manager.doctor(runtime.identity, activation=True)
+
+    assert report.ok
+    assert not repository.lock_active
+    manager.remove(runtime.identity)
+
+
+def test_activate_current_runtime_is_idempotent_and_preserves_pointer(tmp_path: Path) -> None:
+    manager, _source, repository = _manager(tmp_path)
+    installed = manager.install("local", activate=True)
+    before = repository.get_active_pointer(installed.manifest.backend_id, installed.manifest.target)
+    assert before is not None
+
+    manager.activate(installed.identity)
+
+    assert (
+        repository.get_active_pointer(installed.manifest.backend_id, installed.manifest.target)
+        == before
+    )
+
+
+def test_reinstalling_current_runtime_does_not_rewrite_pointer(tmp_path: Path) -> None:
+    manager, _source, repository = _manager(tmp_path)
+    installed = manager.install("local", activate=True)
+    before = repository.get_active_pointer(installed.manifest.backend_id, installed.manifest.target)
+    assert before is not None
+
+    manager.install("same-descriptor", activate=True)
+
+    assert (
+        repository.get_active_pointer(installed.manifest.backend_id, installed.manifest.target)
+        == before
+    )
+
+
+def test_recover_reconstructs_complete_final_directory_without_record(tmp_path: Path) -> None:
+    source, identity = _package(tmp_path)
+    paths = _Paths(tmp_path / "app")
+    repository = FilesystemRuntimeRepository(paths.runtimes_dir)
+    from tests.fakes.fake_runtime_doctor import FakeRuntimeDoctor
+
+    manager = RuntimeManager(
+        paths=paths,
+        repository=repository,
+        archive=_Archive(),
+        package_source=source,
+        doctor=FakeRuntimeDoctor(_report(True), _report(True)),
+        host_facts=HostFacts("macos", "arm64", "14.0", True),
+    )
+    installed = manager.install("local", activate=False)
+    (installed.install_path / "installation.json").unlink()
+
+    assert manager.recover() == (identity,)
+    recovered = repository.get_by_identity(identity)
+    assert recovered is not None
+    assert recovered.state is RuntimeState.INSTALLED
+    assert (installed.install_path / "installation.json").is_file()
+    assert manager.install("local", activate=False).identity == identity
+
+
+def test_recover_quarantines_incomplete_final_directory(tmp_path: Path) -> None:
+    paths = _Paths(tmp_path / "app")
+    repository = FilesystemRuntimeRepository(paths.runtimes_dir)
+    incomplete = paths.runtimes_dir / "runtime-id" / "1.0.0"
+    incomplete.mkdir(parents=True)
+    (incomplete / "payload").mkdir()
+
+    assert repository.recover() == ()
+    assert not incomplete.exists()
+    assert tuple((paths.runtimes_dir / ".recovery").iterdir())

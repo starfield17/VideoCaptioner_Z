@@ -82,13 +82,14 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "ARG", "TRY", "RUF"]
 [tool.pyright]
 include = ["main.py", "src", "scripts", "tests"]
 exclude = [".venv", "dist", "build"]
+extraPaths = ["runtime_worker/src"]
 typeCheckingMode = "strict"
 pythonVersion = "3.13"
 reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "."]
+pythonpath = ["src", ".", "runtime_worker/src"]
 addopts = "-ra"
 markers = [
     "integration: uses installed FFmpeg/FFprobe or other local external tools",

@@ -1,0 +1,11 @@
+python = "3.12.9"
+runtime_id = "mlx-whisper-metal-macos-arm64"
+backend_id = "mlx-whisper"
+backend_version = "0.4.3"
+device_kind = "metal"
+model_format = "mlx-whisper"
+minimum_os_version = "14.0"
+supported_platforms = ["macos"]
+supported_architectures = ["arm64"]
+dependencies = ["mlx-whisper==0.4.3"]
+prune_packages = ["build", "functorch", "mpmath", "networkx", "setuptools", "sympy", "torch", "torchgen"]

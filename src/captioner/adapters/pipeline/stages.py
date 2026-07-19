@@ -156,7 +156,14 @@ class TranscribeStage:
             path=str(self.artifacts.resolve(wav_ref)),
         )
         transcript = await self.engine.transcribe(
-            TranscriptionRequest(audio, request.config.language), context.execution
+            TranscriptionRequest(
+                audio=audio,
+                language=request.config.language,
+                job_id=request.job_id,
+                stage_attempt_id=_stage_attempt_id(request.job_id, context.workspace),
+                attempt_workspace=context.workspace,
+            ),
+            context.execution,
         )
         return (
             ProducedArtifact(
@@ -166,6 +173,20 @@ class TranscribeStage:
                 data=encode_transcript(transcript),
             ),
         )
+
+
+def _stage_attempt_id(job_id: str, workspace: Path) -> str:
+    """Build a stable Worker correlation ID from the executor-owned workspace."""
+    name = workspace.name
+    if not name.startswith("attempt-"):
+        # The non-durable single-run pipeline uses a temporary directory rather
+        # than the StageExecutor's ``attempt-N`` workspace.  It still has one
+        # well-defined transcription attempt.
+        return f"{job_id}-transcribe-1"
+    suffix = name.removeprefix("attempt-")
+    if not suffix.isdigit() or int(suffix) <= 0:
+        raise AppError("worker.correlation_invalid", {"field": "workspace"})
+    return f"{job_id}-transcribe-{int(suffix)}"
 
 
 @dataclass(slots=True)

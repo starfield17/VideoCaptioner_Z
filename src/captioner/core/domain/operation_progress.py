@@ -82,7 +82,7 @@ class OperationProgress:
         operation = raw.get("operation")
         phase = raw.get("phase")
         message_code = raw.get("message_code")
-        details = raw.get("detail_parameters", {})
+        details = raw.get("detail_parameters")
         if (
             not isinstance(operation, str)
             or not isinstance(phase, str)

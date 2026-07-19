@@ -102,6 +102,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
         ffprobe_bin=options.ffprobe_bin,
         output_dir=output_dir,
         overwrite=options.overwrite,
+        paths=paths,
         pipeline_profile=options.pipeline_profile,
         llm=llm_snapshot,
     )
@@ -419,6 +420,7 @@ def _apply_overrides(
             if overrides.output_dir is None
             else overrides.output_dir,
             overwrite=config.overwrite,
+            paths=paths,
             pipeline_profile=selected_profile,
             llm=llm,
         )

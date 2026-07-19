@@ -321,7 +321,13 @@ def derive_transcript_id(
         "segments": [_segment_to_dict(segment) for segment in segments],
         "metadata": thaw_json_value(freeze_json_value(metadata)),
     }
-    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     return f"transcript-{hashlib.sha256(serialized.encode('utf-8')).hexdigest()}"
 
 
