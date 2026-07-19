@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 
@@ -15,6 +15,38 @@ def result_model_id(model_identity: Mapping[str, object]) -> str:
     if not isinstance(backend, str) or not isinstance(digest, str):
         raise TypeError("model_identity_invalid")
     return f"{backend}:{digest}"
+
+
+def derive_transcript_id(
+    *,
+    language: str,
+    words: Sequence[Mapping[str, object]],
+    segments: Sequence[Mapping[str, object]],
+    engine_id: str,
+    model_id: str,
+    metadata: Mapping[str, object],
+) -> str:
+    """Derive the same content identity as Core's Transcript domain.
+
+    The Worker intentionally hashes only the canonical transcript projection;
+    local audio/model paths are not part of the identity.
+    """
+    payload = {
+        "language": language,
+        "engine_id": engine_id,
+        "model_id": model_id,
+        "words": [dict(word) for word in words],
+        "segments": [dict(segment) for segment in segments],
+        "metadata": dict(metadata),
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return f"transcript-{hashlib.sha256(serialized.encode('utf-8')).hexdigest()}"
 
 
 def write_result(workspace: Path, transcript: Mapping[str, object]) -> dict[str, object]:

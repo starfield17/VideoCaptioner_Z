@@ -8,6 +8,7 @@ import pytest
 from tests.fakes.in_memory_runtime_repository import InMemoryRuntimeRepository
 from tests.fakes.phase6_values import runtime_manifest
 
+from captioner.adapters.runtime.filesystem_runtime_repository import FilesystemRuntimeRepository
 from captioner.adapters.runtime.runtime_archive import (
     FilesystemRuntimeArchive,
     build_file_manifest,
@@ -17,7 +18,13 @@ from captioner.adapters.runtime.runtime_archive import (
 from captioner.core.application.runtime_manager import RuntimeManager
 from captioner.core.application.runtime_selection import HostFacts
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.runtime import DoctorCheck, DoctorPhase, DoctorReport, RuntimeState
+from captioner.core.domain.runtime import (
+    DoctorCheck,
+    DoctorPhase,
+    DoctorReport,
+    RuntimeIdentity,
+    RuntimeState,
+)
 from captioner.core.domain.runtime_package import RuntimePackageDescriptor
 from captioner.core.ports.runtime_package_source import RuntimePackageSource
 
@@ -87,7 +94,7 @@ def _report(ok: bool) -> DoctorReport:
     )
 
 
-def _package(tmp_path: Path) -> tuple[_LocalSource, object]:
+def _package(tmp_path: Path) -> tuple[_LocalSource, RuntimeIdentity]:
     root = tmp_path / "package-root"
     worker = root / "payload" / "worker"
     worker.parent.mkdir(parents=True)
@@ -191,3 +198,68 @@ def test_activation_failure_keeps_no_new_active_pointer(tmp_path: Path) -> None:
         )
         is None
     )
+
+
+def test_activate_current_runtime_is_idempotent_and_preserves_pointer(tmp_path: Path) -> None:
+    manager, _source, repository = _manager(tmp_path)
+    installed = manager.install("local", activate=True)
+    before = repository.get_active_pointer(installed.manifest.backend_id, installed.manifest.target)
+    assert before is not None
+
+    manager.activate(installed.identity)
+
+    assert (
+        repository.get_active_pointer(installed.manifest.backend_id, installed.manifest.target)
+        == before
+    )
+
+
+def test_reinstalling_current_runtime_does_not_rewrite_pointer(tmp_path: Path) -> None:
+    manager, _source, repository = _manager(tmp_path)
+    installed = manager.install("local", activate=True)
+    before = repository.get_active_pointer(installed.manifest.backend_id, installed.manifest.target)
+    assert before is not None
+
+    manager.install("same-descriptor", activate=True)
+
+    assert (
+        repository.get_active_pointer(installed.manifest.backend_id, installed.manifest.target)
+        == before
+    )
+
+
+def test_recover_reconstructs_complete_final_directory_without_record(tmp_path: Path) -> None:
+    source, identity = _package(tmp_path)
+    paths = _Paths(tmp_path / "app")
+    repository = FilesystemRuntimeRepository(paths.runtimes_dir)
+    from tests.fakes.fake_runtime_doctor import FakeRuntimeDoctor
+
+    manager = RuntimeManager(
+        paths=paths,
+        repository=repository,
+        archive=_Archive(),
+        package_source=source,
+        doctor=FakeRuntimeDoctor(_report(True), _report(True)),
+        host_facts=HostFacts("macos", "arm64", "14.0", True),
+    )
+    installed = manager.install("local", activate=False)
+    (installed.install_path / "installation.json").unlink()
+
+    assert manager.recover() == (identity,)
+    recovered = repository.get_by_identity(identity)
+    assert recovered is not None
+    assert recovered.state is RuntimeState.INSTALLED
+    assert (installed.install_path / "installation.json").is_file()
+    assert manager.install("local", activate=False).identity == identity
+
+
+def test_recover_quarantines_incomplete_final_directory(tmp_path: Path) -> None:
+    paths = _Paths(tmp_path / "app")
+    repository = FilesystemRuntimeRepository(paths.runtimes_dir)
+    incomplete = paths.runtimes_dir / "runtime-id" / "1.0.0"
+    incomplete.mkdir(parents=True)
+    (incomplete / "payload").mkdir()
+
+    assert repository.recover() == ()
+    assert not incomplete.exists()
+    assert tuple((paths.runtimes_dir / ".recovery").iterdir())

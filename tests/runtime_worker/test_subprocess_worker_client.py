@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 from tests.fakes.phase6_values import runtime_installation, transcribe_request
 
+from captioner.adapters.runtime.filesystem_runtime_repository import FilesystemRuntimeRepository
 from captioner.adapters.runtime.subprocess_worker_client import (
     ProcessFactory,
     SubprocessWorkerClient,
@@ -30,7 +31,7 @@ def _runtime(tmp_path: Path):
     runtime = runtime_installation()
     install_path = tmp_path / "runtime"
     interpreter = install_path / "payload" / "python" / "bin" / "python3"
-    interpreter.parent.mkdir(parents=True)
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
     interpreter.write_bytes(b"fake interpreter")
     interpreter.chmod(0o755)
     return replace(runtime, install_path=install_path)
@@ -52,6 +53,35 @@ def _factory(mode: str):
         *args: str,
         **kwargs: object,
     ) -> asyncio.subprocess.Process:
+        del executable, args
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-u",
+            str(FIXTURE),
+            mode,
+            cwd=cast(str, kwargs["cwd"]),
+            stdin=cast(int, kwargs["stdin"]),
+            stdout=cast(int, kwargs["stdout"]),
+            stderr=cast(int, kwargs["stderr"]),
+            env=cast(Mapping[str, str], kwargs["env"]),
+            limit=cast(int, kwargs["limit"]),
+            start_new_session=cast(bool, kwargs.get("start_new_session", False)),
+        )
+
+    return create
+
+
+def _sequence_factory(modes: tuple[str, ...]):
+    remaining = list(modes)
+
+    async def create(
+        executable: str,
+        *args: str,
+        **kwargs: object,
+    ) -> asyncio.subprocess.Process:
+        if not remaining:
+            raise AssertionError
+        mode = remaining.pop(0)
         del executable, args
         return await asyncio.create_subprocess_exec(
             sys.executable,
@@ -136,6 +166,155 @@ async def _test_subprocess_client_wrong_cancel_request_is_typed_failure(tmp_path
     _ = client.transcribe(request)
     with pytest.raises(AppError, match=r"worker\.cancel_wrong_request"):
         await client.cancel("other-request")
+    await client.shutdown()
+
+
+def test_same_client_can_restart_after_graceful_shutdown(tmp_path: Path) -> None:
+    asyncio.run(_test_same_client_can_restart_after_graceful_shutdown(tmp_path))
+
+
+async def _test_same_client_can_restart_after_graceful_shutdown(tmp_path: Path) -> None:
+    client = SubprocessWorkerClient(
+        log_dir=tmp_path / "logs",
+        process_factory=cast(ProcessFactory, _factory("stderr")),
+        message_timeout_sec=2.0,
+        termination_grace_sec=0.5,
+    )
+    runtime = _runtime(tmp_path)
+    request = _request(tmp_path)
+    await client.start(runtime, tmp_path / "session-a", HandshakeRequest())
+    assert [event async for event in client.transcribe(request)]
+    await client.shutdown()
+
+    await client.start(runtime, tmp_path / "session-b", HandshakeRequest())
+    assert [event async for event in client.transcribe(request)]
+    await client.shutdown()
+
+
+def test_same_client_restarts_after_worker_crash_during_transcribe(tmp_path: Path) -> None:
+    asyncio.run(_test_same_client_restarts_after_worker_crash_during_transcribe(tmp_path))
+
+
+async def _test_same_client_restarts_after_worker_crash_during_transcribe(
+    tmp_path: Path,
+) -> None:
+    client = SubprocessWorkerClient(
+        log_dir=tmp_path / "logs",
+        process_factory=cast(
+            ProcessFactory,
+            _sequence_factory(("crash-during-transcribe", "stderr")),
+        ),
+        message_timeout_sec=2.0,
+        termination_grace_sec=0.5,
+    )
+    runtime = _runtime(tmp_path)
+    request = _request(tmp_path)
+    await client.start(runtime, tmp_path / "session-a", HandshakeRequest())
+    with pytest.raises(AppError, match=r"worker\.process_exit"):
+        _ = [event async for event in client.transcribe(request)]
+
+    await client.start(runtime, tmp_path / "session-b", HandshakeRequest())
+    assert [event async for event in client.transcribe(request)]
+    await client.shutdown()
+
+
+def test_start_failure_releases_runtime_use_lock(tmp_path: Path) -> None:
+    asyncio.run(_test_start_failure_releases_runtime_use_lock(tmp_path))
+
+
+async def _test_start_failure_releases_runtime_use_lock(tmp_path: Path) -> None:
+    repository = FilesystemRuntimeRepository(tmp_path / "runtimes")
+    base = runtime_installation()
+    runtime = replace(
+        base,
+        install_path=repository.root / base.identity.runtime_id / base.identity.version,
+    )
+    repository.register_installation(runtime)
+    client = SubprocessWorkerClient(
+        log_dir=tmp_path / "logs",
+        runtime_use_lock=repository.use_lock,
+    )
+
+    with pytest.raises(AppError, match=r"runtime\.interpreter_missing"):
+        await client.start(runtime, tmp_path / "session", HandshakeRequest())
+
+    repository.remove_managed_files(runtime.identity)
+
+
+def test_handshake_failure_releases_runtime_use_lock(tmp_path: Path) -> None:
+    asyncio.run(_test_handshake_failure_releases_runtime_use_lock(tmp_path))
+
+
+async def _test_handshake_failure_releases_runtime_use_lock(tmp_path: Path) -> None:
+    repository = FilesystemRuntimeRepository(tmp_path / "runtimes")
+    base = _runtime(tmp_path)
+    runtime = replace(
+        base,
+        install_path=repository.root / base.identity.runtime_id / base.identity.version,
+    )
+    interpreter = runtime.install_path / "payload" / "python" / "bin" / "python3"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"fake interpreter")
+    interpreter.chmod(0o755)
+    repository.register_installation(runtime)
+    client = SubprocessWorkerClient(
+        log_dir=tmp_path / "logs",
+        process_factory=cast(ProcessFactory, _factory("contamination")),
+        message_timeout_sec=2.0,
+        termination_grace_sec=0.2,
+        runtime_use_lock=repository.use_lock,
+    )
+
+    await client.start(runtime, tmp_path / "session", HandshakeRequest())
+    with pytest.raises(AppError):
+        _ = [event async for event in client.transcribe(_request(tmp_path))]
+
+    repository.remove_managed_files(runtime.identity)
+
+
+def test_active_worker_blocks_runtime_removal_until_shutdown(tmp_path: Path) -> None:
+    asyncio.run(_test_active_worker_blocks_runtime_removal_until_shutdown(tmp_path))
+
+
+async def _test_active_worker_blocks_runtime_removal_until_shutdown(tmp_path: Path) -> None:
+    repository = FilesystemRuntimeRepository(tmp_path / "runtimes")
+    base = _runtime(tmp_path)
+    runtime = replace(
+        base,
+        install_path=repository.root / base.identity.runtime_id / base.identity.version,
+    )
+    interpreter = runtime.install_path / "payload" / "python" / "bin" / "python3"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"fake interpreter")
+    interpreter.chmod(0o755)
+    repository.register_installation(runtime)
+    client = SubprocessWorkerClient(
+        log_dir=tmp_path / "logs",
+        process_factory=cast(ProcessFactory, _factory("stderr")),
+        message_timeout_sec=2.0,
+        termination_grace_sec=0.2,
+        runtime_use_lock=repository.use_lock,
+    )
+    await client.start(runtime, tmp_path / "session", HandshakeRequest())
+
+    with pytest.raises(AppError, match=r"runtime\.in_use"):
+        repository.remove_managed_files(runtime.identity)
+
+    await client.shutdown()
+    repository.remove_managed_files(runtime.identity)
+
+
+def test_shutdown_acknowledgement_still_escalates_for_hanging_process(tmp_path: Path) -> None:
+    asyncio.run(_test_shutdown_acknowledgement_still_escalates_for_hanging_process(tmp_path))
+
+
+async def _test_shutdown_acknowledgement_still_escalates_for_hanging_process(
+    tmp_path: Path,
+) -> None:
+    client, _request_value = await _start(tmp_path, "ack-shutdown-but-hang")
+    await client.shutdown()
+    runtime = _runtime(tmp_path)
+    await client.start(runtime, tmp_path / "second-session", HandshakeRequest())
     await client.shutdown()
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from typing import cast
 
 
@@ -65,6 +66,9 @@ def main() -> int:
                     {"acknowledged": True},
                 )
             )
+            if mode == "ack-shutdown-but-hang":
+                while True:
+                    time.sleep(1)
             return 0
         if message_type != "transcribe.request":
             continue
@@ -102,6 +106,22 @@ def main() -> int:
                 sequence += 1
                 break
             continue
+        if mode == "spawn-child":
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            print(f"child_pid={child.pid}", file=sys.stderr, flush=True)
+            while True:
+                incoming = _read()
+                if incoming["message_type"] == "shutdown.request":
+                    _write(
+                        _envelope(
+                            "shutdown.acknowledged",
+                            cast(str, incoming["request_id"]),
+                            sequence,
+                            {"acknowledged": True},
+                        )
+                    )
+                    while True:
+                        time.sleep(1)
         if mode == "wrong-correlation":
             request_id = "wrong-request"
         result_sequence = 0 if mode == "wrong-sequence" else sequence
@@ -122,8 +142,6 @@ def main() -> int:
             )
         )
         sequence += 1
-        if mode == "spawn-child":
-            subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         if mode == "ignore-cancel":
             continue
         # The normal fixture completes one request and waits for shutdown.

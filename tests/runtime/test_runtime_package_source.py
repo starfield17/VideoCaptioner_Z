@@ -36,8 +36,10 @@ class _Response:
         return None
 
     def iter_bytes(self, chunk_size: int) -> Iterator[bytes]:
-        del chunk_size
-        return iter((self.content,))
+        return (
+            self.content[offset : offset + chunk_size]
+            for offset in range(0, len(self.content), chunk_size)
+        )
 
     def __enter__(self) -> _Response:
         return self
@@ -129,3 +131,60 @@ def test_source_rejects_download_size_mismatch(tmp_path: Path) -> None:
             "https://example.test/runtime.runtime.json", tmp_path / "archive.part"
         )
     client.close()
+
+
+@pytest.mark.parametrize(
+    "reference",
+    (
+        r"C:\Downloads\runtime.runtime.json",
+        "C:/Downloads/runtime.runtime.json",
+        r"\\server\share\runtime.runtime.json",
+        "relative/path/runtime.runtime.json",
+    ),
+)
+def test_windows_and_relative_strings_are_local_references(
+    reference: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    descriptor = _descriptor()
+    calls: list[Path] = []
+    source = LocalOrHTTPSRuntimePackageSource()
+
+    def resolve_local(path: Path, destination: Path) -> RuntimePackageDescriptor:
+        calls.append(path)
+        assert destination == tmp_path / "archive.part"
+        return descriptor
+
+    monkeypatch.setattr(source, "_resolve_local", resolve_local)
+    assert source.resolve(reference, tmp_path / "archive.part") == descriptor
+    assert calls == [Path(reference)]
+
+
+def test_remote_descriptor_is_streamed_and_stops_at_limit(tmp_path: Path) -> None:
+    calls = 0
+    oversized = b"x" * (2 * 1024 * 1024 + 1)
+
+    class StreamingResponse(_Response):
+        def iter_bytes(self, chunk_size: int) -> Iterator[bytes]:
+            nonlocal calls
+            assert chunk_size == 64 * 1024
+            for block in super().iter_bytes(chunk_size):
+                calls += 1
+                yield block
+
+    class StreamingClient(_Client):
+        def __init__(self) -> None:
+            super().__init__(lambda request: StreamingResponse(request.url, oversized))
+
+    with pytest.raises(AppError, match=r"runtime\.source_descriptor_too_large"):
+        LocalOrHTTPSRuntimePackageSource(client=StreamingClient()).resolve(
+            "https://example.test/runtime.runtime.json", tmp_path / "archive.part"
+        )
+    assert calls < (len(oversized) // (64 * 1024)) + 2
+
+
+def test_local_descriptor_rejects_size_before_reading(tmp_path: Path) -> None:
+    descriptor_path = tmp_path / "runtime.runtime.json"
+    descriptor_path.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+
+    with pytest.raises(AppError, match=r"runtime\.source_descriptor_too_large"):
+        LocalOrHTTPSRuntimePackageSource().resolve(descriptor_path, tmp_path / "archive.part")

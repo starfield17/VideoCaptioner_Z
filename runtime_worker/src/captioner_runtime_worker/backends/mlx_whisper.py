@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import Event
 from typing import cast
 
+from ..transcript import derive_transcript_id
 from .base import Backend, ProgressCallback
 from .faster_whisper import CancelledError
 
@@ -74,24 +75,32 @@ class MLXWhisperMetalBackend(Backend):
         detected_language = language_value if isinstance(language_value, str) else language or "und"
         backend = cast(str, runtime_info["backend_id"])
         model_id = f"{backend}:{cast(str, model_identity['manifest_sha256'])}"
+        metadata = {
+            "runtime_identity": runtime_info["runtime_id"],
+            "runtime_version": runtime_info["runtime_version"],
+            "backend_version": runtime_info["backend_version"],
+            "worker_version": runtime_info["worker_version"],
+            "device_kind": runtime_info["device_kind"],
+            "model_identity": dict(model_identity),
+            "word_timestamps": True,
+        }
         return {
             "schema_version": 1,
             "transcript": {
-                "id": f"runtime-{model_id}-{len(words)}",
+                "id": derive_transcript_id(
+                    language=detected_language,
+                    words=words,
+                    segments=segments,
+                    engine_id=backend,
+                    model_id=model_id,
+                    metadata=metadata,
+                ),
                 "language": detected_language,
                 "engine_id": backend,
                 "model_id": model_id,
                 "words": words,
                 "segments": segments,
-                "metadata": {
-                    "runtime_identity": runtime_info["runtime_id"],
-                    "runtime_version": runtime_info["runtime_version"],
-                    "backend_version": runtime_info["backend_version"],
-                    "worker_version": runtime_info["worker_version"],
-                    "device_kind": runtime_info["device_kind"],
-                    "model_identity": dict(model_identity),
-                    "word_timestamps": True,
-                },
+                "metadata": metadata,
             },
         }
 

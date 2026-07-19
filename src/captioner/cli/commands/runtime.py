@@ -49,14 +49,18 @@ def build_manager(paths: AppPaths, *, activation_client: bool = False) -> Runtim
     repository = FilesystemRuntimeRepository(paths.runtimes_dir)
     host = probe_host_facts()
     worker_factory: WorkerClientFactory | None = (
-        (lambda _runtime: SubprocessWorkerClient(log_dir=paths.log_dir))
+        (
+            lambda _runtime: SubprocessWorkerClient(
+                log_dir=paths.log_dir,
+                runtime_use_lock=repository.use_lock,
+            )
+        )
         if activation_client
         else None
     )
     doctor = FilesystemRuntimeDoctor(
         host_facts=host,
         worker_client_factory=worker_factory,
-        runtime_use_lock=repository.use_lock,
     )
     manager = RuntimeManager(
         paths=paths,

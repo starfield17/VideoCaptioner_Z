@@ -127,13 +127,6 @@ class RuntimeManager:
                     return existing
                 if final_root.exists():
                     raise AppError("runtime.version_directory_conflict")
-                final_root.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    os.replace(staging_root, final_root)
-                except OSError as exc:
-                    if exc.errno == 28:
-                        raise AppError("runtime.disk_full") from exc
-                    raise AppError("runtime.install_move_failed") from exc
                 installation = RuntimeInstallation(
                     identity=manifest.runtime_identity,
                     manifest=manifest,
@@ -142,6 +135,19 @@ class RuntimeManager:
                     managed=True,
                     doctor_passed=False,
                 )
+                # Keep the complete installation record inside the staging
+                # root so a final-directory move cannot expose a payload
+                # without its registration metadata.
+                self._write_installation_metadata(staging_root, installation)
+                _fsync_directory(staging_root)
+                final_root.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.replace(staging_root, final_root)
+                    _fsync_directory(final_root.parent)
+                except OSError as exc:
+                    if exc.errno == 28:
+                        raise AppError("runtime.disk_full") from exc
+                    raise AppError("runtime.install_move_failed") from exc
                 self._repository.register_installation(installation)
                 if activate:
                     self._activate(installation.identity, progress)
@@ -276,6 +282,19 @@ class RuntimeManager:
             RuntimeState.EXTERNAL_UNMANAGED,
         }:
             raise AppError("runtime.not_installable")
+        pointer = self._repository.get_active_pointer(
+            runtime.manifest.backend_id, runtime.manifest.target
+        )
+        if (
+            pointer is not None
+            and pointer.current == identity
+            and pointer.pending_activation is None
+            and runtime.is_available
+        ):
+            # Re-activating a healthy current Runtime is deliberately a pure
+            # idempotent read.  Health checks belong to the explicit Doctor
+            # command and must not rewrite current/previous pointers.
+            return
         self._repository.prepare_activation(identity)
         self._emit(progress, "activating")
         try:
@@ -373,6 +392,21 @@ class RuntimeManager:
         _write_json(root / "runtime-manifest.json", descriptor.runtime_manifest.to_dict())
 
     @staticmethod
+    def _write_installation_metadata(root: Path, installation: RuntimeInstallation) -> None:
+        _write_json(
+            root / "installation.json",
+            {
+                "schema_version": 1,
+                "identity": installation.identity.to_dict(),
+                "manifest": installation.manifest.to_dict(),
+                "install_path": str(installation.install_path),
+                "state": installation.state.value,
+                "managed": installation.managed,
+                "doctor_passed": installation.doctor_passed,
+            },
+        )
+
+    @staticmethod
     def _emit(progress: ProgressCallback | None, phase: str) -> None:
         if progress is not None:
             progress(OperationProgress("runtime", phase, f"runtime.{phase}", {}))
@@ -416,6 +450,19 @@ def _write_json(path: Path, value: object) -> None:
 def _remove_tree(path: Path) -> None:
     if path.is_dir():
         shutil.rmtree(path)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise AppError("runtime.persistence_failed", {"reason": "directory_fsync"}) from exc
 
 
 def _version_at_least(actual: str, required: str) -> bool:

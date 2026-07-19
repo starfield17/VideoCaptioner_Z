@@ -6,7 +6,6 @@ import asyncio
 import json
 import uuid
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import cast
 
@@ -22,7 +21,6 @@ from captioner.core.domain.runtime import (
     DoctorCheck,
     DoctorPhase,
     DoctorReport,
-    RuntimeIdentity,
     RuntimeInstallation,
     RuntimeManifest,
 )
@@ -31,7 +29,6 @@ from captioner.core.domain.worker_protocol import DoctorRequest, DoctorResponse,
 from captioner.core.ports.worker_client import WorkerClient
 
 WorkerClientFactory = Callable[[RuntimeInstallation], WorkerClient]
-RuntimeUseLockFactory = Callable[[RuntimeIdentity], AbstractContextManager[None]]
 
 
 class FilesystemRuntimeDoctor:
@@ -42,11 +39,9 @@ class FilesystemRuntimeDoctor:
         *,
         host_facts: HostFacts,
         worker_client_factory: WorkerClientFactory | None = None,
-        runtime_use_lock: RuntimeUseLockFactory | None = None,
     ) -> None:
         self._host = host_facts
         self._worker_client_factory = worker_client_factory
-        self._runtime_use_lock = runtime_use_lock
 
     def static_doctor(self, runtime: RuntimeInstallation) -> DoctorReport:
         checks: list[DoctorCheck] = []
@@ -85,13 +80,7 @@ class FilesystemRuntimeDoctor:
     async def _activation_doctor(
         self, runtime: RuntimeInstallation, workspace: Path
     ) -> DoctorReport:
-        lock = (
-            nullcontext()
-            if self._runtime_use_lock is None
-            else self._runtime_use_lock(runtime.identity)
-        )
-        with lock:
-            return await self._activation_doctor_unlocked(runtime, workspace)
+        return await self._activation_doctor_unlocked(runtime, workspace)
 
     async def _activation_doctor_unlocked(
         self, runtime: RuntimeInstallation, workspace: Path
@@ -322,4 +311,4 @@ def _is_executable(path: Path) -> bool:
     return bool(path.stat().st_mode & 0o111)
 
 
-__all__ = ["FilesystemRuntimeDoctor", "RuntimeUseLockFactory", "WorkerClientFactory"]
+__all__ = ["FilesystemRuntimeDoctor", "WorkerClientFactory"]

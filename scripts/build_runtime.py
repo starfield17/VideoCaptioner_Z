@@ -27,6 +27,7 @@ from captioner.core.domain.runtime_package import RuntimePackageDescriptor
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_WORKER_ROOT = PROJECT_ROOT / "runtime_worker"
 RUNTIME_PROJECTS_ROOT = PROJECT_ROOT / "runtime_projects"
+_MAX_DESCRIPTOR_BYTES = 2 * 1024 * 1024
 
 
 class RuntimeBuildError(RuntimeError):
@@ -128,6 +129,10 @@ def _build(project_name: str, version: str, output: Path) -> None:
                 str(worker_wheel),
             ]
         )
+        prune_runtime_packages(
+            python_root,
+            _optional_string_list(config, "prune_packages"),
+        )
         _remove_generated_files(python_root)
         build_info = {
             "schema_version": 1,
@@ -194,10 +199,12 @@ def _build(project_name: str, version: str, output: Path) -> None:
             runtime_manifest=manifest,
         )
         descriptor_path = output / f"{archive_filename[:-7]}.runtime.json"
-        descriptor_path.write_text(
-            json.dumps(descriptor.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        descriptor_bytes = (
+            json.dumps(descriptor.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        if len(descriptor_bytes) > _MAX_DESCRIPTOR_BYTES:
+            raise RuntimeBuildError("descriptor_too_large")
+        descriptor_path.write_bytes(descriptor_bytes)
         with tempfile.TemporaryDirectory(prefix="captioner-runtime-relocation-") as relocated_name:
             safe_extract_archive(archive_path, Path(relocated_name), manifest)
             relocated_interpreter = _runtime_interpreter(
@@ -256,6 +263,33 @@ def _remove_generated_files(root: Path) -> None:
             shutil.rmtree(path)
 
 
+def prune_runtime_packages(python_root: Path, package_names: list[str]) -> None:
+    """Remove explicitly excluded optional packages from the final payload.
+
+    Some Runtime packages publish conversion or training dependencies that are
+    not needed by the isolated inference worker.  The lock still resolves the
+    complete upstream dependency set; this step only omits the declared,
+    unused packages from the distributable Runtime.
+    """
+    site_packages_roots = (
+        python_root / "lib" / "python3.12" / "site-packages",
+        python_root / "Lib" / "site-packages",
+    )
+    names = set(package_names)
+    for site_packages in site_packages_roots:
+        if not site_packages.is_dir():
+            continue
+        for path in site_packages.iterdir():
+            if path.name in names or any(
+                path.name.startswith(f"{name}-") and path.name.endswith(".dist-info")
+                for name in names
+            ):
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+
+
 def _load_toml(path: Path) -> dict[str, object]:
     import tomllib
 
@@ -276,6 +310,18 @@ def _string_list(value: Mapping[str, object], key: str) -> list[str]:
         raise RuntimeBuildError(f"invalid_field:{key}")
     entries = cast(list[object], item)
     if any(not isinstance(entry, str) for entry in entries):
+        raise RuntimeBuildError(f"invalid_field:{key}")
+    return cast(list[str], entries)
+
+
+def _optional_string_list(value: Mapping[str, object], key: str) -> list[str]:
+    item = value.get(key)
+    if item is None:
+        return []
+    if not isinstance(item, list):
+        raise RuntimeBuildError(f"invalid_field:{key}")
+    entries = cast(list[object], item)
+    if any(not isinstance(entry, str) or not entry.strip() for entry in entries):
         raise RuntimeBuildError(f"invalid_field:{key}")
     return cast(list[str], entries)
 

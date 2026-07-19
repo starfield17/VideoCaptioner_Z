@@ -12,8 +12,16 @@ from captioner_runtime_worker.backends.faster_whisper import (
 )
 from captioner_runtime_worker.backends.mlx_whisper import MLXWhisperMetalBackend
 from captioner_runtime_worker.protocol import decode, encode
-from captioner_runtime_worker.transcript import write_result
+from captioner_runtime_worker.transcript import derive_transcript_id, write_result
 from captioner_runtime_worker.worker import ProtocolWriter
+
+from captioner.core.domain.transcript import (
+    TranscriptSegment,
+    WordToken,
+)
+from captioner.core.domain.transcript import (
+    derive_transcript_id as derive_core_transcript_id,
+)
 
 
 def test_protocol_writer_keeps_jsonl_on_original_stdout() -> None:
@@ -131,3 +139,77 @@ def test_codec_round_trip_matches_worker_protocol() -> None:
     line = encode("shutdown.request", "request-1", 0, {"reason": "test"})
     value = decode(line)
     assert value["protocol"] == "captioner.worker"
+
+
+def test_worker_transcript_id_matches_core_and_binds_content() -> None:
+    words = [
+        {
+            "id": "word-000001",
+            "text": "hello",
+            "start_ms": 0,
+            "end_ms": 500,
+            "confidence": 0.9,
+            "speaker_id": None,
+        },
+        {
+            "id": "word-000002",
+            "text": "world",
+            "start_ms": 500,
+            "end_ms": 1000,
+            "confidence": 0.8,
+            "speaker_id": None,
+        },
+    ]
+    segments = [
+        {
+            "id": "segment-000001",
+            "word_ids": ["word-000001", "word-000002"],
+            "raw_text": "hello world",
+            "start_ms": 0,
+            "end_ms": 1000,
+            "confidence": None,
+        }
+    ]
+    metadata = {"device_kind": "cpu", "word_timestamps": True}
+    worker_id = derive_transcript_id(
+        language="en",
+        words=words,
+        segments=segments,
+        engine_id="faster-whisper",
+        model_id="faster-whisper:" + "a" * 64,
+        metadata=metadata,
+    )
+    core_id = derive_core_transcript_id(
+        language="en",
+        words=(
+            WordToken("word-000001", "hello", 0, 500, 0.9, None),
+            WordToken("word-000002", "world", 500, 1000, 0.8, None),
+        ),
+        segments=(
+            TranscriptSegment(
+                "segment-000001",
+                ("word-000001", "word-000002"),
+                "hello world",
+                0,
+                1000,
+                None,
+            ),
+        ),
+        engine_id="faster-whisper",
+        model_id="faster-whisper:" + "a" * 64,
+        metadata=metadata,
+    )
+    assert worker_id == core_id
+    changed_words = [dict(item) for item in words]
+    changed_words[0]["text"] = "goodbye"
+    assert (
+        derive_transcript_id(
+            language="en",
+            words=changed_words,
+            segments=segments,
+            engine_id="faster-whisper",
+            model_id="faster-whisper:" + "a" * 64,
+            metadata=metadata,
+        )
+        != worker_id
+    )

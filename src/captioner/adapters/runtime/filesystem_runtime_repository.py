@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import uuid
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import cast
 
 from filelock import FileLock, Timeout
 
+from captioner.adapters.runtime.runtime_archive import verify_runtime_payload
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.runtime import (
     ActiveRuntimePointer,
@@ -23,6 +25,7 @@ from captioner.core.domain.runtime import (
     RuntimeState,
     RuntimeTarget,
 )
+from captioner.core.domain.runtime_package import RuntimePackageDescriptor
 
 _SLOT_RE = re.compile(
     r"^(?P<backend>[^|]+)\|(?P<platform>[^|]+)\|(?P<arch>[^|]+)\|(?P<device>[^|]+)$"
@@ -75,7 +78,7 @@ class FilesystemRuntimeRepository:
             for record in sorted(self.external_root.glob("*.json")):
                 installations.append(self._read_installation(record))
         for runtime_dir in sorted(self.root.iterdir()):
-            if not runtime_dir.is_dir() or runtime_dir.name == "external":
+            if not runtime_dir.is_dir() or runtime_dir.name in {"external", ".recovery"}:
                 continue
             for version_dir in sorted(runtime_dir.iterdir()):
                 if version_dir.is_dir() and (version_dir / "installation.json").is_file():
@@ -141,6 +144,8 @@ class FilesystemRuntimeRepository:
         if installation.manifest.backend_id != backend_id or installation.manifest.target != target:
             raise AppError("runtime.active_pointer_invalid")
         old = self.get_active_pointer(backend_id, target)
+        if old is not None and old.current == identity and old.pending_activation is None:
+            return
         pointer = ActiveRuntimePointer(
             backend_id,
             target,
@@ -157,6 +162,8 @@ class FilesystemRuntimeRepository:
         old = self.get_active_pointer(
             installation.manifest.backend_id, installation.manifest.target
         )
+        if old is not None and old.current == identity and old.pending_activation is None:
+            return old
         pointer = ActiveRuntimePointer(
             installation.manifest.backend_id,
             installation.manifest.target,
@@ -270,28 +277,120 @@ class FilesystemRuntimeRepository:
 
     def recover(self) -> tuple[RuntimeIdentity, ...]:
         recovered: list[RuntimeIdentity] = []
+        recovered.extend(self._recover_unregistered_versions())
         for pointer in tuple(self._read_active_slots().values()):
             if pointer.pending_activation is None:
                 continue
             candidate = self.get_by_identity(pointer.pending_activation)
-            if candidate is not None:
-                self.update_installation(
-                    RuntimeInstallation(
-                        identity=candidate.identity,
-                        manifest=candidate.manifest,
-                        install_path=candidate.install_path,
-                        state=(
-                            RuntimeState.EXTERNAL_UNMANAGED
-                            if candidate.state is RuntimeState.EXTERNAL_UNMANAGED
-                            else RuntimeState.FAILED
-                        ),
-                        managed=candidate.managed,
-                        doctor_passed=False,
-                    )
+            if candidate is None:
+                # The pointer may have been persisted before the candidate
+                # registration.  Clear the pending transaction even when the
+                # candidate record is not recoverable.
+                self._restore_pointer_without_candidate(pointer)
+                continue
+            self.update_installation(
+                RuntimeInstallation(
+                    identity=candidate.identity,
+                    manifest=candidate.manifest,
+                    install_path=candidate.install_path,
+                    state=(
+                        RuntimeState.EXTERNAL_UNMANAGED
+                        if candidate.state is RuntimeState.EXTERNAL_UNMANAGED
+                        else RuntimeState.FAILED
+                    ),
+                    managed=candidate.managed,
+                    doctor_passed=False,
                 )
-                recovered.append(candidate.identity)
-                self.restore_pending_activation(candidate.identity)
+            )
+            recovered.append(candidate.identity)
+            self.restore_pending_activation(candidate.identity)
         return tuple(recovered)
+
+    def _restore_pointer_without_candidate(self, pointer: ActiveRuntimePointer) -> None:
+        slots = self._read_active_slots()
+        key = _slot_key(pointer.backend_id, pointer.target)
+        if pointer.previous is None:
+            slots.pop(key, None)
+        else:
+            slots[key] = ActiveRuntimePointer(
+                pointer.backend_id,
+                pointer.target,
+                current=pointer.previous,
+                previous=None,
+                pending_activation=None,
+            )
+        self._write_active_slots(slots)
+
+    def _recover_unregistered_versions(self) -> list[RuntimeIdentity]:
+        """Rebuild complete final directories exposed before registration.
+
+        A final version directory without its registration record is never
+        treated as an installed Runtime.  If its sidecars and payload are
+        complete, the record is reconstructed; otherwise the directory is
+        quarantined so a later install cannot be blocked by a stale name.
+        """
+        if not self.root.is_dir():
+            return []
+        recovered: list[RuntimeIdentity] = []
+        for runtime_dir in sorted(self.root.iterdir()):
+            if not runtime_dir.is_dir() or runtime_dir.name in {"external", ".recovery"}:
+                continue
+            for version_dir in sorted(runtime_dir.iterdir()):
+                if not version_dir.is_dir() or (version_dir / "installation.json").is_file():
+                    continue
+                try:
+                    installation = self._reconstruct_installation(version_dir)
+                except (AppError, OSError):
+                    self._quarantine_version(version_dir)
+                    continue
+                self._write_json(
+                    version_dir / "installation.json",
+                    _installation_to_dict(installation),
+                )
+                recovered.append(installation.identity)
+        return recovered
+
+    def _reconstruct_installation(self, version_dir: Path) -> RuntimeInstallation:
+        package_path = version_dir / "runtime-package.json"
+        manifest_path = version_dir / "runtime-manifest.json"
+        if not package_path.is_file() or not manifest_path.is_file():
+            raise AppError("runtime.recovery_incomplete")
+        package = RuntimePackageDescriptor.from_dict(self._read_json(package_path))
+        manifest = RuntimeManifest.from_dict(self._read_json(manifest_path))
+        if package.runtime_manifest != manifest:
+            raise AppError("runtime.recovery_incomplete")
+        if (
+            manifest.runtime_identity.runtime_id != version_dir.parent.name
+            or manifest.runtime_identity.version != version_dir.name
+        ):
+            raise AppError("runtime.recovery_incomplete")
+        verify_runtime_payload(
+            version_dir,
+            manifest,
+            allowed_extra_paths=(
+                "runtime-package.json",
+                "runtime-manifest.json",
+                ".use.lock",
+            ),
+        )
+        return RuntimeInstallation(
+            identity=manifest.runtime_identity,
+            manifest=manifest,
+            install_path=version_dir,
+            state=RuntimeState.INSTALLED,
+            managed=True,
+            doctor_passed=False,
+        )
+
+    def _quarantine_version(self, version_dir: Path) -> None:
+        recovery_root = self.root / ".recovery"
+        recovery_root.mkdir(parents=True, exist_ok=True)
+        target = recovery_root / f"{version_dir.name}-{uuid.uuid4().hex}"
+        try:
+            os.replace(version_dir, target)
+            _fsync_directory(recovery_root)
+        except OSError as exc:
+            raise AppError("runtime.recovery_failed") from exc
 
     def _record_path(self, installation: RuntimeInstallation) -> Path:
         if installation.managed:
@@ -339,6 +438,17 @@ class FilesystemRuntimeRepository:
             managed=managed_value,
             doctor_passed=doctor_value,
         )
+
+    @staticmethod
+    def _read_json(path: Path) -> object:
+        try:
+            return json.loads(
+                path.read_text(encoding="utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_json_constant,
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise AppError("runtime.recovery_incomplete") from exc
 
     def _read_active_slots(self) -> dict[str, ActiveRuntimePointer]:
         if not self.active_path.is_file():

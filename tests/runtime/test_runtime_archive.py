@@ -164,6 +164,17 @@ def test_archive_rejects_duplicate_extra_and_missing_files(tmp_path: Path) -> No
         validate_archive(missing, manifest)
 
 
+def test_archive_enforces_total_uncompressed_size_limit(tmp_path: Path) -> None:
+    data = b"0123456789"
+    archive = tmp_path / "large-logical.tar.gz"
+    _archive_with_members(archive, [("payload/worker", data, "file")])
+    digest = hashlib.sha256(data).hexdigest()
+    manifest = _manifest_for_file("payload/worker", len(data), digest)
+
+    with pytest.raises(AppError, match=r"runtime\.archive_too_large"):
+        validate_archive(archive, manifest, max_extracted_bytes=9)
+
+
 def _manifest_for_one_file(relative_path: str) -> RuntimeManifest:
     digest = hashlib.sha256(b"x").hexdigest()
     capability = BackendCapability(
@@ -188,4 +199,22 @@ def _manifest_for_one_file(relative_path: str) -> RuntimeManifest:
         supported_model_formats=("faster-whisper-ct2",),
         archive_sha256="a" * 64,
         files=(RuntimeFileEntry(relative_path, 1, digest, False),),
+    )
+
+
+def _manifest_for_file(relative_path: str, size: int, digest: str) -> RuntimeManifest:
+    manifest = _manifest_for_one_file(relative_path)
+    from captioner.core.domain.runtime import RuntimeFileEntry
+
+    return RuntimeManifest(
+        schema_version=manifest.schema_version,
+        runtime_identity=manifest.runtime_identity,
+        worker_protocol_version=manifest.worker_protocol_version,
+        backend_id=manifest.backend_id,
+        backend_version=manifest.backend_version,
+        target=manifest.target,
+        capabilities=manifest.capabilities,
+        supported_model_formats=manifest.supported_model_formats,
+        archive_sha256=manifest.archive_sha256,
+        files=(RuntimeFileEntry(relative_path, size, digest, False),),
     )

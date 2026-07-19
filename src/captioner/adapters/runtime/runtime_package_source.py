@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -25,7 +26,6 @@ class _HTTPURL(Protocol):
 
 class _HTTPResponse(Protocol):
     url: _HTTPURL
-    content: bytes
 
     def raise_for_status(self) -> object: ...
 
@@ -37,8 +37,6 @@ class _HTTPResponse(Protocol):
 
 
 class _HTTPClient(Protocol):
-    def get(self, url: str) -> object: ...
-
     def stream(self, method: str, url: str) -> object: ...
 
     def close(self) -> None: ...
@@ -61,18 +59,29 @@ class LocalOrHTTPSRuntimePackageSource:
     def resolve(self, reference: str | Path, destination: Path) -> RuntimePackageDescriptor:
         if isinstance(reference, Path):
             return self._resolve_local(reference, destination)
-        parsed = urlparse(reference)
-        if parsed.scheme == "":
+        if reference.casefold().startswith("https://"):
+            parsed = urlparse(reference)
+            if parsed.username or parsed.password:
+                raise AppError("runtime.source_url_invalid")
+            return self._resolve_remote(reference, destination)
+        if _looks_like_windows_path(reference):
             return self._resolve_local(Path(reference), destination)
-        if parsed.scheme != "https" or parsed.username or parsed.password:
+        parsed = urlparse(reference)
+        if parsed.scheme:
             raise AppError("runtime.source_url_invalid")
-        return self._resolve_remote(reference, destination)
+        return self._resolve_local(Path(reference), destination)
 
     def _resolve_local(self, descriptor_path: Path, destination: Path) -> RuntimePackageDescriptor:
         path = descriptor_path.expanduser().resolve()
         if not path.is_file():
             raise AppError("runtime.package_descriptor_missing")
-        descriptor = _load_descriptor(path.read_bytes())
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise AppError("runtime.package_descriptor_missing") from exc
+        if size > _MAX_DESCRIPTOR_BYTES:
+            raise AppError("runtime.source_descriptor_too_large")
+        descriptor = _load_descriptor(_read_bounded_file(path, _MAX_DESCRIPTOR_BYTES))
         if descriptor.archive_size_bytes > self._max_download_bytes:
             raise AppError("runtime.archive_too_large")
         archive = path.parent / descriptor.archive_filename
@@ -100,18 +109,24 @@ class LocalOrHTTPSRuntimePackageSource:
             client = httpx.Client(follow_redirects=True, timeout=30.0)
         try:
             try:
-                response = cast(_HTTPResponse, client.get(url))
-                response.raise_for_status()
-                _ensure_https_response(response)
-                data = response.content
+                stream = cast(AbstractContextManager[object], client.stream("GET", url))
+                with stream as raw_response:
+                    response = cast(_HTTPResponse, raw_response)
+                    response.raise_for_status()
+                    _ensure_https_response(response)
+                    data = bytearray()
+                    for block in response.iter_bytes(64 * 1024):
+                        if len(data) + len(block) > limit:
+                            _fail("runtime.source_descriptor_too_large")
+                        data.extend(block)
             except (httpx.HTTPError, OSError) as exc:
                 raise AppError("runtime.source_fetch_failed") from exc
+            except AppError:
+                raise
         finally:
             if owns_client:
                 client.close()
-        if len(data) > limit:
-            raise AppError("runtime.source_descriptor_too_large")
-        return data
+        return bytes(data)
 
     def _download(self, url: str, destination: Path, expected_size: int) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +192,25 @@ def _copy_archive(source: Path, destination: Path, expected_size: int) -> None:
         if exc.errno == 28:
             raise AppError("runtime.disk_full") from exc
         raise AppError("runtime.source_copy_failed") from exc
+
+
+def _read_bounded_file(path: Path, limit: int) -> bytes:
+    data = bytearray()
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(64 * 1024), b""):
+                if len(data) + len(block) > limit:
+                    _fail("runtime.source_descriptor_too_large")
+                data.extend(block)
+    except AppError:
+        raise
+    except OSError as exc:
+        raise AppError("runtime.package_descriptor_missing") from exc
+    return bytes(data)
+
+
+def _looks_like_windows_path(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z]:", value) or value.startswith(("\\\\", "//")))
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:

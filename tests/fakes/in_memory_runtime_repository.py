@@ -97,9 +97,19 @@ class InMemoryRuntimeRepository:
             raise AppError("runtime.active_pointer_invalid")
         if installation.manifest.target != target:
             raise AppError("runtime.active_pointer_invalid")
+        existing = self._pointers.get((backend_id, target.key))
+        if (
+            existing is not None
+            and existing.current == identity
+            and existing.pending_activation is None
+        ):
+            return
         self._active[(backend_id, target.key)] = identity
         self._pointers[(backend_id, target.key)] = ActiveRuntimePointer(
-            backend_id, target, current=identity
+            backend_id,
+            target,
+            current=identity,
+            previous=None if existing is None else existing.current,
         )
 
     def clear_active_runtime(self, backend_id: str, target: RuntimeTarget) -> None:
@@ -117,6 +127,8 @@ class InMemoryRuntimeRepository:
             raise AppError("runtime.not_registered")
         key = (installation.manifest.backend_id, installation.manifest.target.key)
         old = self._pointers.get(key)
+        if old is not None and old.current == identity and old.pending_activation is None:
+            return old
         pointer = ActiveRuntimePointer(
             installation.manifest.backend_id,
             installation.manifest.target,

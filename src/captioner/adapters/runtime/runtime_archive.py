@@ -15,16 +15,34 @@ from captioner.core.domain.runtime import RuntimeFileEntry, RuntimeManifest
 from captioner.core.ports.runtime_archive import RuntimeArchive
 
 _MAX_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024
+_MAX_EXTRACTED_BYTES = 16 * 1024 * 1024 * 1024
 
 
 class FilesystemRuntimeArchive(RuntimeArchive):
     """Filesystem implementation of the Core Runtime archive port."""
 
+    def __init__(
+        self,
+        *,
+        max_archive_bytes: int = _MAX_ARCHIVE_BYTES,
+        max_extracted_bytes: int = _MAX_EXTRACTED_BYTES,
+    ) -> None:
+        if max_archive_bytes <= 0 or max_extracted_bytes <= 0:
+            raise ValueError
+        self._max_archive_bytes = max_archive_bytes
+        self._max_extracted_bytes = max_extracted_bytes
+
     def sha256_file(self, path: Path) -> str:
         return sha256_file(path)
 
     def extract(self, archive_path: Path, destination: Path, manifest: RuntimeManifest) -> None:
-        safe_extract_archive(archive_path, destination, manifest)
+        safe_extract_archive(
+            archive_path,
+            destination,
+            manifest,
+            max_archive_bytes=self._max_archive_bytes,
+            max_extracted_bytes=self._max_extracted_bytes,
+        )
 
 
 def sha256_file(path: Path) -> str:
@@ -43,8 +61,11 @@ def validate_archive(
     manifest: RuntimeManifest,
     *,
     max_archive_bytes: int = _MAX_ARCHIVE_BYTES,
+    max_extracted_bytes: int = _MAX_EXTRACTED_BYTES,
 ) -> tuple[tarfile.TarInfo, ...]:
     """Validate every tar entry before any extraction occurs."""
+    if max_archive_bytes <= 0 or max_extracted_bytes <= 0:
+        raise ValueError
     try:
         size = archive_path.stat().st_size
     except OSError as exc:
@@ -54,6 +75,7 @@ def validate_archive(
     expected = {entry.relative_path: entry for entry in manifest.files}
     seen: set[str] = set()
     members: list[tarfile.TarInfo] = []
+    extracted_size = 0
     try:
         with tarfile.open(archive_path, mode="r:gz") as archive:
             for member in archive.getmembers():
@@ -69,6 +91,9 @@ def validate_archive(
                         _fail("runtime.archive_extra_file", {"path": name})
                     if member.size != entry.size_bytes:
                         _fail("runtime.archive_size_mismatch", {"path": name})
+                    extracted_size += member.size
+                    if extracted_size > max_extracted_bytes:
+                        _fail("runtime.archive_too_large", {"reason": "uncompressed"})
                 members.append(member)
     except AppError:
         raise
@@ -87,9 +112,15 @@ def safe_extract_archive(
     manifest: RuntimeManifest,
     *,
     max_archive_bytes: int = _MAX_ARCHIVE_BYTES,
+    max_extracted_bytes: int = _MAX_EXTRACTED_BYTES,
 ) -> None:
     """Extract only regular files/directories after complete preflight."""
-    members = validate_archive(archive_path, manifest, max_archive_bytes=max_archive_bytes)
+    members = validate_archive(
+        archive_path,
+        manifest,
+        max_archive_bytes=max_archive_bytes,
+        max_extracted_bytes=max_extracted_bytes,
+    )
     root = destination.resolve()
     root.mkdir(parents=True, exist_ok=True)
     try:
@@ -109,8 +140,7 @@ def safe_extract_archive(
                     _fail("runtime.archive_invalid", {"reason": "file_stream"})
                 try:
                     with target.open("xb") as output:
-                        for block in iter(source.read, b""):
-                            output.write(block)
+                        _copy_stream(source, output)
                         output.flush()
                         os.fsync(output.fileno())
                 finally:
@@ -253,6 +283,15 @@ def _ensure_inside(path: Path, root: Path) -> None:
         path.relative_to(root)
     except ValueError as exc:
         raise AppError("runtime.archive_entry_invalid", {"reason": "path_escape"}) from exc
+
+
+def _copy_stream(source: object, destination: object) -> None:
+    reader = getattr(source, "read", None)
+    writer = getattr(destination, "write", None)
+    if not callable(reader) or not callable(writer):
+        raise AppError("runtime.archive_invalid", {"reason": "file_stream"})
+    for block in iter(lambda: reader(1024 * 1024), b""):
+        writer(block)
 
 
 def _fsync_file(path: Path) -> None:

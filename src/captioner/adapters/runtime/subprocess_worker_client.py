@@ -7,12 +7,13 @@ import os
 import subprocess
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, NoReturn, Protocol, cast
 
 from captioner.core.domain.errors import AppError
-from captioner.core.domain.runtime import RuntimeInstallation, RuntimeState
+from captioner.core.domain.runtime import RuntimeIdentity, RuntimeInstallation, RuntimeState
 from captioner.core.domain.worker_protocol import (
     WORKER_PROTOCOL_NAME,
     WORKER_PROTOCOL_VERSION,
@@ -59,6 +60,7 @@ class _WorkerProcess(Protocol):
 
 
 ProcessFactory = Callable[..., Awaitable[_WorkerProcess]]
+RuntimeUseLockFactory = Callable[[RuntimeIdentity], AbstractContextManager[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +79,7 @@ class SubprocessWorkerClient(WorkerClient):
         message_timeout_sec: float = DEFAULT_MESSAGE_TIMEOUT_SEC,
         cancellation_timeout_sec: float = 2.0,
         termination_grace_sec: float = 2.0,
+        runtime_use_lock: RuntimeUseLockFactory | None = None,
     ) -> None:
         if message_timeout_sec <= 0 or cancellation_timeout_sec <= 0 or termination_grace_sec <= 0:
             raise ValueError
@@ -87,6 +90,7 @@ class SubprocessWorkerClient(WorkerClient):
         self._message_timeout = message_timeout_sec
         self._cancellation_timeout = cancellation_timeout_sec
         self._termination_grace = termination_grace_sec
+        self._runtime_use_lock_factory = runtime_use_lock
         self._process: _WorkerProcess | None = None
         self._runtime: RuntimeInstallation | None = None
         self._workspace: Path | None = None
@@ -101,6 +105,7 @@ class SubprocessWorkerClient(WorkerClient):
         self._active_request: TranscribeRequest | None = None
         self._cancel_ack_event: asyncio.Event | None = None
         self._shutdown_started = False
+        self._runtime_use_lock_context: AbstractContextManager[None] | None = None
         self._codec = JsonlProtocolCodec()
 
     async def start(
@@ -109,8 +114,7 @@ class SubprocessWorkerClient(WorkerClient):
         workspace: Path,
         request: HandshakeRequest,
     ) -> WorkerHandshake:
-        if self._process is not None:
-            raise AppError("worker.already_started")
+        self._assert_session_clear()
         if runtime.state not in {
             RuntimeState.INSTALLED,
             RuntimeState.AVAILABLE,
@@ -119,12 +123,21 @@ class SubprocessWorkerClient(WorkerClient):
             raise AppError("runtime.not_available")
         if not workspace.is_absolute():
             raise AppError("worker.workspace_invalid")
-        interpreter = runtime_interpreter(runtime)
-        if not interpreter.is_file():
-            raise AppError("runtime.interpreter_missing")
+        lock = (
+            nullcontext()
+            if self._runtime_use_lock_factory is None
+            else self._runtime_use_lock_factory(runtime.identity)
+        )
+        lock.__enter__()
+        self._runtime_use_lock_context = lock
+        self._runtime = runtime
+        self._workspace = workspace
         session_id = uuid.uuid4().hex
         log_path = self._log_dir / "runtimes" / runtime.identity.runtime_id / f"{session_id}.log"
         try:
+            interpreter = runtime_interpreter(runtime)
+            if not interpreter.is_file():
+                _fail("runtime.interpreter_missing")
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_stream = log_path.open("ab")
             spawn_kwargs: dict[str, object] = {
@@ -150,8 +163,6 @@ class SubprocessWorkerClient(WorkerClient):
             )
             if self._process.stdin is None or self._process.stdout is None:
                 _fail("worker.pipe_missing")
-            self._runtime = runtime
-            self._workspace = workspace
             self._stderr_task = asyncio.create_task(self._pump_stderr())
             request_id = f"handshake-{uuid.uuid4().hex}"
             await self._send(
@@ -178,6 +189,9 @@ class SubprocessWorkerClient(WorkerClient):
         except (OSError, subprocess.SubprocessError) as exc:
             await self._cleanup(force=True)
             raise AppError("worker.start_failed") from exc
+        except BaseException:
+            await self._cleanup(force=True)
+            raise
         else:
             self._last_incoming_sequence = validate_sequence(None, envelope.sequence)
             self._stdout_task = asyncio.create_task(self._pump_stdout())
@@ -284,7 +298,10 @@ class SubprocessWorkerClient(WorkerClient):
         if not acknowledged or self._active_request_id is not None:
             await self._terminate_process_tree()
         else:
-            await self._wait_process(self._termination_grace)
+            # The acknowledgement is only a protocol event.  The session is
+            # not finished until the process itself has exited.
+            if not await self._wait_process(self._termination_grace):
+                await self._terminate_process_tree()
         await self._cleanup(force=False)
         return ShutdownResult(acknowledged=True)
 
@@ -473,33 +490,82 @@ class SubprocessWorkerClient(WorkerClient):
         await terminate_process_tree(process, grace_timeout=self._termination_grace)
 
     async def _cleanup(self, *, force: bool) -> None:
-        if force and self._process is not None and self._process.returncode is None:
-            await self._terminate_process_tree()
-        for task in (self._stdout_task, self._stderr_task):
+        process = self._process
+        if process is not None and process.returncode is None:
+            exited = False if force else await self._wait_process(self._termination_grace)
+            if not exited or process.returncode is None:
+                await self._terminate_process_tree()
+                if process.returncode is None:
+                    await self._wait_process(self._termination_grace)
+                if process.returncode is None:
+                    # Keep the process reference and use-lock when the
+                    # process cannot be proven dead.
+                    raise AppError("worker.process_termination_timeout")
+
+        tasks = (self._stdout_task, self._stderr_task)
+        for task in tasks:
             if task is not None and not task.done():
                 task.cancel()
-        for task in (self._stdout_task, self._stderr_task):
-            if task is not None:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    continue
-        if self._process is not None and self._process.stdin is not None:
-            self._process.stdin.close()
-        stream = self._log_stream
-        if stream is not None:
-            stream.close()
-        self._stdout_task = None
-        self._stderr_task = None
-        self._log_stream = None
+        try:
+            for task in tasks:
+                if task is not None:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        continue
+            if process is not None and process.stdin is not None:
+                process.stdin.close()
+            stream = self._log_stream
+            if stream is not None:
+                stream.close()
+        finally:
+            lock = self._runtime_use_lock_context
+            if lock is not None:
+                lock.__exit__(None, None, None)
+            self._reset_session_state()
+
+    def _assert_session_clear(self) -> None:
+        if any(
+            value is not None
+            for value in (
+                self._process,
+                self._runtime,
+                self._workspace,
+                self._stdout_task,
+                self._stderr_task,
+                self._log_stream,
+                self._runtime_use_lock_context,
+            )
+        ):
+            raise AppError("worker.session_not_reset")
+        if (
+            self._pending
+            or self._last_incoming_sequence is not None
+            or self._outgoing_sequence != 0
+            or self._active_request_id is not None
+            or self._active_request is not None
+            or self._cancel_ack_event is not None
+            or self._shutdown_started
+        ):
+            raise AppError("worker.session_not_reset")
+
+    def _reset_session_state(self) -> None:
+        """Reset every per-process field before the Client can be restarted."""
         self._process = None
         self._runtime = None
         self._workspace = None
+        self._stdout_task = None
+        self._stderr_task = None
+        self._log_stream = None
+        self._runtime_use_lock_context = None
+        self._last_incoming_sequence = None
+        self._outgoing_sequence = 0
         self._active_request_id = None
         self._active_request = None
         self._cancel_ack_event = None
-        self._pending.clear()
         self._shutdown_started = False
+        self._pending.clear()
+        self._queue = asyncio.Queue()
 
 
 async def _create_process(
@@ -599,6 +665,7 @@ def _fail(code: str) -> NoReturn:
 
 __all__ = [
     "MAX_WORKER_LINE_BYTES",
+    "RuntimeUseLockFactory",
     "SubprocessWorkerClient",
     "runtime_interpreter",
 ]

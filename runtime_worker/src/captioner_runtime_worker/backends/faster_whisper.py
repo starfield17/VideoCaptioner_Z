@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Event
 from typing import Protocol, cast
 
+from ..transcript import derive_transcript_id
 from .base import Backend, ProgressCallback
 
 
@@ -173,22 +174,30 @@ def _transcript(
 ) -> dict[str, object]:
     backend = cast(str, runtime_info["backend_id"])
     model_id = f"{backend}:{cast(str, model_identity['manifest_sha256'])}"
+    metadata = {
+        "runtime_identity": runtime_info["runtime_id"],
+        "runtime_version": runtime_info["runtime_version"],
+        "backend_version": runtime_info["backend_version"],
+        "worker_version": runtime_info["worker_version"],
+        "device_kind": runtime_info["device_kind"],
+        "model_identity": dict(model_identity),
+        "word_timestamps": True,
+    }
     transcript = {
-        "id": f"runtime-{model_id}-{len(words)}",
+        "id": derive_transcript_id(
+            language=language,
+            words=words,
+            segments=segments,
+            engine_id=backend,
+            model_id=model_id,
+            metadata=metadata,
+        ),
         "language": language,
         "engine_id": backend,
         "model_id": model_id,
         "words": words,
         "segments": segments,
-        "metadata": {
-            "runtime_identity": runtime_info["runtime_id"],
-            "runtime_version": runtime_info["runtime_version"],
-            "backend_version": runtime_info["backend_version"],
-            "worker_version": runtime_info["worker_version"],
-            "device_kind": runtime_info["device_kind"],
-            "model_identity": dict(model_identity),
-            "word_timestamps": True,
-        },
+        "metadata": metadata,
     }
     return {"schema_version": 1, "transcript": transcript}
 
