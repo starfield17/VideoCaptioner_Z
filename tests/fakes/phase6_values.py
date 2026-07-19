@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -94,7 +95,9 @@ def runtime_installation(
     return RuntimeInstallation(
         identity=manifest.runtime_identity,
         manifest=manifest,
-        install_path=Path("/captioner/runtime") / manifest.runtime_identity.runtime_id,
+        install_path=Path(tempfile.gettempdir())
+        / "captioner-runtime-test"
+        / manifest.runtime_identity.runtime_id,
         state=state,
         doctor_passed=doctor_passed,
     )
@@ -214,7 +217,8 @@ def model_installation(
     return ModelInstallation(
         identity=manifest.identity,
         manifest=manifest,
-        model_directory=Path("/captioner/models")
+        model_directory=Path(tempfile.gettempdir())
+        / "captioner-model-test"
         / manifest.identity.repository_id.replace("/", "-"),
         state=state,
         managed=managed,

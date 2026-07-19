@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 
 import pytest
@@ -24,6 +25,7 @@ class _Process:
         return 0
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
 def test_posix_termination_escalates_from_term_to_kill(monkeypatch: pytest.MonkeyPatch) -> None:
     process = _Process(terminate_after=2)
     signals: list[tuple[int, signal.Signals]] = []
@@ -45,6 +47,7 @@ def test_posix_termination_escalates_from_term_to_kill(monkeypatch: pytest.Monke
     assert len(signals) == 2
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
 def test_process_group_already_gone_is_not_unknown_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

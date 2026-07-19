@@ -296,7 +296,10 @@ def _copy_stream(source: object, destination: object) -> None:
 
 def _fsync_file(path: Path) -> None:
     try:
-        with path.open("rb") as stream:
+        # Windows rejects fsync on a read-only handle.  The archive was just
+        # created by us, so retain a writable handle for the same durability
+        # barrier on every supported platform.
+        with path.open("rb+") as stream:
             os.fsync(stream.fileno())
     except OSError as exc:
         raise AppError("runtime.archive_write_failed", {"reason": "fsync"}) from exc
