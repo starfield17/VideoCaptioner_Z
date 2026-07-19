@@ -16,6 +16,8 @@ from captioner.core.domain.worker_protocol import (
     DoctorResponse,
     HandshakeRequest,
     JsonlProtocolCodec,
+    ModelLoadRequest,
+    ModelLoadResponse,
     OperationCancelled,
     ResultDescriptor,
     ShutdownAcknowledged,
@@ -44,6 +46,7 @@ _JOB_TYPES = {
 
 
 def _envelope(message_type: str) -> WorkerEnvelope:
+    transcribe = transcribe_request()
     payload_by_type = {
         WorkerMessageType.HANDSHAKE_REQUEST.value: HandshakeRequest(
             required_capabilities=("word_timestamps",),
@@ -51,7 +54,7 @@ def _envelope(message_type: str) -> WorkerEnvelope:
             required_result_schema_versions=(1,),
         ).to_payload(),
         WorkerMessageType.HANDSHAKE_RESPONSE.value: worker_handshake().to_payload(),
-        WorkerMessageType.TRANSCRIBE_REQUEST.value: transcribe_request().to_payload(),
+        WorkerMessageType.TRANSCRIBE_REQUEST.value: transcribe.to_payload(),
         WorkerMessageType.OPERATION_PROGRESS.value: OperationProgress(
             "asr", "transcribing", "worker.transcribing", {}
         ).to_payload(),
@@ -69,6 +72,16 @@ def _envelope(message_type: str) -> WorkerEnvelope:
         ).to_payload(),
         WorkerMessageType.DOCTOR_RESPONSE.value: DoctorResponse(
             "nonce-1", True, "cpu", result_descriptor()
+        ).to_payload(),
+        WorkerMessageType.MODEL_LOAD_REQUEST.value: ModelLoadRequest(
+            model_directory=transcribe.model_directory,
+            model_identity=transcribe.model_identity,
+        ).to_payload(),
+        WorkerMessageType.MODEL_LOAD_RESPONSE.value: ModelLoadResponse(
+            model_identity=transcribe.model_identity,
+            backend_id="faster-whisper",
+            device_kind="cpu",
+            loaded=True,
         ).to_payload(),
     }
     payload = payload_by_type[message_type]

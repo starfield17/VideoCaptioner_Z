@@ -19,7 +19,7 @@ def main() -> int:
             cast(str, handshake_request["request_id"]),
             sequence,
             {
-                "protocol_version": "1.1",
+                "protocol_version": "1.2",
                 "runtime_id": "faster-whisper-cpu-macos-arm64",
                 "runtime_version": "1.0.0",
                 "backend_id": "faster-whisper",
@@ -173,7 +173,7 @@ def _envelope(
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "protocol": "captioner.worker",
-        "version": "1.1",
+        "version": "1.2",
         "message_type": message_type,
         "request_id": request_id,
         "sequence": sequence,

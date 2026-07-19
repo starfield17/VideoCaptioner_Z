@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from captioner.adapters.asr.faster_whisper import FasterWhisperConfig, FasterWhisperEngine
+from captioner.adapters.asr.runtime_worker import WorkerBackedASREngine
 from captioner.adapters.exporters.srt import serialize_bytes as serialize_srt
 from captioner.adapters.exporters.transcript_json import serialize_bytes as serialize_transcript
 from captioner.adapters.llm.http_transport import HTTPTransport
@@ -18,6 +19,8 @@ from captioner.adapters.llm.openai_compatible import OpenAICompatibleClient
 from captioner.adapters.llm.token_counter import ModelTokenCounter, resolve_tokenizer_id
 from captioner.adapters.media.ffmpeg_audio import FFmpegAudioNormalizer
 from captioner.adapters.media.ffprobe import FFprobeMediaInspector
+from captioner.adapters.model.filesystem_model_repository import FilesystemModelRepository
+from captioner.adapters.model.filesystem_model_validator import FilesystemModelValidator
 from captioner.adapters.persistence.batch_lease import BatchLease
 from captioner.adapters.persistence.content_addressed_artifact_store import (
     ContentAddressedArtifactStore,
@@ -40,14 +43,22 @@ from captioner.adapters.pipeline.stages import (
     verify_publication,
 )
 from captioner.adapters.process.asyncio_subprocess import AsyncioSubprocessRunner
+from captioner.adapters.runtime.filesystem_runtime_repository import (
+    FilesystemRuntimeRepository,
+)
+from captioner.adapters.runtime.host_probe import probe_host_facts
+from captioner.adapters.runtime.subprocess_worker_client import SubprocessWorkerClient
 from captioner.adapters.subtitles.ass import serialize_bytes as serialize_ass
 from captioner.adapters.subtitles.json_track import serialize as serialize_track_json
 from captioner.adapters.subtitles.webvtt import serialize_bytes as serialize_webvtt
 from captioner.adapters.testing.fault_injector import ScriptedFaultInjector
 from captioner.core.application.durable_pipeline import DurablePipelineService
+from captioner.core.application.model_compatibility import ensure_model_compatibility
+from captioner.core.application.model_preflight import preflight_new_job
 from captioner.core.application.run_single import RunSingleService
 from captioner.core.application.stage_executor import EventFactory, StageExecutor
 from captioner.core.application.structured_llm_service import Sleep, StructuredLLMService
+from captioner.core.domain.asr_job_snapshot import ASRJobSnapshot
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig
 from captioner.core.domain.journal import replay
@@ -57,6 +68,7 @@ from captioner.core.domain.llm_job_config import (
     ProviderPublicSnapshot,
     required_prompts_for,
 )
+from captioner.core.domain.model import ModelState
 from captioner.core.domain.result import (
     FrozenJsonValue,
     JsonValue,
@@ -96,6 +108,7 @@ def build_run_service(
     paths: AppPaths | None = None,
     model_id: str | None = None,
     asr_engine: ASREngine | None = None,
+    asr_snapshot: ASRJobSnapshot | None = None,
 ) -> RunSingleService:
     """Assemble concrete adapters for one CLI invocation."""
     if model_id is not None:
@@ -107,15 +120,19 @@ def build_run_service(
     process = AsyncioSubprocessRunner()
     inspector = FFprobeMediaInspector(process, executable=ffprobe_bin)
     normalizer = FFmpegAudioNormalizer(process, executable=ffmpeg_bin)
-    engine = asr_engine or FasterWhisperEngine(
-        FasterWhisperConfig(
-            model_ref=model_ref,
-            device=device,
-            compute_type=compute_type,
-            language=language,
-            model_cache_dir=application_paths.models_dir / "faster-whisper",
+    engine = asr_engine
+    if engine is None and asr_snapshot is not None:
+        engine = build_worker_asr_engine(asr_snapshot, paths=application_paths)
+    if engine is None:
+        engine = FasterWhisperEngine(
+            FasterWhisperConfig(
+                model_ref=model_ref,
+                device=device,
+                compute_type=compute_type,
+                language=language,
+                model_cache_dir=application_paths.models_dir / "faster-whisper",
+            )
         )
-    )
     return RunSingleService(
         inspector=inspector,
         normalizer=normalizer,
@@ -128,6 +145,103 @@ def build_run_service(
         webvtt_serializer=serialize_webvtt,
         ass_serializer=serialize_ass,
     )
+
+
+def build_worker_asr_engine(
+    snapshot: ASRJobSnapshot,
+    *,
+    paths: AppPaths,
+    runtime_repository: FilesystemRuntimeRepository | None = None,
+    model_repository: FilesystemModelRepository | None = None,
+) -> WorkerBackedASREngine:
+    """Resolve a persisted ASR snapshot into one isolated Worker engine.
+
+    This helper consumes exact identities only.  It never runs the auto
+    selector, downloads a model, or mutates an active Runtime pointer.
+    """
+    runtime_repo = runtime_repository or FilesystemRuntimeRepository(paths.runtimes_dir)
+    model_repo = model_repository or FilesystemModelRepository(
+        paths.models_dir,
+        staging_dir=paths.staging_dir,
+    )
+    runtime = runtime_repo.get_by_identity(snapshot.effective_runtime_identity)
+    if runtime is None or not runtime.is_available:
+        raise AppError("runtime.not_available")
+    model = model_repo.get_by_identity(snapshot.effective_model_identity)
+    if model is None:
+        raise AppError("model.not_installed")
+    if model.state in {ModelState.STAGED, ModelState.FAILED} or not model.is_validated:
+        raise AppError("model.not_installed")
+    report = FilesystemModelValidator().validate(model.manifest, model.model_directory)
+    if not report.ok:
+        raise AppError(
+            "model.external_content_changed"
+            if model.state is ModelState.EXTERNAL_UNMANAGED
+            else (report.error_code or "model.validation_failed")
+        )
+    if runtime.manifest.backend_id != snapshot.effective_backend_id:
+        raise AppError("runtime.snapshot_mismatch", {"field": "backend_id"})
+    if runtime.manifest.target.device_kind != snapshot.effective_device_kind:
+        raise AppError("runtime.snapshot_mismatch", {"field": "device_kind"})
+    ensure_model_compatibility(runtime, model)
+    worker = SubprocessWorkerClient(
+        log_dir=paths.log_dir,
+        runtime_use_lock=runtime_repo.use_lock,
+    )
+    return WorkerBackedASREngine(
+        runtime=runtime,
+        model=model,
+        worker_client=worker,
+        session_workspace_root=paths.workspaces_dir,
+        model_use_lock=model_repo.use_lock,
+        load_on_start=True,
+        backend_options={"compute_type": snapshot.compute_type},
+    )
+
+
+def create_asr_job_snapshot(
+    *,
+    model_selector: str,
+    requested_device: str,
+    compute_type: str,
+    paths: AppPaths,
+) -> ASRJobSnapshot:
+    """Run new-Job Runtime/Model preflight without installing anything."""
+    runtime_repository = FilesystemRuntimeRepository(paths.runtimes_dir)
+    active_runtimes = tuple(
+        runtime
+        for runtime in runtime_repository.list_installations()
+        if runtime.is_available
+        and (
+            (
+                pointer := runtime_repository.get_active_pointer(
+                    runtime.manifest.backend_id,
+                    runtime.manifest.target,
+                )
+            )
+            is not None
+            and pointer.current == runtime.identity
+        )
+    )
+    model_repository = FilesystemModelRepository(
+        paths.models_dir,
+        staging_dir=paths.staging_dir,
+    )
+    result = preflight_new_job(
+        model_selector=model_selector,
+        requested_device=requested_device,
+        compute_type=compute_type,
+        host=probe_host_facts(),
+        installed_models=model_repository.list_installed_models(),
+        active_runtimes=active_runtimes,
+        validator=FilesystemModelValidator(),
+    )
+    if not result.ok or result.snapshot is None:
+        raise AppError(
+            result.error_code or "runtime.preflight_failed",
+            {"reasons": list(result.reasons)},
+        )
+    return result.snapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +364,7 @@ def create_job_config(
     max_retries: int | None = None,
     chunk: Mapping[str, object] | None = None,
     prompt_identity: Mapping[str, object] | None = None,
+    asr_snapshot: ASRJobSnapshot | None = None,
 ) -> JobConfig:
     selected_profile = PipelineProfile(pipeline_profile)
     application_paths = resolve_app_paths() if paths is None else paths
@@ -279,9 +394,19 @@ def create_job_config(
             "llm.config_invalid",
             {"reason": "complete_snapshot_required"},
         )
+    selected_schema = 3 if asr_snapshot is not None else 2
+    selected_model_ref = (
+        asr_snapshot.requested_model_selector if asr_snapshot is not None else model.model_ref
+    )
+    selected_model_identity = (
+        f"{asr_snapshot.effective_backend_id}:"
+        f"{asr_snapshot.effective_model_identity.manifest_sha256}"
+        if asr_snapshot is not None
+        else model.model_identity
+    )
     return JobConfig(
-        model.model_ref,
-        model.model_identity,
+        selected_model_ref,
+        selected_model_identity,
         device,
         compute_type,
         language,
@@ -293,8 +418,10 @@ def create_job_config(
         str(output_dir.expanduser().resolve()),
         overwrite,
         stage_versions_for(selected_profile),
+        schema_version=selected_schema,
         pipeline_profile=selected_profile,
         llm=None if snapshot is None else _frozen_mapping(snapshot),
+        asr_snapshot=asr_snapshot,
     )
 
 
@@ -410,6 +537,7 @@ def build_durable_service(
     llm_cache: LLMCachePort | None = None,
     token_counter: TokenCounter | None = None,
     asr_engine: ASREngine | None = None,
+    asr_snapshot: ASRJobSnapshot | None = None,
 ) -> DurableServiceBundle:
     selected_profile = PipelineProfile(pipeline_profile)
     application_paths = resolve_app_paths() if paths is None else paths
@@ -427,7 +555,11 @@ def build_durable_service(
         language,
         model_cache_dir=application_paths.models_dir / "faster-whisper",
     )
-    engine = asr_engine or FasterWhisperEngine(engine_config)
+    engine = asr_engine
+    if engine is None and asr_snapshot is not None:
+        engine = build_worker_asr_engine(asr_snapshot, paths=application_paths)
+    if engine is None:
+        engine = FasterWhisperEngine(engine_config)
     policy = SegmentationPolicyConfig.from_mapping(
         segmentation or SegmentationPolicyConfig().to_mapping()
     )

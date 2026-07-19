@@ -24,6 +24,8 @@ from captioner.core.domain.worker_protocol import (
     DoctorResponse,
     HandshakeRequest,
     JsonlProtocolCodec,
+    ModelLoadRequest,
+    ModelLoadResponse,
     OperationCancelled,
     OperationProgress,
     ResultDescriptor,
@@ -235,6 +237,33 @@ class SubprocessWorkerClient(WorkerClient):
         typed = decode_typed_message(envelope)
         if not isinstance(typed, DoctorResponse):
             raise AppError("worker.doctor_invalid")
+        return typed
+
+    async def load_model(self, request: ModelLoadRequest) -> ModelLoadResponse:
+        if self._process is None:
+            raise AppError("worker.not_started")
+        if self._active_request_id is not None:
+            raise AppError("worker.busy")
+        request_id = f"model-load-{uuid.uuid4().hex}"
+        await self._send(
+            WorkerEnvelope(
+                protocol=WORKER_PROTOCOL_NAME,
+                version=WORKER_PROTOCOL_VERSION,
+                message_type=WorkerMessageType.MODEL_LOAD_REQUEST.value,
+                request_id=request_id,
+                sequence=self._next_outgoing_sequence(),
+                payload=request.to_payload(),
+            )
+        )
+        envelope = await self._receive(timeout=self._message_timeout)
+        if (
+            envelope.request_id != request_id
+            or envelope.message_type != WorkerMessageType.MODEL_LOAD_RESPONSE.value
+        ):
+            raise AppError("worker.correlation_mismatch")
+        typed = decode_typed_message(envelope)
+        if not isinstance(typed, ModelLoadResponse):
+            raise AppError("worker.model_load_invalid")
         return typed
 
     async def cancel(self, request_id: str) -> CancelResult:

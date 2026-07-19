@@ -9,6 +9,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import cast
 
+from captioner.core.domain.asr_job_snapshot import ASRJobSnapshot
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.llm_job_config import LLMJobSnapshot
 from captioner.core.domain.result import (
@@ -25,6 +26,7 @@ from captioner.core.domain.stage import (
 )
 
 JOB_CONFIG_SCHEMA_VERSION = 2
+ASR_JOB_CONFIG_SCHEMA_VERSION = 3
 LEGACY_JOB_CONFIG_SCHEMA_VERSION = 1
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
@@ -71,11 +73,13 @@ class JobConfig:
     schema_version: int = JOB_CONFIG_SCHEMA_VERSION
     pipeline_profile: PipelineProfile = PipelineProfile.DETERMINISTIC
     llm: Mapping[str, FrozenJsonValue] | None = None
+    asr_snapshot: ASRJobSnapshot | None = None
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version not in {
             LEGACY_JOB_CONFIG_SCHEMA_VERSION,
             JOB_CONFIG_SCHEMA_VERSION,
+            ASR_JOB_CONFIG_SCHEMA_VERSION,
         }:
             raise AppError("job.config_invalid", {"field": "schema_version"})
         try:
@@ -86,6 +90,22 @@ class JobConfig:
             profile = PipelineProfile.DETERMINISTIC
             if self.llm is not None:
                 raise AppError("job.config_invalid", {"field": "llm"})
+        if self.schema_version == ASR_JOB_CONFIG_SCHEMA_VERSION:
+            if not isinstance(self.asr_snapshot, ASRJobSnapshot):
+                raise AppError("job.config_invalid", {"field": "asr_snapshot"})
+            expected_model_identity = (
+                f"{self.asr_snapshot.effective_backend_id}:"
+                f"{self.asr_snapshot.effective_model_identity.manifest_sha256}"
+            )
+            if (
+                self.model_ref != self.asr_snapshot.requested_model_selector
+                or self.device != self.asr_snapshot.requested_device
+                or self.compute_type != self.asr_snapshot.compute_type
+                or self.model_identity != expected_model_identity
+            ):
+                raise AppError("job.config_invalid", {"field": "asr_snapshot"})
+        elif self.asr_snapshot is not None:
+            raise AppError("job.config_invalid", {"field": "asr_snapshot"})
         object.__setattr__(self, "pipeline_profile", profile)
         required = (self.model_ref, self.model_identity, self.device, self.compute_type)
         if any(not value.strip() for value in required):
@@ -163,10 +183,21 @@ class JobConfig:
         if self.schema_version == JOB_CONFIG_SCHEMA_VERSION:
             value["pipeline_profile"] = self.pipeline_profile.value
             value["llm"] = None if self.llm is None else thaw_json_value(self.llm)
+        elif self.schema_version == ASR_JOB_CONFIG_SCHEMA_VERSION:
+            value["pipeline_profile"] = self.pipeline_profile.value
+            value["llm"] = None if self.llm is None else thaw_json_value(self.llm)
+            if self.asr_snapshot is None:
+                raise AppError("job.config_invalid", {"field": "asr_snapshot"})
+            value["asr_snapshot"] = self.asr_snapshot.to_mapping()
         return value
 
     @property
     def runtime_signature(self) -> tuple[object, ...]:
+        snapshot = (
+            None
+            if self.asr_snapshot is None
+            else _hashable_json(freeze_json_value(self.asr_snapshot.to_mapping()))
+        )
         return (
             self.model_ref,
             self.model_identity,
@@ -181,6 +212,7 @@ class JobConfig:
             _hashable_json(self.stage_versions),
             self.pipeline_profile.value,
             _hashable_json(self.llm) if self.llm is not None else None,
+            snapshot,
         )
 
     @property

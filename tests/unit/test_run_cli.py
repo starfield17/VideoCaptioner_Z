@@ -7,13 +7,37 @@ import pytest
 
 from captioner.cli import cli_entry
 from captioner.cli.commands import batch as batch_command
+from captioner.core.domain.asr_job_snapshot import ASRJobSnapshot
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
+from captioner.core.domain.model import ModelIdentity
+from captioner.core.domain.runtime import RuntimeIdentity
 from captioner.infrastructure.app_paths import AppPaths
 
 
 def _projection() -> BatchProjection:
     return BatchProjection("batch-test", last_event_seq=1)
+
+
+def _snapshot(**kwargs: object) -> ASRJobSnapshot:
+    del kwargs
+    return ASRJobSnapshot(
+        1,
+        "model",
+        "auto",
+        "faster-whisper",
+        RuntimeIdentity("runtime", "1.0.0"),
+        ModelIdentity(
+            "faster-whisper",
+            "local-import",
+            "local-import/model",
+            "1",
+            "faster-whisper-ct2",
+            "0" * 64,
+        ),
+        "cpu",
+        "default",
+    )
 
 
 def _payload(_projection: BatchProjection, *, paths: AppPaths) -> dict[str, object]:
@@ -38,6 +62,7 @@ def test_run_json_output_is_locale_neutral(
 ) -> None:
     monkeypatch.setattr(batch_command, "run", _run_success)
     monkeypatch.setattr(batch_command, "projection_payload", _payload)
+    monkeypatch.setattr(cli_entry, "create_asr_job_snapshot", _snapshot)
     assert (
         cli_entry.main(
             [
@@ -46,6 +71,8 @@ def test_run_json_output_is_locale_neutral(
                 "second.wav",
                 "--output",
                 str(tmp_path),
+                "--model",
+                "model",
                 "--json",
                 "--language",
                 "en",
@@ -63,7 +90,22 @@ def test_run_human_output_remains_available(
 ) -> None:
     monkeypatch.setattr(batch_command, "run", _run_success)
     monkeypatch.setattr(batch_command, "projection_payload", _payload)
-    assert cli_entry.main(["--lang", "zh-CN", "run", "input.wav", "--output", str(tmp_path)]) == 0
+    monkeypatch.setattr(cli_entry, "create_asr_job_snapshot", _snapshot)
+    assert (
+        cli_entry.main(
+            [
+                "--lang",
+                "zh-CN",
+                "run",
+                "input.wav",
+                "--output",
+                str(tmp_path),
+                "--model",
+                "model",
+            ]
+        )
+        == 0
+    )
     assert "batch_id: batch-test" in capsys.readouterr().out
 
 
@@ -87,7 +129,21 @@ def test_run_maps_structured_errors_to_exit_codes(
         raise error
 
     monkeypatch.setattr(batch_command, "run", fail)
-    assert cli_entry.main(["run", "input.wav", "--output", str(tmp_path), "--json"]) == expected
+    monkeypatch.setattr(cli_entry, "create_asr_job_snapshot", _snapshot)
+    assert (
+        cli_entry.main(
+            [
+                "run",
+                "input.wav",
+                "--output",
+                str(tmp_path),
+                "--model",
+                "model",
+                "--json",
+            ]
+        )
+        == expected
+    )
     assert json.loads(capsys.readouterr().err)["code"] == error.code
 
 
