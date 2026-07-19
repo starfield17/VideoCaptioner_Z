@@ -247,9 +247,10 @@ def worker_handshake() -> WorkerHandshake:
 def transcribe_request() -> TranscribeRequest:
     runtime = runtime_installation()
     model = model_installation()
+    work_root = Path(tempfile.gettempdir()) / "captioner-worker-test"
     return TranscribeRequest(
-        normalized_audio_path=Path("/captioner/work/audio.wav"),
-        attempt_workspace=Path("/captioner/work/attempt"),
+        normalized_audio_path=work_root / "audio.wav",
+        attempt_workspace=work_root / "attempt",
         model_directory=model.model_directory,
         backend_id=runtime.manifest.backend_id,
         runtime_identity=runtime.identity,
