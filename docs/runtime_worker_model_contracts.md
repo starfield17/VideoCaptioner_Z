@@ -1,9 +1,10 @@
 # Phase 6 Runtime / Worker / Model Contracts
 
 Phase 6.0 fixed the contracts used by Runtime and model work. Phase 6.1 adds
-the local Runtime manager and real Worker transport described below. It still
-does not download or install models, and it does not implement CUDA12,
-Hugging Face, or ModelScope model management.
+the local Runtime manager and real Worker transport described below. Phase 6.2
+adds managed model sources, validation, load verification, and new-Job
+Runtime/Model preflight. CUDA12, model conversion, and GUI management remain
+deferred.
 
 ## Ownership and execution flow
 
@@ -24,7 +25,20 @@ Core
   → Artifact Store commit
 ```
 
-The future transport is JSONL: Core writes protocol messages to Worker stdin,
+Phase 6.2 adds a separate Model Manager boundary.  Remote sources resolve an
+immutable revision, but the Worker only receives the resulting local model
+directory and manifest identity.  It never receives source credentials or a
+repository download target.  New schema-3 Jobs persist the effective Runtime,
+Model, backend, and device selection; resume resolves those exact identities
+and does not run `auto` selection again.  Legacy schema-1/2 Jobs retain their
+legacy in-process compatibility path.
+
+Faster Whisper models require the offline CTranslate2 files `config.json`,
+`model.bin`, and `tokenizer.json`.  MLX Whisper models require `config.json`,
+one supported weight file, and either `tokenizer.json` or `vocab.json` plus
+`merges.txt`.  There is no format conversion in this phase.
+
+The transport is JSONL: Core writes protocol messages to Worker stdin,
 Worker writes protocol messages only to stdout, and human-readable diagnostics
 go to stderr. Complete Transcripts do not travel in JSONL; an operation result
 contains a relative result path, byte size, SHA-256, schema ID, and schema
@@ -50,7 +64,7 @@ multiple versions. A duplicate active candidate is an ambiguity error.
 
 Static Doctor and Activation Doctor are separate operations. Static Doctor
 validates the installed payload and sidecar/build metadata. Activation Doctor
-starts the Runtime's own Python, performs the v1.1 handshake and Doctor probe,
+starts the Runtime's own Python, performs the v1.2 handshake and Doctor probe,
 checks backend imports/device visibility, verifies a workspace round-trip, and
 shuts the Worker down cleanly.
 
@@ -86,8 +100,8 @@ identity. A final identity is created only after revision resolution,
 materialization/import, file inventory, validation, and canonical Manifest
 digest computation. `LocalModelInspector` is the separate Port for directories
 that do not have a Captioner Manifest yet; its inspection projection carries
-detection and validation results, while local import and external-path
-registration remain later Model Manager work.
+detection and validation results. The Model Manager owns local import and
+external-path registration.
 
 Managed models may be removed by a later repository implementation. External
 models are advanced-mode references: Captioner does not copy or delete their
@@ -107,10 +121,10 @@ faster-whisper + cpu/cuda  → faster-whisper-ct2
 mlx-whisper + metal       → mlx-whisper
 ```
 
-The Phase 6.0 MLX validator contract requires `config.json` and at least one
-of `model.safetensors`, `weights.safetensors`, or `weights.npz`. No MLX
-package, conversion step, SDK, or remote source is included here. Remote model
-files are not hosted by this repository.
+The MLX validator contract requires `config.json`, at least one of
+`model.safetensors`, `weights.safetensors`, or `weights.npz`, and offline
+tokenizer assets. The model source adapters do not convert formats or execute
+remote code. Remote model files are not hosted by this repository.
 
 ## Auto selection
 
@@ -152,7 +166,7 @@ models the same lifecycle without starting a production Runtime.
 ## Progress and errors
 
 Runtime, model, and ASR progress reports identify the current phase only, such
-as `verifying_archive`, `loading_model`, or `transcribing`. Protocol v1.1 does
+as `verifying_archive`, `loading_model`, or `transcribing`. Protocol v1.2 does
 not carry percentages, completed-unit counts, ETA, or equivalent precision.
 
 Public Worker errors contain a stable code, localized message code, retryable
@@ -171,8 +185,7 @@ and uses `mlx-whisper==0.4.3`. It accepts only a local MLX model directory;
 `config.json` and one of the supported weight filenames are required. Neither
 Worker downloads a model or resolves a remote repository ID.
 
-The ordinary `captioner run --model ...` path remains on the existing
-in-process Faster Whisper adapter in Phase 6.1. `WorkerBackedASREngine` is an
-injection seam and is exercised by Runtime Doctor and isolated tests. PR 6.2
-may construct it after Model Manager preflight; it must not make an uninstalled
-model look available.
+New `captioner run --model ...` Jobs perform installed-model and active-Runtime
+preflight once, persist an effective schema-3 ASR snapshot, and use
+`WorkerBackedASREngine`. Legacy schema-1/2 Jobs retain the existing in-process
+compatibility path. No model selector triggers an implicit download.

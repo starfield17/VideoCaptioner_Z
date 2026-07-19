@@ -61,9 +61,17 @@ machine:
 python main.py --cli doctor --json
 ```
 
-Named Faster Whisper models downloaded after this change use
-`<data_dir>/models/faster-whisper`. Existing Hugging Face or Faster Whisper
-caches are not moved or migrated automatically.
+Phase 6.2 model operations are explicit and offline-safe.  A new Job selects
+an already installed model; `captioner run` does not download `tiny` or any
+other implicit model.  Use `model search-hf`, `model install-hf`,
+`model install-modelscope`, `model import`, or `model register-external` before
+running a schema-3 Job.  See [docs/model_manager.md](docs/model_manager.md)
+and [docs/model_sources.md](docs/model_sources.md).
+
+Managed model installs use a clean payload under
+`<data_dir>/models/managed/<identity-digest>`. Source SDK download caches are
+transaction-local and existing Hugging Face or Faster Whisper caches are not
+moved or migrated automatically.
 
 ### Recommended Nuitka build (`uv`)
 
@@ -148,7 +156,7 @@ is optional and is installed separately:
 ```bash
 uv sync --frozen --extra asr-faster-whisper
 captioner run input.mp4 second.wav --output build/output \
-  --model tiny --device cpu --compute-type int8 --language en --json
+  --model <installed-model-selector> --device auto --compute-type int8 --language en --json
 python scripts/validate_subtitle.py build/output/input.srt
 captioner status batch-... --json
 captioner resume batch-... --json

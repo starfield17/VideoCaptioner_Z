@@ -28,6 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_WORKER_ROOT = PROJECT_ROOT / "runtime_worker"
 RUNTIME_PROJECTS_ROOT = PROJECT_ROOT / "runtime_projects"
 _MAX_DESCRIPTOR_BYTES = 2 * 1024 * 1024
+_WORKER_PROTOCOL_VERSION = "1.2"
 
 
 class RuntimeBuildError(RuntimeError):
@@ -137,7 +138,7 @@ def _build(project_name: str, version: str, output: Path) -> None:
         build_info = {
             "schema_version": 1,
             "worker_version": "1.0.0",
-            "protocol_version": "1.1",
+            "protocol_version": _WORKER_PROTOCOL_VERSION,
             "runtime_id": runtime_id,
             "runtime_version": version,
             "backend_id": backend_id,
@@ -174,7 +175,7 @@ def _build(project_name: str, version: str, output: Path) -> None:
         manifest = RuntimeManifest(
             schema_version=1,
             runtime_identity=identity,
-            worker_protocol_version="1.1",
+            worker_protocol_version=_WORKER_PROTOCOL_VERSION,
             backend_id=backend_id,
             backend_version=backend_version,
             target=RuntimeTarget(
@@ -188,6 +189,7 @@ def _build(project_name: str, version: str, output: Path) -> None:
             archive_sha256="0" * 64,
             files=files,
         )
+        _validate_build_info(build_info, manifest)
         archive_path = output / archive_filename
         create_deterministic_archive(build_root, archive_path)
         archive_sha256 = sha256_file(archive_path)
@@ -222,6 +224,27 @@ def _build_worker_wheel(output: Path) -> Path:
     if len(wheels) != 1:
         raise RuntimeBuildError("worker_wheel_not_deterministic")
     return wheels[0]
+
+
+def _validate_build_info(build_info: Mapping[str, object], manifest: RuntimeManifest) -> None:
+    """Reject an archive whose Worker metadata drifts from its manifest."""
+    expected = {
+        "schema_version": 1,
+        "protocol_version": manifest.worker_protocol_version,
+        "runtime_id": manifest.runtime_identity.runtime_id,
+        "runtime_version": manifest.runtime_identity.version,
+        "backend_id": manifest.backend_id,
+        "backend_version": manifest.backend_version,
+        "platform": manifest.target.platform,
+        "architecture": manifest.target.architecture,
+        "device_kind": manifest.target.device_kind,
+        "supported_model_formats": list(manifest.supported_model_formats),
+        "capabilities": sorted(manifest.capabilities.advertised_capabilities),
+    }
+    if any(build_info.get(key) != value for key, value in expected.items()):
+        raise RuntimeBuildError("build_info_manifest_mismatch")
+    if not isinstance(build_info.get("worker_version"), str):
+        raise RuntimeBuildError("build_info_manifest_mismatch")
 
 
 def _managed_python(version: str) -> Path:

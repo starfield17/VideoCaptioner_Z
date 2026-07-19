@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -30,6 +31,32 @@ class FasterWhisperCPUBackend(Backend):
     def doctor_import(self) -> bool:
         __import__("faster_whisper")
         __import__("ctranslate2")
+        return True
+
+    def load_model(
+        self,
+        *,
+        model_directory: Path,
+        options: Mapping[str, object],
+        model_identity: Mapping[str, object] | None = None,
+    ) -> bool:
+        _require_local_model(model_directory)
+        compute_type = options.get("compute_type", "int8")
+        if compute_type not in {"int8", "float32"}:
+            raise ValueError("cpu_compute_type_invalid")
+        from faster_whisper import WhisperModel
+
+        with contextlib.redirect_stdout(__import__("sys").stderr):
+            self._model = cast(
+                _WhisperModel,
+                WhisperModel(
+                    str(model_directory), device="cpu", compute_type=cast(str, compute_type)
+                ),
+            )
+        digest = None if model_identity is None else model_identity.get("manifest_sha256")
+        self._model_key = (
+            (str(model_directory.resolve()), digest) if isinstance(digest, str) else None
+        )
         return True
 
     def transcribe(
@@ -60,15 +87,11 @@ class FasterWhisperCPUBackend(Backend):
         key = (str(model_directory.resolve()), digest)
         progress("loading_model")
         if self._model is None or self._model_key != key:
-            from faster_whisper import WhisperModel
-
-            with contextlib.redirect_stdout(__import__("sys").stderr):
-                self._model = cast(
-                    _WhisperModel,
-                    WhisperModel(
-                        str(model_directory), device="cpu", compute_type=cast(str, compute_type)
-                    ),
-                )
+            self.load_model(
+                model_directory=model_directory,
+                options=options,
+                model_identity=model_identity,
+            )
             self._model_key = key
         if cancelled.is_set():
             raise CancelledError
@@ -213,8 +236,22 @@ def _milliseconds(value: object) -> int:
 
 
 def _require_local_model(path: Path) -> None:
-    if not path.is_absolute() or not path.is_dir():
+    if path.is_symlink() or not path.is_absolute() or not path.is_dir():
         raise ValueError("local_model_directory_required")
+    for name in ("config.json", "model.bin", "tokenizer.json"):
+        candidate = path / name
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError(f"ct2_{name.replace('.', '_')}_missing")
+    if (path / "model.bin").stat().st_size <= 0:
+        raise ValueError("ct2_model_bin_empty")
+    for name in ("config.json", "tokenizer.json"):
+        candidate = path / name
+        if candidate.stat().st_size > 8 * 1024 * 1024:
+            raise ValueError("ct2_json_too_large")
+        try:
+            json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"ct2_{name.replace('.', '_')}_invalid") from exc
 
 
 __all__ = ["CancelledError", "FasterWhisperCPUBackend"]

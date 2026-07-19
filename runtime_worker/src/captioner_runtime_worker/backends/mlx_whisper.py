@@ -27,6 +27,19 @@ class MLXWhisperMetalBackend(Backend):
         core.eval(value)
         return True
 
+    def load_model(
+        self,
+        *,
+        model_directory: Path,
+        options: Mapping[str, object],
+        model_identity: Mapping[str, object] | None = None,
+    ) -> bool:
+        del options
+        del model_identity
+        _validate_model_directory(model_directory)
+        __import__("mlx_whisper")
+        return True
+
     def transcribe(
         self,
         *,
@@ -106,17 +119,33 @@ class MLXWhisperMetalBackend(Backend):
 
 
 def _validate_model_directory(path: Path) -> None:
-    if not path.is_absolute() or not path.is_dir():
+    if path.is_symlink() or not path.is_absolute() or not path.is_dir():
         raise ValueError("local_model_directory_required")
-    if not (path / "config.json").is_file():
+    config = path / "config.json"
+    if config.is_symlink() or not config.is_file():
         raise ValueError("mlx_config_missing")
-    if not any(
-        (path / name).is_file()
-        for name in ("model.safetensors", "weights.safetensors", "weights.npz")
-    ):
+    weight_paths = [
+        path / name for name in ("model.safetensors", "weights.safetensors", "weights.npz")
+    ]
+    if not any(not item.is_symlink() and item.is_file() for item in weight_paths):
         raise ValueError("mlx_weights_missing")
+    tokenizer = path / "tokenizer.json"
+    vocab = path / "vocab.json"
+    merges = path / "merges.txt"
+    if not (
+        (not tokenizer.is_symlink() and tokenizer.is_file())
+        or (
+            not vocab.is_symlink()
+            and vocab.is_file()
+            and not merges.is_symlink()
+            and merges.is_file()
+        )
+    ):
+        raise ValueError("mlx_tokenizer_missing")
     try:
-        value = json.loads((path / "config.json").read_text(encoding="utf-8"))
+        if config.stat().st_size > 8 * 1024 * 1024:
+            raise ValueError("mlx_config_too_large")
+        value = json.loads(config.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("mlx_config_invalid") from exc
     if not isinstance(value, dict):

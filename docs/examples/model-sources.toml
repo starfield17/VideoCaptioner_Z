@@ -1,0 +1,13 @@
+# Optional source configuration.  The file is read from the OS config
+# directory as model-sources.toml; this example intentionally contains no
+# credentials.
+
+[sources.huggingface]
+enabled = true
+endpoint = "https://huggingface.co"
+max_workers = 4
+
+[sources.modelscope]
+enabled = true
+endpoint = "https://modelscope.cn"
+max_workers = 4

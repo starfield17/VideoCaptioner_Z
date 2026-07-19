@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Never, cast
 
 from captioner.core.domain.artifact import ArtifactRef
+from captioner.core.domain.asr_job_snapshot import ASRJobSnapshot
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobProjection, JobState, validate_identifier
@@ -452,6 +453,8 @@ def _config_from_value(value: FrozenJsonValue | None) -> JobConfig:
         expected = base_fields
     elif schema_version == 2:
         expected = base_fields | {"pipeline_profile", "llm"}
+    elif schema_version == 3:
+        expected = base_fields | {"pipeline_profile", "llm", "asr_snapshot"}
     else:
         raise AppError("journal.transition_invalid", {"reason": "config_fields"})
     if set(raw) != expected:
@@ -477,6 +480,11 @@ def _config_from_value(value: FrozenJsonValue | None) -> JobConfig:
                 raw.get("pipeline_profile", PipelineProfile.DETERMINISTIC),
             ),
             llm=cast(Mapping[str, FrozenJsonValue] | None, raw.get("llm")),
+            asr_snapshot=(
+                None
+                if raw.get("asr_snapshot") is None
+                else ASRJobSnapshot.from_mapping(raw["asr_snapshot"])
+            ),
         )
     except (TypeError, ValueError) as exc:
         raise AppError("journal.transition_invalid", {"reason": "config_types"}) from exc

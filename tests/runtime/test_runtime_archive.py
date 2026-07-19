@@ -37,7 +37,7 @@ def _manifest(root: Path, *, archive_sha256: str = "a" * 64) -> RuntimeManifest:
     return RuntimeManifest(
         schema_version=1,
         runtime_identity=RuntimeIdentity("faster-whisper-cpu-test", "1.0.0"),
-        worker_protocol_version="1.1",
+        worker_protocol_version="1.2",
         backend_id="faster-whisper",
         backend_version="1.2.1",
         target=RuntimeTarget("macos", "arm64", "cpu", "14.0"),
@@ -191,7 +191,7 @@ def _manifest_for_one_file(relative_path: str) -> RuntimeManifest:
     return RuntimeManifest(
         schema_version=1,
         runtime_identity=RuntimeIdentity("faster-whisper-cpu-test", "1.0.0"),
-        worker_protocol_version="1.1",
+        worker_protocol_version="1.2",
         backend_id="faster-whisper",
         backend_version="1.2.1",
         target=RuntimeTarget("macos", "arm64", "cpu", "14.0"),

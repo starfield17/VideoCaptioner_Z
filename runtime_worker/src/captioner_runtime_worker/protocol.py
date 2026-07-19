@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import BinaryIO, cast
 
 PROTOCOL = "captioner.worker"
-VERSION = "1.1"
+VERSION = "1.2"
 
 _INBOUND_MESSAGE_TYPES = frozenset(
     {
@@ -17,6 +17,7 @@ _INBOUND_MESSAGE_TYPES = frozenset(
         "transcribe.request",
         "cancel.request",
         "shutdown.request",
+        "model.load.request",
     }
 )
 _JOB_MESSAGE_TYPES = frozenset({"transcribe.request", "cancel.request"})
@@ -155,6 +156,11 @@ def _validate_payload(message_type: str, payload: dict[str, object]) -> None:
         return
     if message_type == "shutdown.request":
         _required_string(payload, "reason")
+        return
+    if message_type == "model.load.request":
+        _absolute_path(payload, "model_directory")
+        _required_object(payload, "model_identity")
+        _required_object(payload, "backend_options")
         return
     raise ValueError("unknown_message_type")
 

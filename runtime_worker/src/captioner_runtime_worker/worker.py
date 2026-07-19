@@ -23,6 +23,7 @@ _MESSAGE_TYPES = {
     "transcribe.request",
     "cancel.request",
     "shutdown.request",
+    "model.load.request",
 }
 
 
@@ -63,6 +64,7 @@ class RuntimeWorker:
         self._active_job_id: str | None = None
         self._active_attempt_id: str | None = None
         self._cancel_event: threading.Event | None = None
+        self._active_operation_kind: str | None = None
         self._model_key: tuple[str, str] | None = None
         self._shutting_down = False
         self._last_incoming_sequence: int | None = None
@@ -123,6 +125,8 @@ class RuntimeWorker:
             self._cancel(request_id, message, payload, writer)
         elif message_type == "shutdown.request":
             await self._shutdown(request_id, writer)
+        elif message_type == "model.load.request":
+            self._start_model_load(request_id, payload, writer)
 
     def _handshake(
         self, request_id: str, payload: Mapping[str, object], writer: ProtocolWriter
@@ -196,6 +200,89 @@ class RuntimeWorker:
             },
         )
 
+    def _start_model_load(
+        self, request_id: str, payload: Mapping[str, object], writer: ProtocolWriter
+    ) -> None:
+        if self._active_task is not None and not self._active_task.done():
+            writer.send(
+                "model.load.response",
+                request_id,
+                {
+                    "model_identity": dict(_object(payload, "model_identity")),
+                    "backend_id": _string(self._info, "backend_id"),
+                    "device_kind": _string(self._info, "device_kind"),
+                    "loaded": False,
+                    "details": {"code": "worker.busy"},
+                },
+            )
+            return
+        cancel_event = threading.Event()
+        self._active_request_id = request_id
+        self._active_job_id = None
+        self._active_attempt_id = None
+        self._active_operation_kind = "model_load"
+        self._cancel_event = cancel_event
+        self._active_task = asyncio.create_task(
+            self._run_model_load(request_id, payload, writer, cancel_event)
+        )
+
+    async def _run_model_load(
+        self,
+        request_id: str,
+        payload: Mapping[str, object],
+        writer: ProtocolWriter,
+        cancel_event: threading.Event,
+    ) -> None:
+        model_identity: Mapping[str, object] = {}
+        loaded = False
+        details: dict[str, object] = {}
+        try:
+            model_directory = Path(_string(payload, "model_directory"))
+            model_identity = _object(payload, "model_identity")
+            options = _object(payload, "backend_options")
+            if not model_directory.is_absolute() or not model_directory.is_dir():
+                _invalid("worker.remote_model_rejected")
+            digest = _string(model_identity, "manifest_sha256")
+            key = (str(model_directory.resolve()), digest)
+            if self._model_key is not None and self._model_key != key:
+                _invalid("worker.model_switch_requires_restart")
+            if self._model_key == key:
+                loaded = True
+            else:
+                loaded = await asyncio.to_thread(
+                    self._get_backend().load_model,
+                    model_directory=model_directory,
+                    options=options,
+                    model_identity=model_identity,
+                )
+                if loaded:
+                    self._model_key = key
+            if cancel_event.is_set():
+                loaded = False
+                details["code"] = "operation.cancelled"
+        except ValueError as exc:
+            details["code"] = str(exc)
+        except Exception:
+            details["code"] = "worker.model_load_failed"
+        finally:
+            writer.send(
+                "model.load.response",
+                request_id,
+                {
+                    "model_identity": dict(model_identity),
+                    "backend_id": _string(self._info, "backend_id"),
+                    "device_kind": _string(self._info, "device_kind"),
+                    "loaded": loaded,
+                    "details": details,
+                },
+            )
+            self._active_task = None
+            self._active_request_id = None
+            self._active_job_id = None
+            self._active_attempt_id = None
+            self._active_operation_kind = None
+            self._cancel_event = None
+
     def _start_transcribe(
         self,
         message: Mapping[str, object],
@@ -233,6 +320,7 @@ class RuntimeWorker:
         self._active_request_id = request_id
         self._active_job_id = job_id
         self._active_attempt_id = attempt_id
+        self._active_operation_kind = "transcribe"
         self._active_task = asyncio.create_task(
             self._run_transcribe(
                 request_id,
@@ -314,6 +402,7 @@ class RuntimeWorker:
             self._active_request_id = None
             self._active_job_id = None
             self._active_attempt_id = None
+            self._active_operation_kind = None
             self._cancel_event = None
 
     def _cancel(

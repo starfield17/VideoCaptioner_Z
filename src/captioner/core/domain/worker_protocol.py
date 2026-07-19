@@ -22,7 +22,7 @@ from captioner.core.domain.result import (
 from captioner.core.domain.runtime import RuntimeIdentity
 
 WORKER_PROTOCOL_NAME = "captioner.worker"
-WORKER_PROTOCOL_VERSION = "1.1"
+WORKER_PROTOCOL_VERSION = "1.2"
 _VERSION_RE = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SENSITIVE_KEYS = frozenset(
@@ -69,7 +69,7 @@ def _empty_json_mapping() -> dict[str, JsonValue]:
 
 
 class WorkerMessageType(StrEnum):
-    """Messages in Worker transport protocol 1.1."""
+    """Messages in Worker transport protocol 1.2."""
 
     HANDSHAKE_REQUEST = "handshake.request"
     HANDSHAKE_RESPONSE = "handshake.response"
@@ -84,6 +84,8 @@ class WorkerMessageType(StrEnum):
     SHUTDOWN_ACKNOWLEDGED = "shutdown.acknowledged"
     DOCTOR_REQUEST = "doctor.request"
     DOCTOR_RESPONSE = "doctor.response"
+    MODEL_LOAD_REQUEST = "model.load.request"
+    MODEL_LOAD_RESPONSE = "model.load.response"
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +261,95 @@ class DoctorResponse:
             device_kind=_required_str(raw, "device_kind"),
             probe_result=ResultDescriptor.from_payload(_required_value(raw, "probe_result")),
             details=cast(Mapping[str, JsonValue], details),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelLoadRequest:
+    """Request a Worker backend to load one already-installed local model."""
+
+    model_directory: Path
+    model_identity: ModelIdentity
+    backend_options: Mapping[str, JsonValue] = field(default_factory=_empty_json_mapping)
+
+    def __post_init__(self) -> None:
+        if not self.model_directory.is_absolute():
+            raise AppError("worker.model_load_invalid", {"field": "model_directory"})
+        raw_model_identity: object = cast(object, self.model_identity)
+        if type(raw_model_identity) is not ModelIdentity:
+            raise AppError("worker.model_load_invalid", {"field": "model_identity"})
+        object.__setattr__(
+            self,
+            "backend_options",
+            _freeze_public_mapping(self.backend_options, "worker.model_load_invalid"),
+        )
+
+    def to_payload(self) -> dict[str, JsonValue]:
+        return {
+            "model_directory": str(self.model_directory),
+            "model_identity": self.model_identity.to_dict(),
+            "backend_options": _thaw_public_mapping(self.backend_options),
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> ModelLoadRequest:
+        raw = _object(value, "model_load_request")
+        directory = _required_str(raw, "model_directory")
+        return cls(
+            model_directory=Path(directory),
+            model_identity=ModelIdentity.from_dict(_required_value(raw, "model_identity")),
+            backend_options=cast(
+                Mapping[str, JsonValue],
+                _required_mapping(raw, "backend_options", "worker.model_load_invalid"),
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelLoadResponse:
+    """Typed result of a local model load verification."""
+
+    model_identity: ModelIdentity
+    backend_id: str
+    device_kind: str
+    loaded: bool
+    details: Mapping[str, JsonValue] = field(default_factory=_empty_json_mapping)
+
+    def __post_init__(self) -> None:
+        raw_model_identity: object = cast(object, self.model_identity)
+        if type(raw_model_identity) is not ModelIdentity:
+            raise AppError("worker.model_load_invalid", {"field": "model_identity"})
+        _require_nonempty(self.backend_id, "backend_id", "worker.model_load_invalid")
+        _require_nonempty(self.device_kind, "device_kind", "worker.model_load_invalid")
+        if type(self.loaded) is not bool:
+            raise AppError("worker.model_load_invalid", {"field": "loaded"})
+        object.__setattr__(
+            self,
+            "details",
+            _freeze_public_mapping(self.details, "worker.model_load_invalid"),
+        )
+
+    def to_payload(self) -> dict[str, JsonValue]:
+        return {
+            "model_identity": self.model_identity.to_dict(),
+            "backend_id": self.backend_id,
+            "device_kind": self.device_kind,
+            "loaded": self.loaded,
+            "details": _thaw_public_mapping(self.details),
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> ModelLoadResponse:
+        raw = _object(value, "model_load_response")
+        return cls(
+            model_identity=ModelIdentity.from_dict(_required_value(raw, "model_identity")),
+            backend_id=_required_str(raw, "backend_id"),
+            device_kind=_required_str(raw, "device_kind"),
+            loaded=_required_bool(raw, "loaded"),
+            details=cast(
+                Mapping[str, JsonValue],
+                _required_mapping(raw, "details", "worker.model_load_invalid"),
+            ),
         )
 
 
@@ -724,6 +815,8 @@ type WorkerProtocolMessage = (
     | ShutdownAcknowledged
     | DoctorRequest
     | DoctorResponse
+    | ModelLoadRequest
+    | ModelLoadResponse
 )
 
 
@@ -779,6 +872,10 @@ def _decode_typed_payload(
         return DoctorRequest.from_payload(payload)
     if message_type == WorkerMessageType.DOCTOR_RESPONSE.value:
         return DoctorResponse.from_payload(payload)
+    if message_type == WorkerMessageType.MODEL_LOAD_REQUEST.value:
+        return ModelLoadRequest.from_payload(payload)
+    if message_type == WorkerMessageType.MODEL_LOAD_RESPONSE.value:
+        return ModelLoadResponse.from_payload(payload)
     raise AppError("worker.message_type_unknown", {"field": "message_type"})
 
 
@@ -981,6 +1078,15 @@ def _required_value(value: Mapping[object, object], key: str) -> object:
     return value[key]
 
 
+def _required_mapping(
+    value: Mapping[object, object], key: str, code: str
+) -> Mapping[object, object]:
+    item = _required_value(value, key)
+    if not isinstance(item, Mapping):
+        raise AppError(code, {"field": key})
+    return cast(Mapping[object, object], item)
+
+
 def _optional_str(value: Mapping[object, object], key: str) -> str | None:
     item = value.get(key)
     if item is not None and not isinstance(item, str):
@@ -1059,6 +1165,8 @@ __all__ = [
     "DoctorResponse",
     "HandshakeRequest",
     "JsonlProtocolCodec",
+    "ModelLoadRequest",
+    "ModelLoadResponse",
     "OperationCancelled",
     "OperationProgress",
     "ResultDescriptor",

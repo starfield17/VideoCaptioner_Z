@@ -16,11 +16,13 @@ from captioner.adapters.persistence.jsonl_journal import JsonlJournal
 from captioner.bootstrap import (
     DurableServiceBundle,
     build_durable_service,
+    create_asr_job_snapshot,
     create_batch_lease,
     create_job_config,
     create_llm_job_snapshot,
 )
 from captioner.core.application.durable_pipeline import BatchStatus, write_cancel_marker
+from captioner.core.domain.asr_job_snapshot import ASRJobSnapshot
 from captioner.core.domain.batch import BatchProjection
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.job import JobConfig, JobState, validate_identifier
@@ -58,6 +60,7 @@ class BatchRunOptions:
     pipeline_profile: PipelineProfile = PipelineProfile.DETERMINISTIC
     target_language: str | None = None
     llm_provider_profile: str = "default"
+    asr_snapshot: ASRJobSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +108,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
         paths=paths,
         pipeline_profile=options.pipeline_profile,
         llm=llm_snapshot,
+        asr_snapshot=options.asr_snapshot,
     )
     bundle = build_durable_service(
         batch_id,
@@ -117,6 +121,7 @@ def run(options: BatchRunOptions, *, paths: AppPaths) -> BatchProjection:
         paths=paths,
         pipeline_profile=options.pipeline_profile,
         llm=config.llm,
+        asr_snapshot=config.asr_snapshot,
     )
     lease = create_batch_lease(bundle.batch_dir)
     lease.acquire()
@@ -339,6 +344,7 @@ def _bundle(
         pipeline_profile=config.pipeline_profile,
         llm=config.llm,
         initialize_runtime=initialize_runtime,
+        asr_snapshot=config.asr_snapshot,
     )
 
 
@@ -408,6 +414,41 @@ def _apply_overrides(
     )
     llm = _llm_for_resume(config, overrides, selected_profile, paths)
     effective_language = _effective_language(config, overrides)
+    if config.asr_snapshot is not None and _has_asr_override(overrides):
+        if paths is None:
+            raise AppError("runtime.preflight_failed", {"reason": "paths"})
+        requested_model = overrides.model_ref or config.asr_snapshot.requested_model_selector
+        requested_device = overrides.device or config.asr_snapshot.requested_device
+        requested_compute_type = overrides.compute_type or config.asr_snapshot.compute_type
+        snapshot = create_asr_job_snapshot(
+            model_selector=requested_model,
+            requested_device=requested_device,
+            compute_type=requested_compute_type,
+            paths=paths,
+        )
+        candidate = create_job_config(
+            model_ref=requested_model,
+            device=requested_device,
+            compute_type=requested_compute_type,
+            language=effective_language,
+            ffmpeg_bin=config.ffmpeg_bin,
+            ffprobe_bin=config.ffprobe_bin,
+            output_dir=Path(config.output_dir)
+            if overrides.output_dir is None
+            else overrides.output_dir,
+            overwrite=config.overwrite,
+            paths=paths,
+            pipeline_profile=selected_profile,
+            llm=llm,
+            asr_snapshot=snapshot,
+        )
+        return replace(
+            candidate,
+            vad_filter=config.vad_filter,
+            normalization=config.normalization,
+            segmentation=config.segmentation,
+            stage_versions=stage_versions_for(selected_profile),
+        )
     if overrides.model_ref is not None:
         candidate = create_job_config(
             model_ref=overrides.model_ref,
@@ -518,6 +559,13 @@ def _effective_language(config: JobConfig, overrides: ResumeOverrides) -> str | 
     return language
 
 
+def _has_asr_override(overrides: ResumeOverrides) -> bool:
+    return any(
+        value is not None
+        for value in (overrides.model_ref, overrides.device, overrides.compute_type)
+    )
+
+
 async def _run_and_close(
     bundle: DurableServiceBundle,
     operation: Callable[[], Awaitable[BatchProjection]],
@@ -530,6 +578,8 @@ async def _run_and_close(
 
 def _earliest_change(old: JobConfig, new: JobConfig) -> StageName:
     plan = stage_plan_for(new.pipeline_profile)
+    if old.asr_snapshot != new.asr_snapshot:
+        return StageName.TRANSCRIBE
     if old.ffprobe_bin != new.ffprobe_bin:
         return StageName.INSPECT
     if old.ffmpeg_bin != new.ffmpeg_bin or old.normalization != new.normalization:

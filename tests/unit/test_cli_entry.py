@@ -6,10 +6,35 @@ from pathlib import Path
 import pytest
 
 from captioner import __version__
+from captioner.cli import cli_entry
 from captioner.cli.cli_entry import build_parser, main
 from captioner.cli.commands import batch as batch_command
+from captioner.core.domain.asr_job_snapshot import ASRJobSnapshot
 from captioner.core.domain.batch import BatchProjection
+from captioner.core.domain.model import ModelIdentity
+from captioner.core.domain.runtime import RuntimeIdentity
 from captioner.infrastructure.app_paths import AppPaths
+
+
+def _snapshot(**kwargs: object) -> ASRJobSnapshot:
+    del kwargs
+    return ASRJobSnapshot(
+        1,
+        "model",
+        "auto",
+        "faster-whisper",
+        RuntimeIdentity("runtime", "1.0.0"),
+        ModelIdentity(
+            "faster-whisper",
+            "local-import",
+            "local-import/model",
+            "1",
+            "faster-whisper-ct2",
+            "0" * 64,
+        ),
+        "cpu",
+        "default",
+    )
 
 
 def test_cli_help_and_parser() -> None:
@@ -100,8 +125,23 @@ def test_run_language_auto_is_explicit_none_and_omitted_is_none(
 
     monkeypatch.setattr(batch_command, "run", capture_run)
     monkeypatch.setattr(batch_command, "projection_payload", payload)
-    assert main(["run", "input.wav", "--output", str(tmp_path)]) == 0
-    assert main(["run", "input.wav", "--output", str(tmp_path), "--language", "auto"]) == 0
+    monkeypatch.setattr(cli_entry, "create_asr_job_snapshot", _snapshot)
+    assert main(["run", "input.wav", "--output", str(tmp_path), "--model", "model"]) == 0
+    assert (
+        main(
+            [
+                "run",
+                "input.wav",
+                "--output",
+                str(tmp_path),
+                "--model",
+                "model",
+                "--language",
+                "auto",
+            ]
+        )
+        == 0
+    )
     assert languages == [None, None]
 
 
@@ -139,4 +179,10 @@ def test_language_detect_is_rejected() -> None:
         build_parser().parse_args(
             ["run", "input.wav", "--output", "output", "--language", "detect"]
         )
+        assert raised.value.code == 2
+
+
+def test_run_requires_an_installed_model_selector() -> None:
+    with pytest.raises(SystemExit) as raised:
+        build_parser().parse_args(["run", "input.wav", "--output", "output"])
     assert raised.value.code == 2

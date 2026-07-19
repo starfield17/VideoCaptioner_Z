@@ -10,6 +10,16 @@ ProgressCallback = Callable[[str], None]
 
 
 class Backend:
+    def load_model(
+        self,
+        *,
+        model_directory: Path,
+        options: Mapping[str, object],
+        model_identity: Mapping[str, object] | None = None,
+    ) -> bool:
+        del model_directory, options, model_identity
+        raise NotImplementedError
+
     def transcribe(
         self,
         *,

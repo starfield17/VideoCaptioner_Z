@@ -56,7 +56,7 @@ def runtime_manifest(
     return RuntimeManifest(
         schema_version=1,
         runtime_identity=RuntimeIdentity(effective_runtime_id, version),
-        worker_protocol_version="1.1",
+        worker_protocol_version="1.2",
         backend_id=backend_id,
         backend_version="1.0.0",
         target=RuntimeTarget(platform, architecture, device_kind, minimum_os_version),
@@ -229,7 +229,7 @@ def model_installation(
 
 def worker_handshake() -> WorkerHandshake:
     return WorkerHandshake(
-        protocol_version="1.1",
+        protocol_version="1.2",
         runtime_id="faster-whisper-cpu-macos-arm64",
         runtime_version="1.0.0",
         backend_id="faster-whisper",

@@ -49,6 +49,9 @@ def test_faster_whisper_backend_requires_local_model_and_maps_words(
 ) -> None:
     model_dir = tmp_path / "model"
     model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.bin").write_bytes(b"weights")
     audio = tmp_path / "audio.wav"
     audio.write_bytes(b"wav")
     fake_module = ModuleType("faster_whisper")
@@ -96,6 +99,9 @@ def test_faster_whisper_backend_requires_local_model_and_maps_words(
 def test_faster_whisper_backend_rejects_cancelled_inference(tmp_path: Path) -> None:
     model_dir = tmp_path / "model"
     model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.bin").write_bytes(b"weights")
     audio = tmp_path / "audio.wav"
     audio.write_bytes(b"wav")
     cancelled = Event()

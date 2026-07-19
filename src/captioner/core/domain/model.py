@@ -91,6 +91,11 @@ class ModelIdentity:
             "manifest_sha256": self.manifest_sha256,
         }
 
+    @property
+    def digest(self) -> str:
+        """Return the collision-resistant record key for this identity."""
+        return compute_model_identity_sha256(self)
+
     @classmethod
     def from_dict(cls, value: object) -> ModelIdentity:
         if not isinstance(value, Mapping):
@@ -214,6 +219,60 @@ class ModelManifest:
             "required_device_kind": self.required_device_kind,
             "required_platform": self.required_platform,
         }
+
+    @classmethod
+    def from_dict(cls, value: object) -> ModelManifest:
+        """Decode a manifest without filling missing durable fields."""
+        if not isinstance(value, Mapping):
+            raise AppError("model.manifest_invalid", {"field": "root"})
+        raw = cast(Mapping[object, object], value)
+        files_value = _required_sequence(raw, "files", "model.manifest_invalid")
+        files = tuple(
+            ModelFileEntry(
+                _required_string(
+                    _as_mapping(item, "model.manifest_invalid"),
+                    "relative_path",
+                    "model.manifest_invalid",
+                ),
+                _required_int(
+                    _as_mapping(item, "model.manifest_invalid"),
+                    "size_bytes",
+                    "model.manifest_invalid",
+                ),
+                _required_string(
+                    _as_mapping(item, "model.manifest_invalid"),
+                    "sha256",
+                    "model.manifest_invalid",
+                ),
+            )
+            for item in files_value
+        )
+        source_metadata = _required_mapping(raw, "source_metadata", "model.manifest_invalid")
+        required_device = raw.get("required_device_kind")
+        if required_device is not None and not isinstance(required_device, str):
+            raise AppError("model.manifest_invalid", {"field": "required_device_kind"})
+        required_platform = raw.get("required_platform")
+        if required_platform is not None and not isinstance(required_platform, str):
+            raise AppError("model.manifest_invalid", {"field": "required_platform"})
+        return cls(
+            schema_version=_required_int(raw, "schema_version", "model.manifest_invalid"),
+            identity=ModelIdentity.from_dict(
+                _required_value(raw, "identity", "model.manifest_invalid")
+            ),
+            display_name=_required_string(raw, "display_name", "model.manifest_invalid"),
+            files=files,
+            compatible_runtime_backends=_required_string_tuple(
+                raw, "compatible_runtime_backends", "model.manifest_invalid"
+            ),
+            model_format=_required_string(raw, "model_format", "model.manifest_invalid"),
+            source_metadata=cast(Mapping[str, JsonValue], source_metadata),
+            description=_required_string(raw, "description", "model.manifest_invalid"),
+            required_capabilities=_required_string_tuple(
+                raw, "required_capabilities", "model.manifest_invalid"
+            ),
+            required_device_kind=required_device,
+            required_platform=required_platform,
+        )
 
 
 def model_manifest_digest_payload(
@@ -441,6 +500,55 @@ class ModelInstallation:
     def can_delete_files(self) -> bool:
         return self.managed is True and self.state is not ModelState.EXTERNAL_UNMANAGED
 
+    def to_dict(self) -> dict[str, JsonValue]:
+        """Serialize the installation record, including its local path only here."""
+        return {
+            "schema_version": 1,
+            "identity": self.identity.to_dict(),
+            "manifest": self.manifest.to_dict(),
+            "model_directory": str(self.model_directory),
+            "state": self.state.value,
+            "managed": self.managed,
+            "load_verified": self.load_verified,
+            "validation_passed": self.validation_passed,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> ModelInstallation:
+        if not isinstance(value, Mapping):
+            raise AppError("model.installation_invalid", {"field": "root"})
+        raw = cast(Mapping[object, object], value)
+        if _required_int(raw, "schema_version", "model.installation_invalid") != 1:
+            raise AppError("model.installation_invalid", {"field": "schema_version"})
+        model_directory = _required_string(raw, "model_directory", "model.installation_invalid")
+        state_value = _required_string(raw, "state", "model.installation_invalid")
+        try:
+            state = ModelState(state_value)
+        except ValueError as exc:
+            raise AppError("model.installation_invalid", {"field": "state"}) from exc
+        managed = raw.get("managed")
+        if type(managed) is not bool:
+            raise AppError("model.installation_invalid", {"field": "managed"})
+        load_verified = raw.get("load_verified")
+        if load_verified is not None and type(load_verified) is not bool:
+            raise AppError("model.installation_invalid", {"field": "load_verified"})
+        validation_passed = raw.get("validation_passed")
+        if validation_passed is not None and type(validation_passed) is not bool:
+            raise AppError("model.installation_invalid", {"field": "validation_passed"})
+        return cls(
+            identity=ModelIdentity.from_dict(
+                _required_value(raw, "identity", "model.installation_invalid")
+            ),
+            manifest=ModelManifest.from_dict(
+                _required_value(raw, "manifest", "model.installation_invalid")
+            ),
+            model_directory=Path(model_directory),
+            state=state,
+            managed=managed,
+            load_verified=load_verified,
+            validation_passed=validation_passed,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ModelSourceCapabilities:
@@ -600,7 +708,21 @@ def required_files_for_format(model_format: str) -> tuple[frozenset[str], ...]:
             frozenset({"config.json"}),
             frozenset({"model.safetensors", "weights.safetensors", "weights.npz"}),
         )
+    if model_format == "faster-whisper-ct2":
+        return (frozenset({"config.json", "model.bin", "tokenizer.json"}),)
     return ()
+
+
+def compute_model_identity_sha256(identity: ModelIdentity) -> str:
+    """Hash only the canonical identity fields used for local record names."""
+    canonical = json.dumps(
+        identity.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _validate_mlx_required_files(paths: tuple[str, ...]) -> None:
@@ -615,11 +737,61 @@ def _require_text(value: object, field: str, code: str) -> None:
         raise AppError(code, {"field": field})
 
 
-def _required_string(value: Mapping[object, object], field: str) -> str:
+def _required_string(
+    value: Mapping[object, object], field: str, code: str = "model.identity_invalid"
+) -> str:
     item = value.get(field)
     if not isinstance(item, str):
-        raise AppError("model.identity_invalid", {"field": field})
+        raise AppError(code, {"field": field})
     return item
+
+
+def _required_value(value: Mapping[object, object], field: str, code: str) -> object:
+    if field not in value:
+        raise AppError(code, {"field": field})
+    return value[field]
+
+
+def _required_mapping(value: object, field: str, code: str) -> Mapping[object, object]:
+    raw = _as_mapping(value, code)
+    item = raw.get(field)
+    if not isinstance(item, Mapping):
+        raise AppError(code, {"field": field})
+    return cast(Mapping[object, object], item)
+
+
+def _as_mapping(value: object, code: str) -> Mapping[object, object]:
+    if not isinstance(value, Mapping):
+        raise AppError(code, {"field": "mapping"})
+    return cast(Mapping[object, object], value)
+
+
+def _required_sequence(value: Mapping[object, object], field: str, code: str) -> tuple[object, ...]:
+    item = _required_value(value, field, code)
+    if not isinstance(item, (list, tuple)):
+        raise AppError(code, {"field": field})
+    return tuple(cast(list[object] | tuple[object, ...], item))
+
+
+def _required_int(value: Mapping[object, object], field: str, code: str) -> int:
+    item = _required_value(value, field, code)
+    if type(item) is not int:
+        raise AppError(code, {"field": field})
+    return item
+
+
+def _required_string_tuple(
+    value: Mapping[object, object], field: str, code: str
+) -> tuple[str, ...]:
+    item = _required_sequence(value, field, code)
+    result: list[str] = []
+    for entry in item:
+        if not isinstance(entry, str) or not entry.strip() or entry != entry.strip():
+            raise AppError(code, {"field": field})
+        result.append(entry)
+    if len(set(result)) != len(result):
+        raise AppError(code, {"field": field, "reason": "duplicate"})
+    return tuple(result)
 
 
 def _require_repository_id(value: object, code: str = "model.identity_invalid") -> None:
@@ -715,6 +887,7 @@ __all__ = [
     "ModelStatus",
     "ModelValidationCheck",
     "ModelValidationReport",
+    "compute_model_identity_sha256",
     "compute_model_manifest_sha256",
     "model_manifest_digest_payload",
     "required_files_for_format",

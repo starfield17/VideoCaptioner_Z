@@ -12,6 +12,8 @@ from captioner.core.domain.worker_protocol import (
     DoctorRequest,
     DoctorResponse,
     HandshakeRequest,
+    ModelLoadRequest,
+    ModelLoadResponse,
     ShutdownResult,
     TranscribeRequest,
     WorkerEvent,
@@ -34,6 +36,8 @@ class WorkerClient(Protocol):
     async def cancel(self, request_id: str) -> CancelResult: ...
 
     async def doctor(self, request: DoctorRequest) -> DoctorResponse: ...
+
+    async def load_model(self, request: ModelLoadRequest) -> ModelLoadResponse: ...
 
     async def shutdown(self) -> ShutdownResult: ...
 

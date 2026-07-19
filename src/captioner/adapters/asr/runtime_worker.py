@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator, Mapping
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, cast
@@ -16,11 +16,14 @@ from captioner.core.application.worker_handshake_validation import validate_work
 from captioner.core.application.worker_result_validation import validate_worker_result
 from captioner.core.domain.errors import AppError
 from captioner.core.domain.execution import ExecutionContext
-from captioner.core.domain.model import ModelInstallation, ModelState
+from captioner.core.domain.model import ModelIdentity, ModelInstallation, ModelState
+from captioner.core.domain.result import JsonValue
 from captioner.core.domain.runtime import RuntimeInstallation, RuntimeState
 from captioner.core.domain.transcript import Transcript
 from captioner.core.domain.worker_protocol import (
     HandshakeRequest,
+    ModelLoadRequest,
+    ModelLoadResponse,
     WorkerCancelledEvent,
     WorkerError,
     WorkerErrorEvent,
@@ -42,8 +45,12 @@ class WorkerBackedASREngine(ASREngine):
     model: ModelInstallation
     worker_client: WorkerClient
     session_workspace_root: Path
+    model_use_lock: Callable[[ModelIdentity], AbstractContextManager[None]] | None = None
+    load_on_start: bool = False
+    backend_options: Mapping[str, JsonValue] | None = None
     _handshake: WorkerHandshake | None = None
     _started: bool = False
+    _model_use_lock_context: AbstractContextManager[None] | None = None
 
     def __post_init__(self) -> None:
         if not self.session_workspace_root.is_absolute():
@@ -92,7 +99,7 @@ class WorkerBackedASREngine(ASREngine):
             task=request.task,
             word_timestamps=request.word_timestamps,
             initial_prompt=request.initial_prompt,
-            backend_options={} if request.backend_options is None else request.backend_options,
+            backend_options=_merged_backend_options(self.backend_options, request.backend_options),
             request_id=request_id,
             job_id=request.job_id,
             stage_attempt_id=request.stage_attempt_id,
@@ -106,13 +113,19 @@ class WorkerBackedASREngine(ASREngine):
                 if isinstance(event, WorkerCancelledEvent):
                     _raise_cancelled()
                 return self._decode_worker_result(event, request)
-        except AppError:
-            await self._shutdown_after_failure()
+        except BaseException:
+            # Preserve the original failure while ensuring a cancelled request,
+            # worker crash, or injected client exception cannot retain the model
+            # use-lock or a stale Worker session.
+            try:
+                await self._shutdown_after_failure()
+            except BaseException:
+                self._reset_session()
             raise
         raise AppError("worker.result_missing")
 
     async def close(self) -> None:
-        if not self._started:
+        if not self._started and self._model_use_lock_context is None:
             return
         try:
             await self.worker_client.shutdown()
@@ -129,27 +142,43 @@ class WorkerBackedASREngine(ASREngine):
         if self._started:
             return
         self.session_workspace_root.mkdir(parents=True, exist_ok=True)
+        lock = None if self.model_use_lock is None else self.model_use_lock(self.model.identity)
+        if lock is not None:
+            lock.__enter__()
+            self._model_use_lock_context = lock
         required = tuple(sorted(self.runtime.manifest.capabilities.advertised_capabilities))
         request = HandshakeRequest(
             required_capabilities=required,
             required_backend_id=self.runtime.manifest.backend_id,
             required_result_schema_versions=(1,),
         )
+        worker_started = False
         try:
             handshake = await self.worker_client.start(
                 self.runtime, self.session_workspace_root, request
             )
-        except AppError:
+            worker_started = True
+            result = validate_worker_handshake(self.runtime.manifest, request, handshake)
+            if not result.ok:
+                _raise_handshake_failure(result.error_code, result.reasons)
+            if self.load_on_start:
+                response = await self.worker_client.load_model(
+                    ModelLoadRequest(
+                        model_directory=self.model.model_directory.expanduser().resolve(),
+                        model_identity=self.model.identity,
+                        backend_options=_merged_backend_options(self.backend_options, None),
+                    )
+                )
+                _validate_model_load_response(response, self.runtime, self.model)
+        except BaseException as exc:
+            if worker_started:
+                try:
+                    await self.worker_client.shutdown()
+                except BaseException as shutdown_error:
+                    self._reset_session()
+                    raise shutdown_error from exc
             self._reset_session()
             raise
-        result = validate_worker_handshake(self.runtime.manifest, request, handshake)
-        if not result.ok:
-            await self.worker_client.shutdown()
-            self._reset_session()
-            raise AppError(
-                result.error_code or "worker.handshake_invalid",
-                {"reasons": list(result.reasons)},
-            )
         self._handshake = handshake
         self._started = True
 
@@ -245,6 +274,29 @@ class WorkerBackedASREngine(ASREngine):
     def _reset_session(self) -> None:
         self._started = False
         self._handshake = None
+        lock = self._model_use_lock_context
+        self._model_use_lock_context = None
+        if lock is not None:
+            lock.__exit__(None, None, None)
+
+
+def _validate_model_load_response(
+    response: ModelLoadResponse,
+    runtime: RuntimeInstallation,
+    model: ModelInstallation,
+) -> None:
+    if not response.loaded:
+        raise AppError("model.load_failed")
+    if response.model_identity != model.identity:
+        raise AppError("model.load_identity_mismatch")
+    if response.backend_id != runtime.manifest.backend_id:
+        raise AppError("model.load_identity_mismatch", {"field": "backend_id"})
+    if response.device_kind != runtime.manifest.target.device_kind:
+        raise AppError("model.load_identity_mismatch", {"field": "device_kind"})
+
+
+def _raise_handshake_failure(code: str | None, reasons: tuple[str, ...]) -> NoReturn:
+    raise AppError(code or "worker.handshake_invalid", {"reasons": list(reasons)})
 
 
 def _require_runtime_and_model(runtime: RuntimeInstallation, model: ModelInstallation) -> None:
@@ -266,6 +318,16 @@ def _require_runtime_and_model(runtime: RuntimeInstallation, model: ModelInstall
 
 async def _next_event(iterator: AsyncIterator[WorkerEvent]) -> WorkerEvent:
     return await iterator.__anext__()
+
+
+def _merged_backend_options(
+    configured: Mapping[str, JsonValue] | None,
+    request: Mapping[str, JsonValue] | None,
+) -> Mapping[str, JsonValue]:
+    merged: dict[str, JsonValue] = {} if configured is None else dict(configured)
+    if request is not None:
+        merged.update(request)
+    return merged
 
 
 def _raise_worker_error(error: WorkerError) -> NoReturn:

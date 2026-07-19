@@ -14,6 +14,8 @@ from captioner.core.domain.worker_protocol import (
     DoctorRequest,
     DoctorResponse,
     HandshakeRequest,
+    ModelLoadRequest,
+    ModelLoadResponse,
     ResultDescriptor,
     ShutdownResult,
     TranscribeRequest,
@@ -53,10 +55,15 @@ def _empty_doctor_calls() -> list[DoctorRequest]:
     return []
 
 
+def _empty_load_calls() -> list[ModelLoadRequest]:
+    return []
+
+
 @dataclass(slots=True)
 class ScriptedWorkerClient:
     handshake: WorkerHandshake
     doctor_response: DoctorResponse | None = None
+    load_response: ModelLoadResponse | None = None
     progress_events: tuple[WorkerProgressEvent, ...] = ()
     result: ResultDescriptor | None = None
     error: WorkerError | None = None
@@ -70,6 +77,7 @@ class ScriptedWorkerClient:
     cancel_calls: list[str] = field(default_factory=_empty_cancel_calls)
     shutdown_calls: list[bool] = field(default_factory=_empty_shutdown_calls)
     doctor_calls: list[DoctorRequest] = field(default_factory=_empty_doctor_calls)
+    load_calls: list[ModelLoadRequest] = field(default_factory=_empty_load_calls)
     _active_request_id: str | None = field(default=None, init=False)
     _started: bool = field(default=False, init=False)
     _shutdown: bool = field(default=False, init=False)
@@ -190,6 +198,16 @@ class ScriptedWorkerClient:
             raise AppError("worker.doctor_invalid")
         self.doctor_calls.append(request)
         return self.doctor_response
+
+    async def load_model(self, request: ModelLoadRequest) -> ModelLoadResponse:
+        if not self._started or self._shutdown:
+            raise AppError("worker.not_started")
+        if self._active_request_id is not None:
+            raise AppError("worker.busy")
+        if self.load_response is None:
+            raise AppError("worker.load_failed")
+        self.load_calls.append(request)
+        return self.load_response
 
     async def shutdown(self) -> ShutdownResult:
         self.shutdown_calls.append(self._shutdown)
