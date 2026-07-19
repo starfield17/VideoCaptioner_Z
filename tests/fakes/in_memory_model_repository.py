@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 
 from captioner.core.application.model_compatibility import check_model_compatibility
@@ -15,12 +16,17 @@ def _empty_models() -> dict[ModelIdentity, ModelInstallation]:
     return {}
 
 
+def _empty_in_use() -> set[ModelIdentity]:
+    return set()
+
+
 @dataclass(slots=True)
 class InMemoryModelRepository:
     initial_models: Iterable[ModelInstallation] = ()
     _models: dict[ModelIdentity, ModelInstallation] = field(
         default_factory=_empty_models, init=False
     )
+    _in_use: set[ModelIdentity] = field(default_factory=_empty_in_use, init=False)
 
     def __post_init__(self) -> None:
         for model in self.initial_models:
@@ -64,6 +70,11 @@ class InMemoryModelRepository:
             raise AppError("model.external_registration_invalid")
         self._register(model)
 
+    def update_model(self, model: ModelInstallation) -> None:
+        if model.identity not in self._models:
+            raise AppError("model.not_registered")
+        self._models[model.identity] = model
+
     def _register(self, model: ModelInstallation) -> None:
         if model.identity in self._models:
             raise AppError("model.duplicate_identity")
@@ -87,6 +98,36 @@ class InMemoryModelRepository:
         if model.managed is not True or not model.can_delete_files:
             raise AppError("model.external_unmanaged")
         del self._models[identity]
+
+    def remove_model(self, identity: ModelIdentity) -> None:
+        model = self._models.get(identity)
+        if model is None:
+            raise AppError("model.not_registered")
+        if identity in self._in_use:
+            raise AppError("model.in_use")
+        if model.managed is not True:
+            self._models.pop(identity)
+            return
+        self.remove_managed_model_record(identity)
+
+    @contextmanager
+    def manager_lock(self) -> Generator[None]:
+        yield
+
+    @contextmanager
+    def use_lock(self, identity: ModelIdentity) -> Generator[None]:
+        if identity in self._in_use:
+            raise AppError("model.in_use")
+        if identity not in self._models:
+            raise AppError("model.not_registered")
+        self._in_use.add(identity)
+        try:
+            yield
+        finally:
+            self._in_use.discard(identity)
+
+    def recover(self) -> tuple[ModelIdentity, ...]:
+        return ()
 
     def find_compatible_models(self, runtime: RuntimeInstallation) -> tuple[ModelInstallation, ...]:
         return tuple(

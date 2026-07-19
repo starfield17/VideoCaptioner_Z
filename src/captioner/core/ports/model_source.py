@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol
 
 from captioner.core.domain.model import (
@@ -9,6 +11,7 @@ from captioner.core.domain.model import (
     ModelSourceCapabilities,
     ModelSourceReference,
 )
+from captioner.core.domain.operation_progress import OperationProgress
 
 
 class ModelSource(Protocol):
@@ -19,10 +22,29 @@ class ModelSource(Protocol):
     ) -> tuple[ModelSourceCandidate, ...]: ...
 
     def resolve_exact(
-        self, repository_id: str, revision: str, backend_id: str
-    ) -> ModelSourceReference | None: ...
+        self,
+        repository_id: str,
+        revision: str | None,
+        backend_id: str,
+        model_format_hint: str | None = None,
+    ) -> ModelSourceReference: ...
+
+
+ProgressCallback = Callable[[OperationProgress], None]
+
+
+class ModelMaterializer(Protocol):
+    """Materialize one immutable source reference into caller-owned staging."""
+
+    def materialize(
+        self,
+        reference: ModelSourceReference,
+        destination: Path,
+        *,
+        progress: ProgressCallback | None = None,
+    ) -> None: ...
 
 
 ModelSourcePort = ModelSource
 
-__all__ = ["ModelSource", "ModelSourcePort"]
+__all__ = ["ModelMaterializer", "ModelSource", "ModelSourcePort", "ProgressCallback"]
