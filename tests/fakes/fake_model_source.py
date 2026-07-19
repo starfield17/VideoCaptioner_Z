@@ -62,11 +62,36 @@ class FakeModelSource:
         )[:limit]
 
     def resolve_exact(
-        self, repository_id: str, revision: str, backend_id: str
-    ) -> ModelSourceReference | None:
+        self,
+        repository_id: str,
+        revision: str | None,
+        backend_id: str,
+        model_format_hint: str | None = None,
+    ) -> ModelSourceReference:
         if not self.exact_supported:
             raise AppError("model.source_exact_unsupported")
-        return self._exact.get((repository_id, revision, backend_id))
+        if revision is None:
+            matches = tuple(
+                reference
+                for (
+                    candidate_repo,
+                    _candidate_revision,
+                    candidate_backend,
+                ), reference in self._exact.items()
+                if candidate_repo == repository_id and candidate_backend == backend_id
+            )
+            if len(matches) == 1:
+                return matches[0]
+            raise AppError("model.source_revision_unresolved")
+        result = self._exact.get((repository_id, revision, backend_id))
+        if result is None:
+            raise AppError("model.source_repository_not_found")
+        if model_format_hint is not None and result.model_format_hint not in {
+            None,
+            model_format_hint,
+        }:
+            raise AppError("model.source_revision_not_found")
+        return result
 
 
 class FakeHuggingFaceSource(FakeModelSource):
